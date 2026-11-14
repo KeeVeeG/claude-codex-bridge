@@ -2,7 +2,7 @@
 
 [![Windows and macOS CI](https://github.com/KeeVeeG/codex-claude-bridge/actions/workflows/test.yml/badge.svg)](https://github.com/KeeVeeG/codex-claude-bridge/actions/workflows/test.yml)
 
-Two-way messaging between any **Codex** conversation and any **Claude Code** conversation, in desktop apps and terminals alike: Codex Desktop or Codex CLI on one side, Claude Code in a terminal, Claude Desktop, or VS Code on the other. A Codex Desktop task can message a Claude Code session in a terminal, and a terminal Codex session can write to Claude in VS Code or Claude Desktop. Either side can start, ask, share progress, or reply whenever useful. Every message names its exact recipient: there is no pairing step, deadline, or mandatory reply. The bridge carries text through ordinary MCP tools and leaves its meaning to the participants.
+Two-way messaging between **Codex** and **Claude Code** conversations. Works with Codex and Claude in their desktop apps and terminals, in any combination. Either side can start, ask, share progress, or reply whenever useful. Every message names its exact recipient: there is no pairing step, deadline, or mandatory reply. The bridge carries text through ordinary MCP tools and leaves its meaning to the participants.
 
 - **Windows:** Codex Desktop through its local app-tools pipe, Codex CLI through the local app-server daemon or `codex queue`, Claude through its native session inbox.
 - **macOS:** Claude through its Unix inbox; Codex only through a configured SSH host (see [macOS SSH host](#macos-ssh-host)). The merged macOS implementation has not had a live smoke test yet.
@@ -10,7 +10,7 @@ Two-way messaging between any **Codex** conversation and any **Claude Code** con
 ## Requirements
 
 - Node.js 20+ on `PATH`; no npm dependencies.
-- **Windows:** Codex Desktop or Codex CLI, and a local Claude Code session (CLI, Claude Desktop, or VS Code) with a live messaging inbox.
+- **Windows:** Codex and a local Claude Code session with a live messaging inbox.
 - **macOS:** a local Claude Code session and an authenticated SSH alias for the Codex host.
 
 Out of scope: WSL, Linux (sends fail closed), remote Claude sessions, and Claude's hosted Chat conversations.

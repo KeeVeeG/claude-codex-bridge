@@ -1,11 +1,11 @@
 ---
 name: claude-bridge
-description: Find Codex and local Claude Code conversations by title, in desktop apps or terminals, then send asynchronous messages through MCP tools. Supports native Windows transports and a configured macOS SSH route to Codex. Either side can initiate and reply when its transport is available. Only main conversations use the bridge; subagents must not call its tools.
+description: Find Codex and local Claude Code conversations by title, then send asynchronous messages through MCP tools. Supports native Windows transports and a configured macOS SSH route to Codex. Either side can initiate and reply when its transport is available. Only main conversations use the bridge; subagents must not call its tools.
 ---
 
 # Codex–Claude Bridge
 
-Use the `codex-claude-desktop-bridge` MCP tools. Any Codex conversation and any Claude Code conversation can reach each other, whether it runs in a desktop app or a terminal; Claude Code also in VS Code. Either agent can find a conversation on the other side and send a message directly to its exact ID. Any Codex task can message multiple Claude Code sessions, and any Claude Code session can message multiple Codex tasks. Messages can contain information, questions, proposed work, or findings; acknowledgements and replies are optional. Neither side must wait for a response before sending another useful message.
+Use the `codex-claude-desktop-bridge` MCP tools. They work with Codex and Claude in their desktop apps and terminals, in any combination. Either agent can find a conversation on the other side and send a message directly to its exact ID. Any Codex task can message multiple Claude Code sessions, and any Claude Code session can message multiple Codex tasks. Messages can contain information, questions, proposed work, or findings; acknowledgements and replies are optional. Neither side must wait for a response before sending another useful message.
 
 Only a main conversation uses the bridge. A subagent, such as a Codex task spawned by another task or a Claude Code subagent started by its parent session, must not call any bridge tool, including discovery, `bridge_status`, and the send tools. The bridge does not address subagents: a reply would reach the main conversation instead, and a subagent's call can disrupt later delivery to its parent. Return the finding, the intended recipient, and the proposed message to the parent conversation, which decides whether to send it.
 

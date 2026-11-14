@@ -72,17 +72,21 @@ test('canonical Agent Plugins metadata generates the checked-in native adapters 
   assert.equal(claude.plugins[0].source, './compatibility/native');
 });
 
-// The bridge serves every Codex and Claude Code client, so no listing may read as one client's add-on.
-test('manifest and catalog texts cover every client, not Desktop only', () => {
+// The bridge serves every Codex and Claude Code client, so no listing may read as one client's add-on:
+// short texts name no client, and the long description names them all.
+test('manifest and catalog texts name every supported client or none', () => {
   const { manifest, files } = checkManifests(root);
   const face = manifest.extensions['com.openai'].interface;
   const codex = files['.codex-plugin/plugin.json'];
   const catalog = file => JSON.parse(fs.readFileSync(path.join(root, file), 'utf8'));
   const claudeCatalog = catalog('.claude-plugin/marketplace.json');
-  for (const text of [manifest.description, face.displayName, face.shortDescription, face.longDescription, ...face.defaultPrompt,
-    codex.description, codex.interface.displayName, codex.interface.longDescription, files['.claude-plugin/plugin.json'].description,
+  for (const text of [manifest.description, face.displayName, face.shortDescription, ...face.defaultPrompt,
+    codex.description, codex.interface.displayName, files['.claude-plugin/plugin.json'].description,
     claudeCatalog.description, claudeCatalog.plugins[0].description, catalog('.agents/plugins/marketplace.json').interface.displayName,
-  ]) assert.doesNotMatch(text, /desktop/i, text);
+  ]) assert.doesNotMatch(text, /desktop|terminal|\bcli\b|vs ?code/i, text);
+  for (const text of [face.longDescription, codex.interface.longDescription]) {
+    for (const client of [/desktop apps/, /terminals/]) assert.match(text, client, text);
+  }
   assert.ok(['desktop', 'terminal'].every(keyword => manifest.keywords.includes(keyword)));
 });
 

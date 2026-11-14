@@ -23,7 +23,7 @@
       "interface": {
         "displayName": "Codex–Claude Bridge",
         "shortDescription": "Send messages between Codex and Claude Code.",
-        "longDescription": "Find conversations and send text between Codex and Claude Code, in desktop apps and terminals alike. Windows uses native local transports; macOS reaches Codex through a configured SSH host. Either side can start a conversation or reply.",
+        "longDescription": "Find conversations and send text between Codex and Claude Code. Works with Codex and Claude in their desktop apps and terminals. Either side can start a conversation or reply. Windows uses native local transports; macOS reaches Codex through a configured SSH host.",
         "developerName": "KeeVeeG",
         "category": "Productivity",
         "capabilities": [
