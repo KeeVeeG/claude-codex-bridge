@@ -315,6 +315,20 @@ test('both staged plugins share a profile state path despite different MSIX LOCA
   assert.equal(fs.readFileSync(sourceFile, 'utf8'), sourceBefore);
 });
 
+test('every install gives the Claude server a new configuration, so /reload-plugins restarts it on the new code', t => {
+  const { homeDir } = fixture(t);
+  const versions = [];
+  for (let install = 0; install < 2; install++) {
+    const prepared = prepareInstallation({ sourceRoot: root, homeDir, codex: false, claude: true,
+      env: { LOCALAPPDATA: path.join(homeDir, 'app-private') } });
+    const { version } = JSON.parse(fs.readFileSync(path.join(prepared.destination, 'package.json'), 'utf8'));
+    assert.deepEqual(stagedServer(prepared.destination, '.claude-plugin').args,
+      ['${CLAUDE_PLUGIN_ROOT}/scripts/mcp.mjs', `--plugin-version=${version}`]);
+    versions.push(version);
+  }
+  assert.notEqual(versions[0], versions[1]);
+});
+
 test('installer pins an explicit shared state override without changing portable source config', t => {
   const { homeDir } = fixture(t);
   const sourceFile = path.join(root, '.mcp.json');

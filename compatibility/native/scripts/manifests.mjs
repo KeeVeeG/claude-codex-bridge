@@ -85,7 +85,11 @@ export function compatibilityFiles(manifest, mcp) {
   const portable = mcp.mcpServers[PLUGIN_NAME];
   const env = portable.env === undefined ? {} : { env: structuredClone(portable.env) };
   const codexServer = { command: portable.command, cwd: './', args: ['./scripts/mcp.mjs'], ...env, env_vars: [...CODEX_CONTEXT_ENV_VARS] };
-  const claudeServer = { command: portable.command, args: ['${CLAUDE_PLUGIN_ROOT}/scripts/mcp.mjs'], ...env, env_vars: [...CLAUDE_CONTEXT_ENV_VARS] };
+  // Claude runs this plugin from one fixed folder and keeps a plugin server running across /reload-plugins
+  // while its configuration is unchanged. The version, with the installer's build stamp, makes every install
+  // a new configuration, so a reload restarts the server on the new code.
+  const claudeServer = { command: portable.command, args: ['${CLAUDE_PLUGIN_ROOT}/scripts/mcp.mjs', `--plugin-version=${manifest.version}`],
+    ...env, env_vars: [...CLAUDE_CONTEXT_ENV_VARS] };
   return {
     '.codex-plugin/plugin.json': { ...metadata, skills: './skills/', mcpServers: { [PLUGIN_NAME]: codexServer },
       ...structuredClone(manifest.extensions['com.openai']) },

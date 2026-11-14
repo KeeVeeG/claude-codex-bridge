@@ -1,6 +1,6 @@
 {
   "name": "bridge-claude-codex",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Asynchronous two-way messaging between Claude Code and Codex conversations.",
   "author": {
     "name": "KeeVeeG",

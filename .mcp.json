@@ -3,7 +3,8 @@
     "bridge-claude-codex": {
       "command": "node",
       "args": [
-        "${CLAUDE_PLUGIN_ROOT}/scripts/mcp.mjs"
+        "${CLAUDE_PLUGIN_ROOT}/scripts/mcp.mjs",
+        "--plugin-version=1.0.6"
       ],
       "env_vars": [
         "CODEX_APP_TOOLS_PIPE_PATH",
