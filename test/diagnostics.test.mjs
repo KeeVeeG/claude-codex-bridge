@@ -9,7 +9,7 @@ import { executeBridgeTool } from '../lib/desktop-service.mjs';
 import { canonicalClaudeSocket, sendToClaude, probeClaudeInbox } from '../lib/claude-desktop.mjs';
 import { listCodexTools, sendToCodex } from '../lib/codex-desktop.mjs';
 import { getMessages, getSession } from '../lib/store.mjs';
-import { publishCodexHost } from '../lib/codex-host.mjs';
+import { getCodexHosts, publishCodexHost } from '../lib/codex-host.mjs';
 import { encodeFrame, mockPipe, nativeFixture, messageTool } from './native-helpers.mjs';
 
 const windowsOnly = { skip: process.platform !== 'win32' && 'Claude registry fixtures require Windows named pipes.' };
@@ -249,4 +249,111 @@ test('catalog cancellation never reports message delivery uncertainty', async t 
     assert.notEqual(error.deliveryUnknown, true);
     return true;
   });
+});
+
+function claudeCaller(fixture) {
+  return { stateDir: fixture.stateDir, registryDir: fixture.registryDir, parentPid: process.pid,
+    env: { CLAUDE_CODE_MESSAGING_SOCKET: fixture.inbox.pipePath, CODEX_CLAUDE_BRIDGE_DAEMON: 'off' },
+    desktop: { catalogMs: 500, listMs: 400, budgetMs: 5000 } };
+}
+
+// A stalled Desktop keeps answering its catalog but never finishes list_threads, while a
+// record of a long-gone launch fails instantly and would otherwise be the last error shown.
+test('a stalled Desktop is reported as stalled, not hidden behind endpoints of earlier launches', windowsOnly, async t => {
+  const fixture = await claudeFixture(t);
+  const codex = await mockPipe(t, { framed: true, onMessage(message, socket) {
+    if (message.method === 'tools/list') answer(socket, message.id, { tools: [messageTool, listTool] });
+  } });
+  for (const threadId of ['older-context', 'latest-context']) {
+    publishCodexHost({ stateDir: fixture.stateDir, pipePath: codex.pipePath, threadId });
+  }
+  const earlier = await mockPipe(t);
+  publishCodexHost({ stateDir: fixture.stateDir, pipePath: earlier.pipePath, threadId: 'earlier-launch' });
+  await earlier.close();
+  const context = claudeCaller(fixture);
+  await assert.rejects(executeBridgeTool('list_codex_chats', { limit: 5 }, context), error => {
+    assert.match(error.message, /running but did not answer in time; restart Codex Desktop/);
+    assert.match(error.message, /1 saved endpoint belongs to earlier Codex Desktop launches\./);
+    assert.doesNotMatch(error.message, /ENOENT|Last error|Open a Codex Desktop task/);
+    return true;
+  });
+  // A stalled app is waited for once, not once per saved context.
+  const calls = () => codex.messages.filter(entry => entry.message.method === 'tools/call').length;
+  assert.equal(calls(), 1);
+  const doctor = await executeBridgeTool('bridge_doctor', {}, context);
+  const check = name => doctor.checks.find(entry => entry.name === name);
+  assert.equal(check('codex_registry').status, 'pass');
+  assert.match(check('codex_registry').detail, /2 of 3 point to an existing endpoint/);
+  assert.equal(check('codex_tools').status, 'pass');
+  assert.equal(check('codex_context').status, 'fail');
+  assert.match(check('codex_context').detail, /did not answer in time; restart Codex Desktop/);
+  assert.equal(calls(), 2);
+});
+
+test('bridge_status from a Codex Desktop task registers its endpoint, as the recovery advice says', async t => {
+  const fixture = await nativeFixture(t);
+  const codex = await mockPipe(t, { framed: true });
+  await executeBridgeTool('bridge_status', {}, { env: { CODEX_APP_TOOLS_PIPE_PATH: codex.pipePath },
+    metadata: { 'openai/threadId': 'status-context' }, stateDir: fixture.stateDir });
+  assert.deepEqual(getCodexHosts({ stateDir: fixture.stateDir }).map(host => [host.pipePath, host.threadId]),
+    [[codex.pipePath, 'status-context']]);
+  assert.equal(codex.connections.length, 0, 'registration sends nothing to Desktop');
+});
+
+test('only endpoints of earlier launches point to opening Codex Desktop', windowsOnly, async t => {
+  const fixture = await claudeFixture(t);
+  const earlier = await mockPipe(t);
+  publishCodexHost({ stateDir: fixture.stateDir, pipePath: earlier.pipePath, threadId: 'earlier-launch' });
+  await earlier.close();
+  await assert.rejects(executeBridgeTool('list_codex_chats', {}, claudeCaller(fixture)),
+    /1 saved endpoint belongs to earlier Codex Desktop launches\. Open a Codex Desktop task with the bridge enabled/);
+});
+
+test('a send reuses the context Desktop accepted earlier even while chat discovery stalls', windowsOnly, async t => {
+  const fixture = await claudeFixture(t);
+  let stalled = false;
+  const codex = await mockPipe(t, { framed: true, onMessage(message, socket) {
+    if (message.method === 'tools/list') return answer(socket, message.id, { tools: [messageTool, listTool] });
+    if (message.params.tool !== 'list_threads') return answer(socket, message.id, { success: true, contentItems: [] });
+    if (!stalled) answer(socket, message.id, { success: true, contentItems: [{ type: 'inputText',
+      text: JSON.stringify({ threads: [{ id: 'target-task', kind: 'codex', title: 'Target' }] }) }] });
+  } });
+  publishCodexHost({ stateDir: fixture.stateDir, pipePath: codex.pipePath, threadId: 'host-context' });
+  const context = claudeCaller(fixture);
+  const listed = await executeBridgeTool('list_codex_chats', { limit: 5 }, context);
+  assert.deepEqual(listed.chats.map(chat => chat.thread_id), ['target-task']);
+  stalled = true;
+  // Diagnosing the stall must not cost the context that sends still work with.
+  await assert.rejects(executeBridgeTool('list_codex_chats', { limit: 5 }, context), /did not answer in time/);
+  assert.equal((await executeBridgeTool('bridge_doctor', {}, context)).checks
+    .find(entry => entry.name === 'codex_context').status, 'fail');
+  const sent = await executeBridgeTool('send_to_codex', { thread_id: 'target-task', transport: 'desktop',
+    message: 'Arrives while discovery stalls.' }, context);
+  assert.equal(sent.message.status, 'submitted');
+  const calls = codex.messages.filter(entry => entry.message.method === 'tools/call').map(entry => entry.message.params);
+  assert.deepEqual(calls.map(call => call.tool), ['list_threads', 'list_threads', 'list_threads', 'send_message_to_thread']);
+  assert.equal(calls[3].threadId, 'host-context');
+  assert.equal(codex.messages.filter(entry => entry.message.method === 'tools/list').length, 4,
+    'each call reads the catalog once and hands it to the tool call');
+});
+
+test('a wait the budget cut short is reported as unchecked, not as a stalled Desktop', windowsOnly, async t => {
+  const fixture = await claudeFixture(t);
+  const codex = await mockPipe(t, { framed: true, onMessage(message, socket) {
+    if (message.method === 'tools/list') return answer(socket, message.id, { tools: [messageTool, listTool] });
+    // A slow Desktop build: the removed context is rejected late and the valid one answers late too.
+    if (message.params.threadId === 'removed-context') setTimeout(() => socket.write(encodeFrame({ jsonrpc: '2.0',
+      id: message.id, error: { code: -32603, message: 'Codex app tool request failed' } })), 700);
+    else setTimeout(() => answer(socket, message.id, { success: true,
+      contentItems: [{ type: 'inputText', text: '{"threads":[]}' }] }), 950);
+  } });
+  for (const threadId of ['valid-context', 'removed-context']) {
+    publishCodexHost({ stateDir: fixture.stateDir, pipePath: codex.pipePath, threadId });
+  }
+  const doctor = await executeBridgeTool('bridge_doctor', {}, { ...claudeCaller(fixture),
+    desktop: { catalogMs: 500, listMs: 1000, budgetMs: 1500 } });
+  const check = doctor.checks.find(entry => entry.name === 'codex_context');
+  assert.equal(check.status, 'warning');
+  assert.match(check.detail, /rejected 1 saved task context.*1 saved endpoint record could not be checked within 1\.5 s/);
+  assert.doesNotMatch(check.detail, /restart/);
 });

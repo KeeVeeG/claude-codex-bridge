@@ -39,7 +39,9 @@ function request(pipePath, method, params, { timeoutMs = 30000, mutating = false
     let pending = Buffer.alloc(0);
     let finished = false;
     let submitted = false;
-    const timer = setTimeout(() => fail(new Error('Codex Desktop did not answer before the local request timeout.')), timeoutMs);
+    const timer = setTimeout(() => fail(Object.assign(new Error(submitted
+      ? 'Codex Desktop accepted the request but did not answer before the local request timeout.'
+      : 'Codex Desktop did not accept the connection before the local request timeout.'), { code: 'DESKTOP_TIMEOUT' })), timeoutMs);
 
     function finish(error, result) {
       if (finished) return;
@@ -71,7 +73,8 @@ function request(pipePath, method, params, { timeoutMs = 30000, mutating = false
     });
     socket.on('error', error => {
       if (error.code === 'ENOENT') {
-        fail(new Error('Codex Desktop endpoint from a previous launch is unavailable (ENOENT). Open a Codex task with the bridge enabled so its MCP server can register the current endpoint.'));
+        fail(Object.assign(new Error('This Codex Desktop endpoint belongs to an earlier Codex Desktop launch and no longer exists.'),
+          { code: 'ENDPOINT_GONE' }));
         return;
       }
       const code = error.code ? ` (${error.code})` : '';
@@ -130,21 +133,21 @@ export async function listCodexTools(pipePath, { signal, timeoutMs = 10000 } = {
 }
 
 /** Discover actual local Codex chats through the running Desktop app. */
-async function listNativeCodexChats({ pipePath, contextThreadId, limit = 30, signal, timeoutMs = 10000 }) {
+async function listNativeCodexChats({ pipePath, contextThreadId, limit = 30, signal, timeoutMs = 10000, catalog }) {
   checkCancellation(signal);
   requiredText(contextThreadId, 'Registered Codex context task id');
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_CODEX_CHAT_LIMIT) {
     throw new Error(`limit must be between 1 and ${MAX_CODEX_CHAT_LIMIT}`);
   }
-  const catalog = await listCodexTools(pipePath, { signal, timeoutMs });
-  const tool = catalog.find(item => item.name === 'list_threads');
+  const tool = (catalog ?? await listCodexTools(pipePath, { signal, timeoutMs })).find(item => item.name === 'list_threads');
   if (!tool?.namespace) throw new Error('This Codex Desktop version does not expose chat discovery');
   const result = await request(pipePath, 'tools/call', {
     arguments: { limit }, callerSource: 'codex', namespace: tool.namespace, tool: tool.name,
     threadId: contextThreadId, callId: `bridge-list-${randomUUID()}`, turnId: `bridge-list-${randomUUID()}`,
   }, { timeoutMs, signal }).catch(error => {
     if (error.message === 'Codex Desktop: Codex app tool request failed') {
-      throw new Error('Codex Desktop rejected the registered task context. Ask an open Codex task to call bridge_status, then retry discovery.');
+      throw Object.assign(new Error('Codex Desktop rejected the registered task context. Ask an open Codex task to call bridge_status, then retry discovery.'),
+        { code: 'CONTEXT_REJECTED' });
     }
     throw error;
   });
@@ -182,13 +185,12 @@ async function listNativeCodexChats({ pipePath, contextThreadId, limit = 30, sig
  * Never retry this function automatically: the Desktop tool has no documented
  * idempotency guarantee. On transport loss deliveryUnknown is set on the error.
  */
-async function sendNativeToCodex({ pipePath, contextThreadId, threadId, message, turnId, callId, signal }) {
+async function sendNativeToCodex({ pipePath, contextThreadId, threadId, message, turnId, callId, signal, catalog }) {
   checkCancellation(signal);
   requiredText(contextThreadId, 'Registered Codex context task id');
   requiredText(threadId, 'Selected Codex task id');
   requiredText(message, 'Message');
-  const catalog = await listCodexTools(pipePath, { signal });
-  const tool = catalog.find(item => item.name === 'send_message_to_thread');
+  const tool = (catalog ?? await listCodexTools(pipePath, { signal })).find(item => item.name === 'send_message_to_thread');
   if (!tool || typeof tool.namespace !== 'string' || !tool.namespace) {
     throw new Error('This Codex Desktop version does not expose send_message_to_thread.');
   }

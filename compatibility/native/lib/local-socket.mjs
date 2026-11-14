@@ -1,4 +1,30 @@
+import fs from 'node:fs';
 import { posix } from 'node:path';
+
+const PIPE_ROOT = '\\\\.\\pipe\\';
+
+/** A checker telling whether a local IPC endpoint still exists, or undefined when it cannot tell.
+ * It never connects: a connect, and even a stat, takes one of a Windows pipe server's instances,
+ * so Windows reads the pipe directory instead, once per checker.
+ */
+export function localSocketPresence() {
+  let pipes;
+  return socketPath => {
+    const canonical = canonicalLocalSocket(socketPath);
+    if (!canonical) return undefined;
+    try {
+      if (process.platform !== 'win32') { fs.lstatSync(canonical); return true; }
+      const name = canonical.slice(PIPE_ROOT.length);
+      // LOCAL\ pipes are not listed at the root, and Windows folds non-ASCII case by rules
+      // canonicalLocalSocket does not apply, so a live pipe could look absent.
+      if (name.includes('\\') || /[^\x20-\x7e]/.test(name)) return undefined;
+      pipes ??= new Set(fs.readdirSync(PIPE_ROOT).map(entry => entry.replace(/[A-Z]/g, letter => letter.toLowerCase())));
+      return pipes.has(name);
+    } catch (error) {
+      return process.platform !== 'win32' && error.code === 'ENOENT' ? false : undefined;
+    }
+  };
+}
 
 /** Canonical local IPC addresses, without probing or resolving filesystem links. */
 export function canonicalLocalSocket(socketPath, platform = process.platform) {

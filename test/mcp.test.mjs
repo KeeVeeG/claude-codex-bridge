@@ -492,7 +492,7 @@ test('MCP advertises direct, addressed messages without pair-management tools or
     assert.equal(tool.outputSchema.type, 'object');
     assert.equal(tool.outputSchema.additionalProperties, false);
     const sending = ['send_to_claude', 'send_to_codex', 'bridge_ui_send', 'bridge_ui_retry_notice'].includes(tool.name);
-    assert.equal(tool.annotations.readOnlyHint, !sending);
+    assert.equal(tool.annotations.readOnlyHint, !sending && tool.name !== 'bridge_status');
     assert.equal(tool.annotations.destructiveHint, sending);
     assert.equal(tool.annotations.openWorldHint, false);
     assert.equal(tool.annotations.idempotentHint, !sending);

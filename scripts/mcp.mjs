@@ -100,12 +100,11 @@ export const TOOLS = [
   {
     name: 'bridge_status',
     title: 'Inspect bridge delivery status',
-    description: 'Inspect this verified Codex or Claude conversation\'s recent outgoing delivery records. Does not send or consume messages.',
+    description: 'Inspect this verified Codex or Claude conversation\'s recent outgoing delivery records. Called from a Codex Desktop task, it also registers that task so Claude can discover and message this Codex Desktop. Does not send or consume messages.',
     inputSchema: schema({ limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Maximum number of recent messages to return.' } }),
     outputSchema: schema({ application: { type: 'string', enum: ['codex', 'claude'] },
       sender_id: outputText, state_directory: outputText, messages: { type: 'array', items: messageRecord },
       note: outputText, plugin_version: outputText }, ['application', 'sender_id', 'state_directory', 'messages', 'note', 'plugin_version']),
-    annotations: { readOnlyHint: true },
   },
   {
     name: 'bridge_doctor',
@@ -164,10 +163,13 @@ export const TOOLS = [
   },
 ];
 
+// Sends are destructive: they cannot be recalled or safely repeated. bridge_status only
+// registers the calling task, which a repeat leaves unchanged.
+const SENDING = ['send_to_claude', 'send_to_codex', 'bridge_ui_send', 'bridge_ui_retry_notice'];
 for (const tool of TOOLS) {
-  const readOnly = !['send_to_claude', 'send_to_codex', 'bridge_ui_send', 'bridge_ui_retry_notice'].includes(tool.name);
-  tool.annotations = { readOnlyHint: readOnly, destructiveHint: !readOnly,
-    openWorldHint: false, idempotentHint: readOnly };
+  const sending = SENDING.includes(tool.name);
+  tool.annotations = { readOnlyHint: !sending && tool.name !== 'bridge_status', destructiveHint: sending,
+    openWorldHint: false, idempotentHint: !sending };
 }
 
 function validateValue(value, specification, name) {

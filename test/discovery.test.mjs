@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
@@ -7,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { canonicalClaudeSocket, discoverClaudeSessions, resolveClaudeCaller, resolveClaudeSession } from '../lib/claude-desktop.mjs';
 import { getCodexHost, getCodexHosts, publishCodexHost } from '../lib/codex-host.mjs';
-import { nativeFixture } from './native-helpers.mjs';
+import { mockPipe, nativeFixture } from './native-helpers.mjs';
 
 const windowsOnly = { skip: process.platform !== 'win32' && 'Native Claude Desktop process metadata is Windows-specific.' };
 const processStart = process.platform === 'win32'
@@ -95,10 +96,12 @@ test('a different process claiming the same socket cannot change the direct pare
     socketPath: setup.socketPath }), /process identity changed|invalid creation metadata|key/);
 });
 
-test('Codex host publication is atomic and survives publisher exit without an arbitrary expiry', async t => {
+test('Codex host publication is atomic, survives publisher exit without an arbitrary expiry, and drops vanished endpoints', async t => {
   const setup = await nativeFixture(t);
+  const live = await mockPipe(t);
+  const vanished = await mockPipe(t);
   assert.equal(getCodexHost({ stateDir: setup.stateDir }), null);
-  const first = publishCodexHost({ stateDir: setup.stateDir, pipePath: localEndpoint('codex-host-test'), threadId: 'known-context' });
+  const first = publishCodexHost({ stateDir: setup.stateDir, pipePath: live.pipePath, threadId: 'known-context' });
   assert.deepEqual(getCodexHost({ stateDir: setup.stateDir }), first);
   const file = path.join(setup.stateDir, 'codex-host.json');
   const previous = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -106,10 +109,23 @@ test('Codex host publication is atomic and survives publisher exit without an ar
   previous.publishedAt = 1;
   fs.writeFileSync(file, JSON.stringify(previous));
   assert.equal(getCodexHost({ stateDir: setup.stateDir }).threadId, 'known-context');
+  publishCodexHost({ stateDir: setup.stateDir, pipePath: vanished.pipePath, threadId: 'vanished-context' });
+  await vanished.close();
   const second = publishCodexHost({ stateDir: setup.stateDir, pipePath: localEndpoint('codex-host-test-2'), threadId: 'new-context' });
   assert.deepEqual(getCodexHost({ stateDir: setup.stateDir }), second);
   assert.deepEqual(getCodexHosts({ stateDir: setup.stateDir }), [second, { ...first, pid: 2_147_483_647, publishedAt: 1 }]);
   assert.deepEqual(fs.readdirSync(setup.stateDir), ['codex-host.json']);
+});
+
+test('Codex host publication keeps a live pipe whose name Windows folds beyond ASCII', windowsOnly, async t => {
+  const setup = await nativeFixture(t);
+  const pipePath = `\\\\.\\pipe\\codex-claude-bridge-test-${randomUUID()}-Ä`;
+  const server = net.createServer(socket => socket.destroy());
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(pipePath, resolve); });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  publishCodexHost({ stateDir: setup.stateDir, pipePath, threadId: 'unicode-context' });
+  publishCodexHost({ stateDir: setup.stateDir, pipePath: localEndpoint('codex-host-test-2'), threadId: 'new-context' });
+  assert.deepEqual(getCodexHosts({ stateDir: setup.stateDir }).map(host => host.threadId), ['new-context', 'unicode-context']);
 });
 
 test('Codex host publication retries Windows sharing contention', windowsOnly, async t => {
