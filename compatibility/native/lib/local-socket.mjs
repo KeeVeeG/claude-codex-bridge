@@ -18,12 +18,22 @@ export function localSocketPresence() {
       // LOCAL\ pipes are not listed at the root, and Windows folds non-ASCII case by rules
       // canonicalLocalSocket does not apply, so a live pipe could look absent.
       if (name.includes('\\') || /[^\x20-\x7e]/.test(name)) return undefined;
-      pipes ??= new Set(fs.readdirSync(PIPE_ROOT).map(entry => entry.replace(/[A-Z]/g, letter => letter.toLowerCase())));
+      pipes ??= pipeNames();
       return pipes.has(name);
     } catch (error) {
       return process.platform !== 'win32' && error.code === 'ENOENT' ? false : undefined;
     }
   };
+}
+
+// Node 20 cannot scandir the pipe root (ENOTDIR); opendir reads it on every supported version.
+function pipeNames() {
+  const directory = fs.opendirSync(PIPE_ROOT);
+  const names = new Set();
+  try {
+    for (let entry; (entry = directory.readSync());) names.add(entry.name.replace(/[A-Z]/g, letter => letter.toLowerCase()));
+  } finally { directory.closeSync(); }
+  return names;
 }
 
 /** Canonical local IPC addresses, without probing or resolving filesystem links. */

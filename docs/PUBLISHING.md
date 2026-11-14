@@ -11,6 +11,8 @@ npm test
 npm run package
 ```
 
+Run `npm test` on Node.js 20 too: it is the oldest supported version, and Windows file-system behaviour differs between Node.js versions.
+
 The packager writes these artifacts under `dist/`:
 
 - `claude-codex-bridge-<version>.zip`: the native compatibility plugin and local installer for Windows or the configured macOS SSH workflow.
