@@ -115,13 +115,27 @@ test('CLI clear and resume follow the current exact session ID without retaining
   assert.equal(resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid }).sessionId, originalId);
 });
 
-test('duplicate Claude session IDs across Desktop and CLI remain ambiguous', async t => {
-  const setup = await fixture(t);
-  fs.writeFileSync(path.join(setup.registryDir, `${process.ppid}.json`), JSON.stringify({
-    ...setup.record, pid: process.ppid, entrypoint: 'claude-desktop',
-  }));
-  assert.throws(() => resolveClaudeSession(setup.record.sessionId, { registryDir: setup.registryDir }), /More than one process/);
-  assert.throws(() => resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid }), /More than one process/);
+test('a conversation open in two windows takes messages in the one used last, and each window can call the bridge', nativeIdentityOnly, async t => {
+  const pipe = await mockPipe(t);
+  const setup = await fixture(t, { socketPath: pipe.pipePath });
+  const other = { ...setup.record, pid: process.ppid, entrypoint: 'claude-desktop', procStart: readProcessStart(process.ppid),
+    messagingSocketPath: socketName(), name: 'Older window' };
+  const otherKey = `${other.pid}.${createHash('sha256').update(canonicalClaudeSocket(other.messagingSocketPath)).digest('hex')}.key`;
+  fs.writeFileSync(path.join(setup.registryDir, otherKey), JSON.stringify({ ...setup.key, peerToken: '2'.repeat(32), [keyStartField]: other.procStart }));
+  const writeOther = values => fs.writeFileSync(path.join(setup.registryDir, `${other.pid}.json`), JSON.stringify(Object.assign(other, values)));
+  const resolve = () => resolveClaudeSession(setup.record.sessionId, { registryDir: setup.registryDir });
+  writeOther({ updatedAt: 1000 });
+  setup.rewrite({ updatedAt: 2000 });
+  const endpoint = resolve();
+  assert.equal(endpoint.pid, process.pid);
+  assert.deepEqual(discoverClaudeSessions({ registryDir: setup.registryDir }).map(session => session.pid), [process.pid]);
+  writeOther({ updatedAt: 3000 });
+  assert.equal(resolve().token, '2'.repeat(32));
+  for (const pid of [process.pid, process.ppid]) {
+    assert.equal(resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: pid }).pid, pid);
+  }
+  const receipt = await sendToClaude({ ...endpoint, message: 'Stays with the window it was sent to' });
+  assert.equal(receipt.status, 'written', 'the other window becoming active does not redirect a send under way');
 });
 
 test('resolving a CLI inbox revalidates entrypoint and session changes during the key read', nativeIdentityOnly, async t => {
@@ -174,7 +188,7 @@ test('resolved Desktop and CLI endpoints preserve issue #1 and send only while t
 });
 
 test('CLI destination changes after resolution fail before writing credentials or message bytes', nativeIdentityOnly, async t => {
-  for (const change of ['session', 'entrypoint', 'process-start', 'domain', 'key-token', 'key-start', 'key-domain', 'socket', 'duplicate']) {
+  for (const change of ['session', 'entrypoint', 'process-start', 'domain', 'key-token', 'key-start', 'key-domain', 'socket']) {
     await t.test(change, async sub => {
       const pipe = await mockPipe(sub);
       const setup = await fixture(sub, { socketPath: pipe.pipePath });
@@ -184,8 +198,6 @@ test('CLI destination changes after resolution fail before writing credentials o
       else if (change === 'process-start') setup.rewrite({ procStart: '1' });
       else if (change === 'domain') setup.rewrite({ pidDomain: `${processDomain}:different-host` });
       else if (change === 'socket') setup.rewrite({ messagingSocketPath: socketName() });
-      else if (change === 'duplicate') fs.writeFileSync(path.join(setup.registryDir, `${process.ppid}.json`),
-        JSON.stringify({ ...setup.record, pid: process.ppid, entrypoint: 'claude-desktop' }));
       else {
         if (change === 'key-token') setup.key.peerToken = '2'.repeat(32);
         if (change === 'key-start') setup.key[keyStartField] = '1';

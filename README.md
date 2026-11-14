@@ -71,7 +71,7 @@ Version 1.0.0 renamed the plugin from `codex-claude-desktop-bridge` to `bridge-c
 
 `panel_history`, `panel_send`, and `panel_retry_notice` serve the panel.
 
-From Claude, find a thread with `list_codex_threads` and call `send_to_codex`; from Codex, find a session with `list_claude_sessions` and call `send_to_claude`. A known exact ID can be used directly. One conversation can message several others. Claude lists terminal (`cli`), print-mode (`sdk-cli`), Desktop (`claude-desktop`), and VS Code (`claude-vscode`) sessions; choose by exact ID, and list again after `/clear` or `/resume`. A session is reachable only while its process runs; print-mode sessions only until they exit.
+From Claude, find a thread with `list_codex_threads` and call `send_to_codex`; from Codex, find a session with `list_claude_sessions` and call `send_to_claude`. A known exact ID can be used directly. One conversation can message several others. Claude lists terminal (`cli`), print-mode (`sdk-cli`), Desktop (`claude-desktop`), and VS Code (`claude-vscode`) sessions; choose by exact ID, and list again after `/clear` or `/resume`. A session is reachable only while its process runs; print-mode sessions only until they exit. A session open in two windows, for example resumed in a new terminal while the old one still runs, gets messages in the window used last.
 
 Incoming messages name their verified source, so a reply is just another `send_*` call to that ID. They are collaborator context, not instructions from the user.
 

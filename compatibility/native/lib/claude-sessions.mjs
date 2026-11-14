@@ -121,6 +121,19 @@ function nativeRecords(directory) {
   return records;
 }
 
+const lastActive = record => [record.updatedAt, record.startedAt].find(Number.isSafeInteger) ?? 0;
+
+/** One conversation can be open in several windows, for example when it was resumed in a new terminal
+ * while the old one stayed open. Messages to it go to the window used last. */
+function latestPerSession(records) {
+  const latest = new Map();
+  for (const record of records) {
+    const known = latest.get(record.sessionId);
+    if (!known || lastActive(record) > lastActive(known)) latest.set(record.sessionId, record);
+  }
+  return [...latest.values()];
+}
+
 /** List live native Claude Code sessions without exposing credentials or endpoints. */
 export function discoverClaudeSessions({ registryDir } = {}) {
   let directory;
@@ -128,7 +141,7 @@ export function discoverClaudeSessions({ registryDir } = {}) {
     if (error.code === 'ENOENT') return [];
     throw error;
   }
-  return nativeRecords(directory).map(metadata);
+  return latestPerSession(nativeRecords(directory)).map(metadata);
 }
 
 function sameSessionIdentity(left, right) {
@@ -147,10 +160,12 @@ function assertProcessStart(record) {
 export function resolveClaudeSession(sessionId, { registryDir } = {}) {
   if (typeof sessionId !== 'string' || !sessionId.trim()) throw new Error('An explicit Claude session ID is required.');
   const directory = registryLocation(registryDir);
-  const records = nativeRecords(directory).filter(record => record.sessionId === sessionId);
-  if (records.length === 0) throw new Error('The chosen Claude Code session is unavailable or has no live inbox.');
-  if (records.length !== 1) throw new Error('More than one process claims this Claude session. Close the duplicate before connecting.');
-  const record = records[0];
+  const [record] = latestPerSession(nativeRecords(directory).filter(record => record.sessionId === sessionId));
+  if (!record) throw new Error('The chosen Claude Code session is unavailable or has no live inbox.');
+  return resolveRecord(directory, record, 'Claude session changed while resolving its inbox. Select its current conversation and retry.');
+}
+
+function resolveRecord(directory, record, changedMessage) {
   assertProcessStart(record);
   const socketPath = canonicalPipe(record.messagingSocketPath);
   const keyHash = createHash('sha256').update(socketPath).digest('hex');
@@ -164,9 +179,7 @@ export function resolveClaudeSession(sessionId, { registryDir } = {}) {
   }
   // Catch a restart or registry replacement that occurred during the key read.
   const current = readRegularJson(join(directory, `${record.pid}.json`), 65_536);
-  if (!sameSessionIdentity(current, record) || !processIsAlive(record.pid)) {
-    throw new Error('Claude session changed while resolving its inbox. Select its current conversation and retry.');
-  }
+  if (!sameSessionIdentity(current, record) || !processIsAlive(record.pid)) throw new Error(changedMessage);
   const endpoint = Object.freeze({ ...metadata(record), socketPath, token: key.peerToken });
   return { ...endpoint, [RESOLVED_SESSION]: Object.freeze({ directory, endpoint }) };
 }
@@ -176,8 +189,10 @@ function verifyResolvedSession(resolved, { socketPath, token, sessionId }) {
   if (canonicalPipe(socketPath) !== expected.socketPath || token !== expected.token || sessionId !== expected.sessionId) {
     throw new Error('Claude destination differs from the selected session. Select its current conversation and retry.');
   }
-  const current = resolveClaudeSession(expected.sessionId, { registryDir: resolved.directory });
-  if (!sameSessionIdentity(current, expected) || current.token !== expected.token) {
+  // Recheck the chosen window itself: the same conversation opened in another window does not redirect a send under way.
+  const record = nativeRecords(resolved.directory).find(record => record.pid === expected.pid);
+  const current = record && resolveRecord(resolved.directory, record, 'Claude destination changed before the message was written. Select its current conversation and retry.');
+  if (!current || !sameSessionIdentity(current, expected) || current.token !== expected.token) {
     throw new Error('Claude destination changed before the message was written. Select its current conversation and retry.');
   }
 }
@@ -203,12 +218,8 @@ export function resolveClaudeCaller({ registryDir, parentPid = process.ppid,
   if (matches.length === 0) {
     throw new Error('Cannot identify the calling Claude Code session from its direct parent and socket. Reload its bridge MCP server; launch it directly without an intermediary shell.');
   }
-  const matched = matches[0];
-  const endpoint = resolveClaudeSession(matched.sessionId, { registryDir: directory });
-  if (!sameSessionIdentity(endpoint, matched)) {
-    throw new Error('Claude caller changed while resolving its identity. Reload the bridge in that Code session.');
-  }
-  return endpoint;
+  // The caller is its own parent process, even when its conversation is also open in another window.
+  return resolveRecord(directory, matches[0], 'Claude caller changed while resolving its identity. Reload the bridge in that Code session.');
 }
 
 function checkToken(token) {

@@ -35,7 +35,7 @@ Call `send_to_codex` with the selected `thread_id`, `message`, and optionally a 
 
 ## Start from Codex
 
-Call `list_claude_sessions` to find the intended Claude conversation by title. If more than one candidate fits the user's description, show their safe metadata and ask the user to choose. A known exact `session_id` can be used without listing again.
+Call `list_claude_sessions` to find the intended Claude conversation by title. If more than one candidate fits the user's description, show their safe metadata and ask the user to choose. A known exact `session_id` can be used without listing again. A session open in two windows gets the message in the window used last.
 
 Each entry's `entrypoint` names its client: interactive `cli`, print-mode `sdk-cli` (such as `claude -p`), `claude-desktop`, or Claude Code in VS Code (`claude-vscode`); all can be available at once. Print-mode recipients must still be running. Select the exact session, never the newest session in the same directory. Recheck its ID after `/clear`, `/resume`, or reopening when identity may have changed.
 
