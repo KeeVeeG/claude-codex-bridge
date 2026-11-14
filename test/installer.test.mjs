@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { prepareInstallation, installApplications, writeJsonAtomic, PLUGIN_NAME, RUNTIME_FILES, CLAUDE_SEND_PERMISSION, grantClaudeSendPermission } from '../scripts/install.mjs';
+import { main, prepareInstallation, installApplications, writeJsonAtomic, PLUGIN_NAME, RUNTIME_FILES, CLAUDE_SEND_PERMISSION, grantClaudeSendPermission } from '../scripts/install.mjs';
 import { checkManifests } from '../scripts/manifests.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -24,6 +25,25 @@ function fixture(t) {
   const marketplacePath = path.join(homeDir, '.agents', 'plugins', 'marketplace.json');
   fs.mkdirSync(path.dirname(marketplacePath), { recursive: true });
   return { homeDir, marketplacePath };
+}
+
+function installationOptions(homeDir) {
+  return { homeDir, env: {}, log() {}, execute() { return '[]'; } };
+}
+
+function backupFixture(t) {
+  const setup = fixture(t);
+  const prepared = prepareInstallation({ sourceRoot: root, homeDir: setup.homeDir, env: {} });
+  const pluginsDir = path.dirname(prepared.destination);
+  const suffixes = [1, 2].map(value => `${String(value).padStart(17, '0')}-${randomUUID()}`);
+  const stagedBackups = suffixes.map(suffix => path.join(pluginsDir, `.${PLUGIN_NAME}.backup-${suffix}`));
+  const marketplaceBackups = suffixes.map(suffix => `${setup.marketplacePath}.backup-${suffix}`);
+  for (const directory of stagedBackups) {
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, 'previous.txt'), 'previous staged files');
+  }
+  for (const filename of marketplaceBackups) fs.writeFileSync(filename, 'previous catalog');
+  return { ...setup, destination: prepared.destination, pluginsDir, stagedBackups, marketplaceBackups };
 }
 
 function stagedServer(destination, manifestDirectory) {
@@ -90,6 +110,123 @@ async function probeMcpStartup(server, cwd, env) {
     });
   });
 }
+
+test('successful installation prunes older installer backups and retains this run and all Claude settings backups', async t => {
+  const setup = backupFixture(t);
+  const { homeDir, marketplacePath, stagedBackups, marketplaceBackups } = setup;
+  fs.writeFileSync(marketplacePath, JSON.stringify({ name: 'personal', plugins: [] }));
+  const settingsFile = path.join(homeDir, '.claude', 'settings.json');
+  fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
+  fs.writeFileSync(settingsFile, '{"model":"keep"}\n');
+  const settingsBackups = marketplaceBackups.map(filename => `${settingsFile}.backup-${filename.split('.backup-')[1]}`);
+  for (const filename of settingsBackups) fs.writeFileSync(filename, 'previous settings');
+  const options = installationOptions(homeDir);
+  options.execute = () => {
+    for (const filename of [...stagedBackups, ...marketplaceBackups]) assert.ok(fs.existsSync(filename), 'backups must survive every installation command');
+    return '[]';
+  };
+  const prepared = await main([], options);
+  assert.ok(prepared.backupDirectory);
+  assert.ok(prepared.marketplaceBackup);
+  assert.ok(fs.existsSync(path.join(prepared.backupDirectory, '.codex-plugin', 'plugin.json')));
+  assert.equal(fs.readFileSync(prepared.marketplaceBackup, 'utf8'), JSON.stringify({ name: 'personal', plugins: [] }));
+  for (const filename of [...stagedBackups, ...marketplaceBackups]) assert.equal(fs.existsSync(filename), false);
+  for (const filename of settingsBackups) assert.equal(fs.readFileSync(filename, 'utf8'), 'previous settings');
+  assert.equal(fs.readdirSync(path.dirname(settingsFile)).filter(name => name.startsWith('settings.json.backup-')).length, 3);
+});
+
+test('successful installation keeps the newest existing backups when this run makes none', async t => {
+  for (const target of ['--codex', '--claude']) {
+    await t.test(target, async sub => {
+      const { homeDir, destination, stagedBackups, marketplaceBackups } = backupFixture(sub);
+      fs.rmSync(destination, { recursive: true });
+      const prepared = await main([target], installationOptions(homeDir));
+      assert.equal(prepared.backupDirectory, null);
+      assert.equal(prepared.marketplaceBackup, null);
+      for (const backups of [stagedBackups, marketplaceBackups]) {
+        assert.equal(fs.existsSync(backups[0]), false);
+        assert.equal(fs.existsSync(backups[1]), true);
+      }
+    });
+  }
+});
+
+test('failed installations do not prune any older backups', async t => {
+  for (const failure of ['staging', 'codex', 'claude', 'permissions', 'host registration']) {
+    await t.test(failure, async sub => {
+      const { homeDir, destination, stagedBackups, marketplaceBackups } = backupFixture(sub);
+      const options = installationOptions(homeDir);
+      let expected = /simulated installation failure/;
+      if (failure === 'staging') {
+        fs.writeFileSync(path.join(destination, '.codex-plugin', 'plugin.json'), '{"name":"another-plugin"}');
+        expected = /belongs to another/;
+      } else if (failure === 'permissions') {
+        const settingsFile = path.join(homeDir, '.claude', 'settings.json');
+        fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
+        fs.writeFileSync(settingsFile, JSON.stringify({ permissions: { deny: [CLAUDE_SEND_PERMISSION] } }));
+        expected = /already matches/;
+      } else if (failure === 'host registration') {
+        options.env = { CODEX_APP_TOOLS_PIPE_PATH: 'https://invalid.example', CODEX_THREAD_ID: 'test-source' };
+        expected = /local named pipe or absolute Unix socket/;
+      } else {
+        options.execute = (command, args) => {
+          if (command === failure && (command === 'codex' || args[1] === 'install')) throw new Error('simulated installation failure');
+          return '[]';
+        };
+      }
+      await assert.rejects(main([], options), expected);
+      for (const filename of marketplaceBackups) assert.equal(fs.readFileSync(filename, 'utf8'), 'previous catalog');
+      for (const directory of stagedBackups) assert.equal(fs.readFileSync(path.join(directory, 'previous.txt'), 'utf8'), 'previous staged files');
+    });
+  }
+});
+
+test('preparation-only staging never prunes older backups', async t => {
+  const { homeDir, stagedBackups, marketplaceBackups } = backupFixture(t);
+  const options = installationOptions(homeDir);
+  options.execute = () => assert.fail('Preparation must not invoke application commands');
+  await main(['--prepare-only'], options);
+  for (const filename of [...stagedBackups, ...marketplaceBackups]) assert.ok(fs.existsSync(filename));
+});
+
+test('backup pruning leaves similarly named entries and links untouched without following nested links', async t => {
+  const { homeDir, pluginsDir, stagedBackups, marketplaceBackups, marketplacePath } = backupFixture(t);
+  const suffix = `00000000000000003-${randomUUID()}`;
+  const unrelated = [
+    path.join(pluginsDir, `.${PLUGIN_NAME}.backup-not-an-installer-backup`),
+    `${stagedBackups[0]}.tmp`,
+    `${marketplaceBackups[0]}.tmp`,
+    `${marketplacePath}.backup-${suffix}-extra`,
+    path.join(pluginsDir, `.${PLUGIN_NAME}.backup-${suffix}`),
+  ];
+  for (const filename of unrelated) fs.writeFileSync(filename, 'unrelated');
+  const unrelatedDirectory = `${marketplacePath}.backup-${suffix}`;
+  fs.mkdirSync(unrelatedDirectory);
+  fs.writeFileSync(path.join(unrelatedDirectory, 'keep.txt'), 'unrelated directory');
+  const target = path.join(homeDir, 'unrelated-target');
+  fs.mkdirSync(target);
+  fs.writeFileSync(path.join(target, 'keep.txt'), 'do not follow links');
+  const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+  const link = path.join(pluginsDir, `.${PLUGIN_NAME}.backup-00000000000000004-${randomUUID()}`);
+  fs.symlinkSync(target, link, linkType);
+  fs.symlinkSync(target, path.join(stagedBackups[0], 'nested-link'), linkType);
+  await main(['--codex'], installationOptions(homeDir));
+  for (const filename of unrelated) assert.equal(fs.readFileSync(filename, 'utf8'), 'unrelated');
+  assert.equal(fs.readFileSync(path.join(unrelatedDirectory, 'keep.txt'), 'utf8'), 'unrelated directory');
+  assert.equal(fs.lstatSync(link).isSymbolicLink(), true);
+  assert.equal(fs.readFileSync(path.join(target, 'keep.txt'), 'utf8'), 'do not follow links');
+  assert.equal(fs.existsSync(stagedBackups[0]), false);
+});
+
+test('backup pruning does not traverse a linked marketplace parent', async t => {
+  const { homeDir, marketplaceBackups } = backupFixture(t);
+  const agents = path.join(homeDir, '.agents');
+  const target = path.join(homeDir, 'linked-agents');
+  fs.renameSync(agents, target);
+  fs.symlinkSync(target, agents, process.platform === 'win32' ? 'junction' : 'dir');
+  await main(['--codex'], installationOptions(homeDir));
+  for (const filename of marketplaceBackups) assert.equal(fs.readFileSync(filename, 'utf8'), 'previous catalog');
+});
 
 test('installer merges a marketplace entry added while runtime files are staging', t => {
   const { homeDir, marketplacePath } = fixture(t);

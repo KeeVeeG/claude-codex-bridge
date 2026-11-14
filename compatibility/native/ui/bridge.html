@@ -79,7 +79,6 @@
     .chat-title { font-size: 13px; font-weight: var(--font-weight-normal, 400); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
     .chat-time { font-size: 10px; color: var(--quiet); white-space: nowrap; font-variant-numeric: tabular-nums }
     .chat-cwd { display: block; margin-top: 4px; font-size: 11px; color: var(--quiet); overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-    .sidebar-foot { display: none }
     .list-empty { padding: 27px 9px; color: var(--muted); font-size: 12px; line-height: 1.6 }
     .list-empty strong { display: block; color: var(--text); font-weight: var(--font-weight-normal, 400); margin-bottom: 4px }
     .conversation { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg) }
@@ -122,7 +121,6 @@
     .send-button { display: grid; place-items: center; flex: 0 0 32px; aspect-ratio: 1 / 1; width: 32px; min-width: 32px; max-width: 32px; height: 32px; min-height: 32px; max-height: 32px; align-self: flex-end; padding: 0; appearance: none; background: var(--text); color: var(--bg); border: 0; border-radius: 50% }
     .send-button:hover:not(:disabled) { background: var(--color-background-info, var(--text)); color: var(--color-text-inverse, var(--bg)) }
     .send-button svg { width: 16px; height: 16px }
-    .composer-note { display: none; font-size: 10px; color: var(--quiet); margin: 7px 2px 0 }
     .composer-inactive { padding: 12px 0; font-size: 12px; line-height: 1.7; color: var(--muted) }
     .composer-inactive strong { display: block; color: var(--text); font-weight: var(--font-weight-normal, 400); margin-bottom: 3px }
     .connection-error { padding: 12px 16px; border-bottom: 1px solid var(--line); color: var(--danger); font-size: 12px }
@@ -131,7 +129,6 @@
     @media(prefers-reduced-motion:reduce) { .spin svg { animation: none } }
     @media(min-width:1150px) { .main { grid-template-columns: 280px minmax(0,1fr) } .timeline { padding-left: 6%; padding-right: 6% } .composer-wrap { padding-left: 6%; padding-right: 6% } .alert { margin-left: 6%; margin-right: 6% } }
     @media(max-width:620px) { .topbar { padding: 0 13px; height: 45px } .main { grid-template-columns: 1fr } .sidebar { border-right: 0 } .conversation { display: none } .shell.has-selection .sidebar { display: none } .shell.has-selection .conversation { display: flex } .mobile-back { display: grid } .conversation-head { padding: 10px 13px } .timeline { padding: 16px 16px 21px } .outgoing .bubble { max-width: 91% } .composer-wrap { padding: 0 12px 12px } .alert { margin: 0 12px 10px } .welcome { display: none } .demo-banner { padding: 6px 13px; font-size: 10px } }
-    @media(max-width:420px) { .send-button { flex-basis: 32px; width: 32px; min-width: 32px; max-width: 32px; height: 32px; min-height: 32px; max-height: 32px } }
   </style>
 </head>
 <body>
@@ -147,14 +144,13 @@
         <div class="sidebar-head"><div class="heading-row"><h1>Conversations</h1><span class="count" id="chat-count">—</span></div><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><label class="sr-only" for="search">Search by chat or project name</label><input class="search" id="search" type="search" placeholder="Search chats or projects" autocomplete="off"></div></div>
         <div class="tabs" role="tablist" aria-label="Show chats"><button class="tab" id="tab-contacted" role="tab" aria-selected="true" aria-controls="chat-list" type="button">Conversations</button><button class="tab" id="tab-all" role="tab" aria-selected="false" aria-controls="chat-list" type="button" tabindex="-1">All chats</button></div>
         <div class="chat-list" id="chat-list" role="tabpanel" aria-label="Claude chats"></div>
-        <div class="sidebar-foot"><span class="foot-dot" aria-hidden="true"></span><span id="sidebar-note">Local Desktop chats</span></div>
       </aside>
       <main class="conversation" aria-label="Conversation">
         <div class="conversation-head" id="conversation-head" hidden><button class="icon-button mobile-back" id="back" type="button" aria-label="Back to chat list"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="m14 6-6 6 6 6"/></svg></button><div class="conversation-heading"><h2 class="conversation-title" id="conversation-title"></h2><div class="conversation-subtitle" id="conversation-subtitle"></div></div></div>
         <div class="welcome" id="welcome"><h2>Select a Claude chat</h2><p>Messages and the reply box will appear here.</p></div>
         <div class="timeline" id="timeline" aria-label="Message history" hidden></div>
         <div class="alert" id="conversation-alert" role="status" hidden><span class="alert-text" id="alert-text"></span><button type="button" id="alert-refresh">Refresh</button></div>
-        <div class="composer-wrap" id="composer-wrap" hidden><div class="composer-inactive" id="composer-inactive" hidden><strong id="inactive-title"></strong><span id="inactive-detail"></span></div><form class="composer" id="composer"><label class="sr-only" for="message">Message for the selected Claude chat</label><textarea id="message" aria-describedby="composer-hint" rows="1" placeholder="Write to Claude…" maxlength="65536"></textarea><span class="sr-only" id="composer-hint">Enter — send · Shift+Enter — new line</span><div class="composer-bottom"><button class="send-button" id="send" type="submit"><span class="sr-only" id="send-label">Send</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-5 5 5-5 5 5"/></svg></button></div></form><p class="composer-note" id="composer-note">Accepted by the local transport; read receipts are unavailable.</p></div>
+        <div class="composer-wrap" id="composer-wrap" hidden><div class="composer-inactive" id="composer-inactive" hidden><strong id="inactive-title"></strong><span id="inactive-detail"></span></div><form class="composer" id="composer"><label class="sr-only" for="message">Message for the selected Claude chat</label><textarea id="message" aria-describedby="composer-hint" rows="1" placeholder="Write to Claude…" maxlength="65536"></textarea><span class="sr-only" id="composer-hint">Enter — send · Shift+Enter — new line</span><div class="composer-bottom"><button class="send-button" id="send" type="submit"><span class="sr-only" id="send-label">Send</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-5 5 5-5 5 5"/></svg></button></div></form></div>
       </main>
     </div>
     <div class="sr-only" id="announcement" aria-live="polite"></div>
@@ -163,7 +159,7 @@
   const $ = id => document.getElementById(id);
   const demo = location.hash === '#demo';
   const state = { chats: [], selected: null, tab: 'contacted', query: '', owner: null, ready: false,
-    drafts: new Map(), histories: new Map(), sends: new Map(), panelError: '', refreshing: false };
+    drafts: new Map(), histories: new Map(), sends: new Map(), refreshing: false };
   const noticeRetries = new Set();
   const rpcPending = new Map();
   let rpcId = 0;
@@ -212,7 +208,7 @@
     if (method === 'ui/initialize') initializeId = id;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { rpcPending.delete(id); reject(new Error('Desktop did not respond in time. Refresh the panel.')); }, 25000);
-      rpcPending.set(id, { resolve, reject, timer, method });
+      rpcPending.set(id, { resolve, reject, timer });
       window.parent.postMessage({ jsonrpc: '2.0', id, method, params }, targetOrigin());
     });
   }
@@ -283,7 +279,7 @@
       } catch (error) { showConnectionError(error.message); }
     }
   });
-  function showConnectionError(text) { state.panelError = text; $('connection-error').textContent = text; $('connection-error').hidden = !text; }
+  function showConnectionError(text) { $('connection-error').textContent = text; $('connection-error').hidden = !text; }
   function history(sessionId) {
     if (!state.histories.has(sessionId)) state.histories.set(sessionId, { messages: [], loaded: false, loading: false, nextCursor: null, hasMore: false, paged: false, error: '', warning: '' });
     return state.histories.get(sessionId);
@@ -569,7 +565,7 @@
   }
   renderChats(); renderConversation();
   if (demo) {
-    $('demo-banner').hidden = false; $('sidebar-note').textContent = 'Demo chats'; $('composer-note').textContent = 'Demo: text stays in this preview and is not sent to Desktop apps.';
+    $('demo-banner').hidden = false;
     await refresh(); initialLoad = true;
   } else {
     try {

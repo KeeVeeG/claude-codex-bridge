@@ -60,6 +60,40 @@ function contained(parent, child) {
   return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
+// Only completed backups with the timestamp and UUID format emitted above qualify.
+const backupSuffix = /^[0-9]{17}-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function pruneBackups(homeDir, parts, prefix, latest, directories) {
+  let directory = path.resolve(homeDir);
+  for (const part of ['', ...parts]) {
+    directory = path.join(directory, part);
+    let stat;
+    try { stat = fs.lstatSync(directory); } catch (error) {
+      if (error.code === 'ENOENT') return;
+      throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) return;
+  }
+  const backups = fs.readdirSync(directory, { withFileTypes: true })
+    .filter(entry => entry.name.startsWith(prefix) && backupSuffix.test(entry.name.slice(prefix.length)) &&
+      !entry.isSymbolicLink() && (directories ? entry.isDirectory() : entry.isFile()))
+    .map(entry => path.join(directory, entry.name)).sort().reverse();
+  const keep = backups.includes(latest) ? latest : backups[0];
+  for (const filename of backups) {
+    if (filename === keep) continue;
+    if (!contained(directory, filename)) throw new Error('Invalid installer backup path.');
+    const stat = fs.lstatSync(filename);
+    if (stat.isSymbolicLink() || !(directories ? stat.isDirectory() : stat.isFile())) continue;
+    // Recursive removal unlinks nested links without traversing their targets.
+    fs.rmSync(filename, { recursive: directories });
+  }
+}
+
+function pruneInstallationBackups(prepared, homeDir) {
+  pruneBackups(homeDir, ['plugins'], `.${PLUGIN_NAME}.backup-`, prepared.backupDirectory, true);
+  pruneBackups(homeDir, ['.agents', 'plugins'], 'marketplace.json.backup-', prepared.marketplaceBackup, false);
+}
+
 function refuseLink(filename) {
   try {
     if (fs.lstatSync(filename).isSymbolicLink()) throw new Error(`Refusing to replace a symbolic link: ${filename}`);
@@ -352,34 +386,35 @@ export function installApplications(prepared, { execute = run, homeDir = os.home
   }
 }
 
-export async function main(args = process.argv.slice(2)) {
+export async function main(args = process.argv.slice(2), { homeDir = os.homedir(), env = process.env,
+  execute = run, log = console.log } = {}) {
   if (args.includes('--help') || args.includes('-h')) {
-    console.log('Usage: node scripts/install.mjs [--all | --codex | --claude] [--prepare-only]\nDefault: install for both apps. A normal Claude installation grants only its send_to_codex MCP tool in user permissions.allow. --prepare-only stages files and local catalogs without invoking either app CLI or changing tool permissions.');
+    log('Usage: node scripts/install.mjs [--all | --codex | --claude] [--prepare-only]\nDefault: install for both apps. A normal Claude installation grants only its send_to_codex MCP tool in user permissions.allow. --prepare-only stages files and local catalogs without invoking either app CLI or changing tool permissions.');
     return;
   }
   for (const arg of args) if (!['--all', '--codex', '--claude', '--prepare-only'].includes(arg)) throw new Error(`Unknown option: ${arg}`);
   const selected = args.filter(arg => ['--all', '--codex', '--claude'].includes(arg));
   if (selected.length > 1) throw new Error('Choose exactly one of --all, --codex, or --claude.');
   const target = selected[0] ?? '--all';
-  const prepared = prepareInstallation({ codex: target !== '--claude', claude: target !== '--codex' });
-  console.log(`Prepared ${PLUGIN_NAME} in ${prepared.destination}`);
-  if (prepared.backupDirectory) console.log(`Previous staged files: ${prepared.backupDirectory}`);
-  if (prepared.marketplaceBackup) console.log(`Personal marketplace backup: ${prepared.marketplaceBackup}`);
+  const prepared = prepareInstallation({ homeDir, env, codex: target !== '--claude', claude: target !== '--codex' });
+  log(`Prepared ${PLUGIN_NAME} in ${prepared.destination}`);
+  if (prepared.backupDirectory) log(`Previous staged files: ${prepared.backupDirectory}`);
+  if (prepared.marketplaceBackup) log(`Personal marketplace backup: ${prepared.marketplaceBackup}`);
   if (args.includes('--prepare-only')) {
-    console.log('Preparation complete. No application plugin commands were run.');
+    log('Preparation complete. No application plugin commands were run.');
     return prepared;
   }
-  installApplications(prepared);
-  if (process.env.CODEX_APP_TOOLS_PIPE_PATH && process.env.CODEX_THREAD_ID &&
-      !process.env.CLAUDE_CODE_MESSAGING_SOCKET) {
+  installApplications(prepared, { homeDir, env, execute, log });
+  if (env.CODEX_APP_TOOLS_PIPE_PATH && env.CODEX_THREAD_ID && !env.CLAUDE_CODE_MESSAGING_SOCKET) {
     const { publishCodexHost } = await import('../lib/codex-host.mjs');
     publishCodexHost({ stateDir: prepared.stateDir,
-      pipePath: process.env.CODEX_APP_TOOLS_PIPE_PATH, threadId: process.env.CODEX_THREAD_ID });
-    console.log('Registered this Codex Desktop host for local conversation discovery.');
+      pipePath: env.CODEX_APP_TOOLS_PIPE_PATH, threadId: env.CODEX_THREAD_ID });
+    log('Registered this Codex Desktop host for local conversation discovery.');
   }
-  if (prepared.claude) console.log('In Claude CLI, run /reload-plugins and check /mcp. If old tools remain, exit and resume the exact conversation with claude --resume <session_id>. In Claude Desktop, fully quit and reopen the app when convenient so its MCP process loads this version.');
-  if (prepared.codex) console.log('In Codex Desktop, start a new task or restart the app to load updated tools. Restart terminal Codex sessions when convenient to load updated tools.');
-  console.log(`Apps were not restarted.${prepared.claude ? ' Only the exact Claude send_to_codex tool received a user-level allow rule.' : ' Claude tool permissions were not changed.'}`);
+  if (prepared.claude) log('In Claude CLI, run /reload-plugins and check /mcp. If old tools remain, exit and resume the exact conversation with claude --resume <session_id>. In Claude Desktop, fully quit and reopen the app when convenient so its MCP process loads this version.');
+  if (prepared.codex) log('In Codex Desktop, start a new task or restart the app to load updated tools. Restart terminal Codex sessions when convenient to load updated tools.');
+  log(`Apps were not restarted.${prepared.claude ? ' Only the exact Claude send_to_codex tool received a user-level allow rule.' : ' Claude tool permissions were not changed.'}`);
+  pruneInstallationBackups(prepared, homeDir);
   return prepared;
 }
 

@@ -299,6 +299,23 @@ test('MCP forwards explicit Codex transport and rejects unsupported choices befo
   assert.deepEqual(calls.map(call => call.args.transport), ['auto', 'desktop', 'terminal', 'ssh']);
 });
 
+test('MCP rejects unsupported input schema types before invoking the executor', async t => {
+  const client = memoryMcp(t, async () => assert.fail('Unsupported schemas must not reach the executor'));
+  await initialize(client);
+  const tool = TOOLS.find(item => item.name === 'list_codex_chats');
+  const original = tool.inputSchema.properties.limit;
+  try {
+    for (const type of ['array', 'boolean', 'unknown']) {
+      tool.inputSchema.properties.limit = { type };
+      const response = await callTool(client, tool.name, { limit: [] });
+      assert.equal(response.result.isError, true);
+      assert.match(response.result.content[0].text, /unsupported schema type/);
+    }
+  } finally {
+    tool.inputSchema.properties.limit = original;
+  }
+});
+
 test('MCP rejects invalid and reserved message IDs before invoking the executor', async t => {
   const calls = [];
   const client = memoryMcp(t, async (name, args) => {

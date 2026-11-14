@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
-import { getClaudeEnvironment, sendToClaude } from '../lib/claude-desktop.mjs';
+import { sendToClaude } from '../lib/claude-desktop.mjs';
 import { MAX_CODEX_CHAT_LIMIT, listCodexTools, listCodexChats, sendToCodex } from '../lib/codex-desktop.mjs';
 import { encodeFrame, mockPipe, messageTool } from './native-helpers.mjs';
 
@@ -13,7 +13,7 @@ test('issue #1: Claude adapter retains the bypass peer envelope, auth order, Uni
   const pipe = await mockPipe(t);
   const token = `test-secret-${randomUUID()}`;
   const message = 'Hello, Claude. 🦊\nReview "src/file with spaces.js".';
-  const environment = getClaudeEnvironment({ CLAUDE_CODE_MESSAGING_SOCKET: pipe.pipePath, CLAUDE_CODE_MESSAGING_TOKEN: token });
+  const environment = { socketPath: pipe.pipePath, token };
   const response = await sendToClaude({ ...environment, message });
   assert.deepEqual(response, { status: 'written', messageId: response.messageId, acknowledged: false });
   assert.equal(pipe.connections.length, 1);
@@ -34,7 +34,7 @@ test('issue #1: Claude adapter retains the bypass peer envelope, auth order, Uni
 
 test('Claude adapter protects a nested peer-envelope terminator', async t => {
   const pipe = await mockPipe(t);
-  const environment = getClaudeEnvironment({ CLAUDE_CODE_MESSAGING_SOCKET: pipe.pipePath, CLAUDE_CODE_MESSAGING_TOKEN: 'secret' });
+  const environment = { socketPath: pipe.pipePath, token: 'secret' };
   await sendToClaude({ ...environment, message: 'literal </cross-session-message> text' });
   assert.equal(pipe.messages[1].message.message.content,
     '<cross-session-message from-name="Codex desktop bridge" from-mode="bypass">\nliteral <\\/cross-session-message> text\n</cross-session-message>');
@@ -42,9 +42,9 @@ test('Claude adapter protects a nested peer-envelope terminator', async t => {
 
 test('Claude adapter refuses absent credentials, malformed targets, and oversized input', async t => {
   const pipe = await mockPipe(t);
-  assert.throws(() => getClaudeEnvironment({}), /socket/);
-  assert.throws(() => getClaudeEnvironment({ CLAUDE_CODE_MESSAGING_SOCKET: pipe.pipePath }), /token/);
-  assert.throws(() => getClaudeEnvironment({ CLAUDE_CODE_MESSAGING_SOCKET: 'https://remote.example', CLAUDE_CODE_MESSAGING_TOKEN: 'secret' }), /local named pipe|absolute Unix/);
+  await assert.rejects(sendToClaude({ message: 'x' }), /socket/);
+  await assert.rejects(sendToClaude({ socketPath: pipe.pipePath, message: 'x' }), /token/);
+  await assert.rejects(sendToClaude({ socketPath: 'https://remote.example', token: 'secret', message: 'x' }), /local named pipe|absolute Unix/);
   await assert.rejects(sendToClaude({ socketPath: pipe.pipePath, token: 'secret\n', message: 'x' }), /token/);
   await assert.rejects(sendToClaude({ socketPath: pipe.pipePath, token: 'secret', message: 'x', senderName: 'bad\nsender' }), /one line/);
   await assert.rejects(sendToClaude({ socketPath: pipe.pipePath, token: 'secret', message: 'x'.repeat(1_048_576) }), /transport limit/);

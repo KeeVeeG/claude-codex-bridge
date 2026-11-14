@@ -6,7 +6,6 @@ dist/
 *.tmp
 .env
 .env.*
-!.env.example
 *.key
 state.json
 state.lock*

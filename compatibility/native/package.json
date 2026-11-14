@@ -19,7 +19,6 @@
   },
   "scripts": {
     "test": "node scripts/test.mjs",
-    "mcp": "node scripts/mcp.mjs",
     "package": "node scripts/package.mjs",
     "manifests:check": "node scripts/manifests.mjs --check",
     "manifests:sync": "node scripts/manifests.mjs --sync"

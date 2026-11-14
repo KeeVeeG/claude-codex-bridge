@@ -233,8 +233,7 @@ export async function getBridgeConversation({ stateDir = defaultStateDir(), owne
   let manualRecords = [];
   try {
     const { readManualRecords } = await import('./manual-service.mjs');
-    const result = await readManualRecords({ stateDir, threadId: ownerThreadId });
-    manualRecords = Array.isArray(result) ? result : Object.values(result ?? {});
+    manualRecords = await readManualRecords({ stateDir, threadId: ownerThreadId });
   } catch (error) {
     if (error.code !== 'ENOENT' && error.code !== 'ERR_MODULE_NOT_FOUND') scanned.warnings.push('Manual delivery notice metadata could not be read.');
   }
