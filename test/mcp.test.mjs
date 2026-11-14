@@ -544,12 +544,15 @@ test('MCP advertises direct, addressed messages without pair-management tools or
   assert.equal(diagnostics.plugin_version, JSON.parse(fs.readFileSync(new URL('../plugin.json', import.meta.url), 'utf8')).version);
 });
 
-test('a running server keeps the code it started with when an update replaces its files, and the doctor says so', async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-in-place-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+test('a server started through a folder link keeps the code it started with when an update replaces its files, and the doctor says so', async t => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-in-place-'));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const root = path.join(temp, 'plugin');
   for (const entry of ['scripts', 'lib', 'ui', 'plugin.json', 'package.json'])
     fs.cpSync(fileURLToPath(new URL(`../${entry}`, import.meta.url)), path.join(root, entry), { recursive: true });
-  const client = startMcp(t, { CLAUDE_CODEX_BRIDGE_STATE_DIR: path.join(root, 'state') }, { server: path.join(root, 'scripts', 'mcp.mjs') });
+  // A link in the launch path (macOS /tmp, a Windows junction) must not stop the server from starting.
+  fs.symlinkSync(root, path.join(temp, 'link'), 'junction');
+  const client = startMcp(t, { CLAUDE_CODEX_BRIDGE_STATE_DIR: path.join(temp, 'state') }, { server: path.join(temp, 'link', 'scripts', 'mcp.mjs') });
   await initialize(client);
   const manifest = path.join(root, 'plugin.json');
   const running = JSON.parse(fs.readFileSync(manifest, 'utf8')).version;

@@ -181,7 +181,8 @@ export function syncManifests(sourceRoot = root) {
   return checkManifests(bundle.source);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Node resolves the entry module through links (macOS /tmp is /private/tmp), so compare real paths.
+if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const args = process.argv.slice(2);
     if (args.length !== 1 || !['--check', '--sync'].includes(args[0])) throw new Error('Usage: node scripts/manifests.mjs --check | --sync');

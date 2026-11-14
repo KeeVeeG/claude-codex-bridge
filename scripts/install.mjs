@@ -593,7 +593,8 @@ export async function main(args = process.argv.slice(2), { homeDir = os.homedir(
   return prepared;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Node resolves the entry module through links (macOS /tmp is /private/tmp), so compare real paths.
+if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try { await main(); } catch (error) {
     console.error(`Installation failed: ${error.message}`);
     process.exitCode = 1;
