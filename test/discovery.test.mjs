@@ -6,7 +6,7 @@ import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { canonicalClaudeSocket, discoverClaudeSessions, resolveClaudeCaller, resolveClaudeSession } from '../lib/claude-desktop.mjs';
+import { canonicalClaudeSocket, discoverClaudeSessions, resolveClaudeCaller, resolveClaudeSession } from '../lib/claude-sessions.mjs';
 import { getCodexHost, getCodexHosts, publishCodexHost } from '../lib/codex-host.mjs';
 import { mockPipe, nativeFixture } from './native-helpers.mjs';
 
@@ -119,7 +119,7 @@ test('Codex host publication is atomic, survives publisher exit without an arbit
 
 test('Codex host publication keeps a live pipe whose name Windows folds beyond ASCII', windowsOnly, async t => {
   const setup = await nativeFixture(t);
-  const pipePath = `\\\\.\\pipe\\codex-claude-bridge-test-${randomUUID()}-Ä`;
+  const pipePath = `\\\\.\\pipe\\claude-codex-bridge-test-${randomUUID()}-Ä`;
   const server = net.createServer(socket => socket.destroy());
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(pipePath, resolve); });
   t.after(() => new Promise(resolve => server.close(resolve)));
@@ -197,7 +197,7 @@ test('Claude socket canonicalization accepts normalized absolute Unix paths off 
 
 test('macOS Claude inbox keys resolve only with the live UTC process token and local domain', { skip: process.platform !== 'darwin' }, async t => {
   const setup = await callerFixture(t);
-  const { resolveClaudeSession } = await import('../lib/claude-desktop.mjs');
+  const { resolveClaudeSession } = await import('../lib/claude-sessions.mjs');
   const record = { ...setup.record, entrypoint: 'claude-desktop', pidDomain: 'darwin', pid: process.pid };
   fs.writeFileSync(path.join(setup.registryDir, `${record.pid}.json`), JSON.stringify(record));
   const hash = createHash('sha256').update(canonicalClaudeSocket(record.messagingSocketPath)).digest('hex');

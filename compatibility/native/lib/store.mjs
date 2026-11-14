@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
+import { defaultStateDir } from './state-directory.mjs';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
@@ -100,11 +100,7 @@ function retryWindowsContention(error, until) {
   return true;
 }
 
-export function defaultStateDir({ homeDir = os.homedir(), env = process.env } = {}) {
-  // Windows app packages can see different virtualized AppData directories.
-  // Both desktop apps must use the same user-owned location regardless of cwd.
-  return env.CODEX_CLAUDE_BRIDGE_STATE_DIR || path.join(homeDir, '.local', 'share', 'codex-claude-desktop-bridge');
-}
+export { defaultStateDir } from './state-directory.mjs';
 
 function text(value, name, max = 65536) {
   if (typeof value !== 'string' || !value.trim() || Buffer.byteLength(value) > max) {

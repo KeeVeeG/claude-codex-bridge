@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { discoverClaudeSessions } from './claude-desktop.mjs';
+import { discoverClaudeSessions } from './claude-sessions.mjs';
 import { scanBridgeExchange, validateHistoryOwner, validateClaudeHistoryId } from './bridge-history.mjs';
 
 const MAX_PROJECTS = 256;

@@ -13,10 +13,10 @@ const windowsOnly = { skip: process.platform !== 'win32' && 'Windows Codex execu
 test('an existing override wins and a missing override yields null without falling back', () => {
   const override = path.join(os.tmpdir(), 'tools', 'codex.exe');
   const bin = path.join(os.tmpdir(), 'bin');
-  const found = resolveCodexExecutable({ env: { CODEX_CLAUDE_BRIDGE_CODEX_BIN: override, PATH: bin },
+  const found = resolveCodexExecutable({ env: { CLAUDE_CODEX_BRIDGE_CODEX_BIN: override, PATH: bin },
     exists: filesOnly([override, path.join(bin, 'codex.exe')]) });
   assert.equal(found, override);
-  assert.equal(resolveCodexExecutable({ env: { CODEX_CLAUDE_BRIDGE_CODEX_BIN: override, PATH: bin },
+  assert.equal(resolveCodexExecutable({ env: { CLAUDE_CODEX_BRIDGE_CODEX_BIN: override, PATH: bin },
     exists: filesOnly([path.join(bin, 'codex.exe')]) }), null);
 });
 

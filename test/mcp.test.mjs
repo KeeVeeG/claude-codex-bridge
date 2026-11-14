@@ -1,3 +1,4 @@
+import { publicDelivery } from '../lib/delivery.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -19,7 +20,7 @@ const windowsOnly = { skip: process.platform !== 'win32' && 'Native Claude regis
 const metadata = threadId => ({ 'x-codex-turn-metadata': { thread_id: threadId } });
 
 function startMcp(t, env = {}, { parentProxy = false } = {}) {
-  const childEnv = { ...process.env, CODEX_CLAUDE_BRIDGE_DAEMON: 'off' };
+  const childEnv = { ...process.env, CLAUDE_CODEX_BRIDGE_DAEMON: 'off' };
   for (const name of ['CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CODEX_APP_TOOLS_PIPE_PATH', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN']) delete childEnv[name];
   Object.assign(childEnv, env);
   const args = parentProxy
@@ -124,9 +125,9 @@ function toolValue(response) {
 // A real-process listing must report the terminal daemon as disabled, proving the child never reached a real daemon.
 function toolValueWithoutDaemon(response) {
   const value = toolValue(response);
-  assert.ok(response.result.structuredContent.warnings.some(warning => /disabled by CODEX_CLAUDE_BRIDGE_DAEMON=off/.test(warning)),
+  assert.ok(response.result.structuredContent.warnings.some(warning => /disabled by CLAUDE_CODEX_BRIDGE_DAEMON=off/.test(warning)),
     JSON.stringify(response.result.structuredContent));
-  return value;
+  return value.threads;
 }
 
 function isToolFailure(response) {
@@ -195,31 +196,30 @@ function assertSchema(value, specification, label = 'result') {
   if (specification.type === 'array') value.forEach((item, index) => assertSchema(item, specification.items, `${label}[${index}]`));
 }
 
-test('MCP structured results match advertised schemas while text JSON remains compatible', async t => {
+test('MCP structured results match advertised schemas and expose identical text and structured JSON', async t => {
   const route = { from: { kind: 'codex', id: 'source' }, to: { kind: 'claude', id: 'recipient' } };
   const record = { id: 'message-one', route, direction: 'to_claude', message: 'Visible message.',
     createdAt: 1, updatedAt: 2, senderPid: 123, status: 'submitted', fingerprint: 'a'.repeat(64),
     receipt: { status: 'written', messageId: 'native-id', acknowledged: false } };
   const values = {
-    list_claude_sessions: ['claude-desktop', 'cli', 'sdk-cli', 'claude-vscode'].map((entrypoint, index) => ({ sessionId: `recipient-${index}`,
-      pid: 123 + index, name: 'Claude', cwd: 'C:/project', status: 'idle', version: '2.1.299', entrypoint,
-      hostSessionId: null, procStart: '123', pidDomain: 'win32:test' })),
-    list_codex_chats: ['desktop', 'terminal'].map((source, index) => ({ thread_id: `source-${index}`,
-      title: 'Codex', status: 'idle', host_id: 'local', source })),
-    send_to_claude: { message: record },
-    send_to_codex: { message: { ...record, route: { from: route.to, to: route.from }, direction: 'to_codex' }, retransmitted: false },
-    bridge_status: { application: 'codex', sender_id: 'source', state_directory: 'C:/state', messages: [record], note: 'Submitted.', plugin_version: 'test' },
+    list_claude_sessions: { sessions: ['claude-desktop', 'cli', 'sdk-cli', 'claude-vscode'].map((entrypoint, index) => ({ session_id: `recipient-${index}`,
+      title: 'Claude', cwd: 'C:/project', status: 'idle', entrypoint })) },
+    list_codex_threads: { threads: ['desktop', 'terminal'].map((source, index) => ({ thread_id: `source-${index}`,
+      title: 'Codex', status: 'idle', cwd: 'C:/project', host_id: 'local', source })), warnings: [] },
+    send_to_claude: { delivery: publicDelivery(record) },
+    send_to_codex: { delivery: publicDelivery({ ...record, route: { from: route.to, to: route.from }, direction: 'to_codex' }) },
+    list_deliveries: { application: 'codex', sender_id: 'source', deliveries: [publicDelivery(record)] },
     bridge_doctor: { application: 'unknown', ready: false, checks: [{ name: 'caller', status: 'fail', detail: 'No verified sender.' }], plugin_version: 'test' },
-    bridge_panel: { owner_thread_id: 'source', application: 'codex', chats: [
+    bridge_panel: { owner_thread_id: 'source', application: 'codex', sessions: [
       ...['claude-desktop', 'cli', 'sdk-cli', 'claude-vscode'].map((entrypoint, index) => ({ session_id: `recipient-${index}`, entrypoint,
         title: 'Claude', cwd: 'C:/project', live: true, last_activity_at: 2, last_contact_at: 1 })),
       { session_id: 'archived-recipient', title: 'Archived Claude', cwd: 'C:/project', live: false,
         last_activity_at: 1, last_contact_at: 1 },
     ], warnings: [] },
-    bridge_ui_history: { session_id: 'recipient', messages: [{ id: record.id, direction: 'to_claude',
+    panel_history: { session_id: 'recipient', messages: [{ id: record.id, direction: 'to_claude',
       message: record.message, created_at: 1, status: 'submitted', manual: true }], next_cursor: null, has_more: false, warnings: [] },
-    bridge_ui_send: { message: { ...record, manual: true }, manual: true, notice_status: 'submitted' },
-    bridge_ui_retry_notice: { message: { ...record, manual: true }, manual: true, notice_status: 'failed', notice_retryable: true,
+    panel_send: { delivery: publicDelivery({ ...record, manual: true }), manual: true, notice_status: 'submitted' },
+    panel_retry_notice: { delivery: publicDelivery({ ...record, manual: true }), manual: true, notice_status: 'failed', notice_retryable: true,
       notice_error: 'The owner notice was rejected before submission.' },
   };
   const client = memoryMcp(t, async name => values[name]);
@@ -227,53 +227,42 @@ test('MCP structured results match advertised schemas while text JSON remains co
   for (const tool of TOOLS) {
     const args = tool.name === 'send_to_claude' ? { session_id: 'recipient', message: 'Text.' }
       : tool.name === 'send_to_codex' ? { thread_id: 'source', message: 'Text.' }
-      : tool.name === 'bridge_ui_send' ? { session_id: 'recipient', message: 'Text.', message_id: 'manual-one' }
-      : tool.name === 'bridge_ui_retry_notice' ? { session_id: 'recipient', message_id: 'manual-one' }
-      : tool.name === 'bridge_ui_history' ? { session_id: 'recipient' } : {};
+      : tool.name === 'panel_send' ? { session_id: 'recipient', message: 'Text.', message_id: 'manual-one' }
+      : tool.name === 'panel_retry_notice' ? { session_id: 'recipient', message_id: 'manual-one' }
+      : tool.name === 'panel_history' ? { session_id: 'recipient' } : {};
     const response = await callTool(client, tool.name, args);
     assert.deepEqual(toolValue(response), values[tool.name]);
     assertSchema(response.result.structuredContent, tool.outputSchema, tool.name);
-    assert.deepEqual(response.result.structuredContent, tool.name === 'list_claude_sessions' ? { sessions: values[tool.name] }
-      : tool.name === 'list_codex_chats' ? { chats: values[tool.name] } : values[tool.name]);
+    assert.deepEqual(response.result.structuredContent, values[tool.name]);
   }
-  const warned = memoryMcp(t, async () => ({ chats: values.list_codex_chats, warnings: ['x'] }));
+  const warned = memoryMcp(t, async () => ({ ...values.list_codex_threads, warnings: ['x'] }));
   await initialize(warned);
-  const warnedResponse = await callTool(warned, 'list_codex_chats', {});
+  const warnedResponse = await callTool(warned, 'list_codex_threads', {});
   assert.deepEqual(warnedResponse.result.structuredContent.warnings, ['x']);
-  assert.deepEqual(toolValue(warnedResponse), values.list_codex_chats);
-  assertSchema(warnedResponse.result.structuredContent, TOOLS.find(tool => tool.name === 'list_codex_chats').outputSchema, 'list_codex_chats');
+  assert.deepEqual(toolValue(warnedResponse), { ...values.list_codex_threads, warnings: ['x'] });
+  assertSchema(warnedResponse.result.structuredContent, TOOLS.find(tool => tool.name === 'list_codex_threads').outputSchema, 'list_codex_threads');
 });
 
-test('list_codex_chats warnings also reach text-only clients in a second block, leaving the first block the chats array', async t => {
-  const chats = [{ thread_id: 'source', title: 'Codex', status: 'idle', host_id: 'local', source: 'desktop' }];
-  const warnings = ['Codex Desktop unavailable: no endpoint.', 'Codex terminal sessions unavailable: not running.'];
-  const warned = memoryMcp(t, async () => ({ chats, warnings }));
-  await initialize(warned);
-  const response = await callTool(warned, 'list_codex_chats', {});
-  assert.equal(response.result.content.length, 2);
-  assert.ok(response.result.content.every(block => block.type === 'text'));
-  assert.deepEqual(JSON.parse(response.result.content[0].text), chats);
-  assert.equal(response.result.content[1].text, `Warnings:\n${warnings.map(warning => `- ${warning}`).join('\n')}`);
-  assert.deepEqual(response.result.structuredContent, { chats, warnings });
-  for (const value of [{ chats, warnings: [] }, { chats }, chats]) {
-    const quiet = memoryMcp(t, async () => value);
-    await initialize(quiet);
-    const result = (await callTool(quiet, 'list_codex_chats', {})).result;
-    assert.equal(result.content.length, 1, JSON.stringify(value));
-    assert.deepEqual(JSON.parse(result.content[0].text), chats);
-    assert.equal(result.structuredContent.warnings, undefined);
+test('list_codex_threads warnings reach text-only and structured clients in the same object', async t => {
+  const threads = [{ thread_id: 'source', title: 'Codex', status: 'idle', cwd: '', host_id: 'local', source: 'desktop' }];
+  for (const warnings of [[], ['Codex Desktop unavailable: no endpoint.']]) {
+    const client = memoryMcp(t, async () => ({ threads, warnings }));
+    await initialize(client);
+    const response = await callTool(client, 'list_codex_threads', {});
+    assert.equal(response.result.content.length, 1);
+    assert.deepEqual(toolValue(response), { threads, warnings });
+    assert.deepEqual(response.result.structuredContent, { threads, warnings });
   }
   const failing = memoryMcp(t, async () => { throw new Error('Codex Desktop unavailable: x'); });
   await initialize(failing);
-  const failure = (await callTool(failing, 'list_codex_chats', {})).result;
+  const failure = (await callTool(failing, 'list_codex_threads', {})).result;
   assert.equal(failure.isError, true);
   assert.equal(failure.content.length, 1);
 });
 
 test('list_claude_sessions output schema accepts terminal Claude Code sessions and rejects unknown entrypoints', () => {
   const tool = TOOLS.find(item => item.name === 'list_claude_sessions');
-  const session = entrypoint => ({ sessionId: 'terminal', pid: 123, name: 'Claude', cwd: 'C:/project', status: 'idle',
-    version: '2.1.280', entrypoint, hostSessionId: null, procStart: '123', pidDomain: 'win32:test' });
+  const session = entrypoint => ({ session_id: 'terminal', title: 'Claude', cwd: 'C:/project', status: 'idle', entrypoint });
   assertSchema({ sessions: [session('cli')] }, tool.outputSchema, 'terminal session');
   assertSchema({ sessions: [session('sdk-cli')] }, tool.outputSchema, 'noninteractive terminal session');
   assertSchema({ sessions: [session('claude-desktop')] }, tool.outputSchema, 'desktop session');
@@ -284,8 +273,8 @@ test('MCP forwards explicit Codex transport and rejects unsupported choices befo
   const calls = [];
   const client = memoryMcp(t, async (name, args) => {
     calls.push({ name, args });
-    return { message: { id: 'route-test', route: { from: { kind: 'claude', id: 'source' }, to: { kind: 'codex', id: 'target' } },
-      direction: 'to_codex', message: args.message, createdAt: 1, status: 'submitted', fingerprint: 'a'.repeat(64) } };
+    return { delivery: publicDelivery({ id: 'route-test', route: { from: { kind: 'claude', id: 'source' }, to: { kind: 'codex', id: 'target' } },
+      direction: 'to_codex', message: args.message, createdAt: 1, status: 'submitted', fingerprint: 'a'.repeat(64) }) };
   });
   await initialize(client);
   for (const transport of ['auto', 'desktop', 'terminal', 'ssh']) {
@@ -302,7 +291,7 @@ test('MCP forwards explicit Codex transport and rejects unsupported choices befo
 test('MCP rejects unsupported input schema types before invoking the executor', async t => {
   const client = memoryMcp(t, async () => assert.fail('Unsupported schemas must not reach the executor'));
   await initialize(client);
-  const tool = TOOLS.find(item => item.name === 'list_codex_chats');
+  const tool = TOOLS.find(item => item.name === 'list_codex_threads');
   const original = tool.inputSchema.properties.limit;
   try {
     for (const type of ['array', 'boolean', 'unknown']) {
@@ -320,8 +309,8 @@ test('MCP rejects invalid and reserved message IDs before invoking the executor'
   const calls = [];
   const client = memoryMcp(t, async (name, args) => {
     calls.push(args);
-    return { message: { id: args.message_id, route: { from: { kind: 'codex', id: 'source' }, to: { kind: 'claude', id: 'recipient' } },
-      direction: 'to_claude', message: args.message, createdAt: 1, status: 'submitted', fingerprint: 'a'.repeat(64) } };
+    return { delivery: publicDelivery({ id: args.message_id, route: { from: { kind: 'codex', id: 'source' }, to: { kind: 'claude', id: 'recipient' } },
+      direction: 'to_claude', message: args.message, createdAt: 1, status: 'submitted', fingerprint: 'a'.repeat(64) }) };
   });
   await initialize(client);
   const tool = TOOLS.find(item => item.name === 'send_to_claude');
@@ -348,7 +337,7 @@ test('queued MCP cancellation never calls executor and keeps numeric and string 
   t.after(() => release());
   const client = memoryMcp(t, async (name, args, context) => {
     calls.push({ name, args, signal: context.signal });
-    if (name === 'list_claude_sessions') { started(); await held; return []; }
+    if (name === 'list_claude_sessions') { started(); await held; return { sessions: [] }; }
     return {};
   });
   await initialize(client);
@@ -378,7 +367,7 @@ test('running MCP cancellation aborts executor promptly and suppresses its respo
       started();
       await new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
     }
-    return [];
+    return { sessions: [] };
   });
   await initialize(client);
   client.write({ id: 'running', method: 'tools/call', params: {
@@ -389,26 +378,26 @@ test('running MCP cancellation aborts executor promptly and suppresses its respo
   assert.equal(signal.aborted, false);
   client.notify('notifications/cancelled', { requestId: 'running', reason: 'User cancelled.' });
   assert.equal(signal.aborted, true);
-  assert.deepEqual(toolValue(await callTool(client, 'list_claude_sessions')), []);
+  assert.deepEqual(toolValue(await callTool(client, 'list_claude_sessions')), { sessions: [] });
   assert.equal(client.messages.some(response => response.id === 'running'), false);
 });
 
 test('unknown, malformed, completed, and initialization cancellations do not cancel later requests', async t => {
   const signals = [];
-  const client = memoryMcp(t, async (name, args, context) => { signals.push(context.signal); return []; });
+  const client = memoryMcp(t, async (name, args, context) => { signals.push(context.signal); return { sessions: [] }; });
   client.write({ id: 'init', method: 'initialize', params: { protocolVersion: '2025-11-25' } });
   client.notify('notifications/cancelled', { requestId: 'init' });
   assert.equal((await client.response('init')).result.protocolVersion, '2025-11-25');
   client.notify('notifications/initialized');
   client.notify('notifications/cancelled', { requestId: 'future' });
   client.write({ id: 'future', method: 'tools/call', params: { name: 'list_claude_sessions' } });
-  assert.deepEqual(toolValue(await client.response('future')), []);
+  assert.deepEqual(toolValue(await client.response('future')), { sessions: [] });
   client.notify('notifications/cancelled', { requestId: 'future' });
   client.notify('notifications/cancelled', { requestId: null });
   client.notify('notifications/cancelled', { requestId: {}, reason: 'Invalid ID.' });
   client.notify('notifications/cancelled', { requestId: 'reused', reason: 123 });
   client.write({ id: 'reused', method: 'tools/call', params: { name: 'list_claude_sessions' } });
-  assert.deepEqual(toolValue(await client.response('reused')), []);
+  assert.deepEqual(toolValue(await client.response('reused')), { sessions: [] });
   assert.ok(signals.every(signal => !signal.aborted));
 });
 
@@ -467,8 +456,8 @@ async function setupMcp(t, { envThreadId, entrypoint = 'claude-desktop', holdFir
   const { publishCodexHost } = await import('../lib/codex-host.mjs');
   publishCodexHost({ stateDir: fixture.stateDir, pipePath: codex.pipePath, threadId: 'known-host-context', pid: process.pid });
   const env = {
-    CODEX_CLAUDE_BRIDGE_STATE_DIR: fixture.stateDir,
-    CODEX_CLAUDE_BRIDGE_REGISTRY_DIR: registryDir,
+    CLAUDE_CODEX_BRIDGE_STATE_DIR: fixture.stateDir,
+    CLAUDE_CODEX_BRIDGE_REGISTRY_DIR: registryDir,
     CODEX_APP_TOOLS_PIPE_PATH: codex.pipePath,
     CLAUDE_CONFIG_DIR: path.join(fixture.root, 'claude-config'),
     ...(envThreadId ? { CODEX_THREAD_ID: envThreadId } : {}),
@@ -480,7 +469,7 @@ async function setupMcp(t, { envThreadId, entrypoint = 'claude-desktop', holdFir
 }
 
 function claudeEnv(setup) {
-  return { CODEX_CLAUDE_BRIDGE_STATE_DIR: setup.stateDir, CODEX_CLAUDE_BRIDGE_REGISTRY_DIR: setup.registryDir };
+  return { CLAUDE_CODEX_BRIDGE_STATE_DIR: setup.stateDir, CLAUDE_CODEX_BRIDGE_REGISTRY_DIR: setup.registryDir };
 }
 
 function registerClaudeParent(setup, parentPid, socketPath, entrypoint = 'claude-desktop') {
@@ -496,20 +485,21 @@ function registerClaudeParent(setup, parentPid, socketPath, entrypoint = 'claude
 
 test('MCP advertises direct, addressed messages without pair-management tools or routing tokens', async t => {
   const fixture = await nativeFixture(t);
-  const client = startMcp(t, { CODEX_CLAUDE_BRIDGE_STATE_DIR: fixture.stateDir });
+  const client = startMcp(t, { CLAUDE_CODEX_BRIDGE_STATE_DIR: fixture.stateDir });
   const initialized = await initialize(client);
-  assert.equal(initialized.result.serverInfo.title, 'Claude');
+  assert.equal(initialized.result.serverInfo.name, 'bridge-claude-codex');
+  assert.equal(initialized.result.serverInfo.title, 'Claude–Codex Bridge');
   assert.equal(initialized.result.serverInfo.icons[0].mimeType, 'image/svg+xml');
   const listed = await client.rpc('tools/list');
   assert.deepEqual(listed.result.tools.map(tool => tool.name).sort(), [
-    'bridge_doctor', 'bridge_panel', 'bridge_status', 'bridge_ui_history', 'bridge_ui_retry_notice', 'bridge_ui_send', 'list_claude_sessions', 'list_codex_chats', 'send_to_claude', 'send_to_codex',
+    'bridge_doctor', 'bridge_panel', 'list_claude_sessions', 'list_codex_threads', 'list_deliveries', 'panel_history', 'panel_retry_notice', 'panel_send', 'send_to_claude', 'send_to_codex',
   ]);
   for (const tool of listed.result.tools) {
     assert.ok(tool.title.trim());
     assert.equal(tool.outputSchema.type, 'object');
     assert.equal(tool.outputSchema.additionalProperties, false);
-    const sending = ['send_to_claude', 'send_to_codex', 'bridge_ui_send', 'bridge_ui_retry_notice'].includes(tool.name);
-    assert.equal(tool.annotations.readOnlyHint, !sending && tool.name !== 'bridge_status');
+    const sending = ['send_to_claude', 'send_to_codex', 'panel_send', 'panel_retry_notice'].includes(tool.name);
+    assert.equal(tool.annotations.readOnlyHint, !sending && tool.name !== 'bridge_doctor');
     assert.equal(tool.annotations.destructiveHint, sending);
     assert.equal(tool.annotations.openWorldHint, false);
     assert.equal(tool.annotations.idempotentHint, !sending);
@@ -523,10 +513,10 @@ test('MCP advertises direct, addressed messages without pair-management tools or
   assert.doesNotMatch(panelIconSvg, /currentColor/);
   assert.match(panelIconSvg, /#D97757/);
   assert.match(panelIconSvg, /#FFF9F1/);
-  const listSchema = listed.result.tools.find(tool => tool.name === 'list_codex_chats').inputSchema;
+  const listSchema = listed.result.tools.find(tool => tool.name === 'list_codex_threads').inputSchema;
   assert.equal(listSchema.properties.limit.maximum, 50);
-  assert.equal(listed.result.tools.find(tool => tool.name === 'bridge_status').inputSchema.properties.limit.maximum, 100);
-  const oversizedList = await callTool(client, 'list_codex_chats', { limit: 51 });
+  assert.equal(listed.result.tools.find(tool => tool.name === 'list_deliveries').inputSchema.properties.limit.maximum, 100);
+  const oversizedList = await callTool(client, 'list_codex_threads', { limit: 51 });
   assert.ok(isToolFailure(oversizedList));
   assert.match(JSON.stringify(oversizedList), /limit must be an integer from 1 to 50/);
   for (const toolName of ['send_to_claude', 'send_to_codex']) {
@@ -554,13 +544,22 @@ test('MCP advertises direct, addressed messages without pair-management tools or
   assert.equal(diagnostics.plugin_version, JSON.parse(fs.readFileSync(new URL('../plugin.json', import.meta.url), 'utf8')).version);
 });
 
+test('a rejected direct Desktop caller receives doctor registration advice through MCP', async t => {
+  const setup = await setupMcp(t, { rejectedContextIds: ['rejected-direct-context'] });
+  const response = await callTool(setup.client, 'list_codex_threads', {}, metadata('rejected-direct-context'));
+  assert.equal(response.result.isError, true);
+  assert.match(response.result.content[0].text, /Ask an open Codex Desktop task to call bridge_doctor/);
+  assert.doesNotMatch(response.result.content[0].text, /call list_deliveries/);
+  assert.equal(setup.notifications.length, 0);
+});
+
 test('Codex MCP startup refreshes a previous host after restart without a startup task ID', async t => {
   const fixture = await nativeFixture(t);
   const livePipe = await mockPipe(t, { framed: true });
   const { publishCodexHost, getCodexHost } = await import('../lib/codex-host.mjs');
   publishCodexHost({ stateDir: fixture.stateDir, pipePath: process.platform === 'win32' ? '\\\\.\\pipe\\previous-codex-app' : '/tmp/previous-codex-app.sock',
     threadId: 'previous-real-task', pid: 2_147_483_647 });
-  const client = startMcp(t, { CODEX_CLAUDE_BRIDGE_STATE_DIR: fixture.stateDir,
+  const client = startMcp(t, { CLAUDE_CODEX_BRIDGE_STATE_DIR: fixture.stateDir,
     CODEX_APP_TOOLS_PIPE_PATH: livePipe.pipePath });
   await initialize(client);
   const host = getCodexHost({ stateDir: fixture.stateDir });
@@ -576,7 +575,7 @@ test('Claude ignores inherited Codex routing variables and does not replace its 
     CODEX_THREAD_ID: 'inherited-codex-task', CLAUDE_CODE_MESSAGING_SOCKET: setup.claude.pipePath });
   await initialize(peer);
   assert.equal(getCodexHost({ stateDir: setup.stateDir }).pipePath, setup.codex.pipePath);
-  const status = toolValue(await callTool(peer, 'bridge_status'));
+  const status = toolValue(await callTool(peer, 'list_deliveries'));
   assert.equal(status.application, 'claude');
   toolValue(await callTool(peer, 'send_to_codex', {
     thread_id: 'codex-target-a', message: 'Claude remains the sender.', message_id: 'inherited-env-test',
@@ -587,15 +586,15 @@ test('Claude ignores inherited Codex routing variables and does not replace its 
     CODEX_APP_TOOLS_PIPE_PATH: '\\\\.\\pipe\\stale-inherited-codex', CODEX_THREAD_ID: 'inherited-codex-task' });
   await initialize(peerWithoutSocket);
   assert.equal(getCodexHost({ stateDir: setup.stateDir }).pipePath, setup.codex.pipePath);
-  assert.equal(toolValue(await callTool(peerWithoutSocket, 'bridge_status')).application, 'claude');
+  assert.equal(toolValue(await callTool(peerWithoutSocket, 'list_deliveries')).application, 'claude');
 });
 
-for (const entrypoint of ['cli', 'sdk-cli']) test(`Codex and Claude ${entrypoint} can initiate independent addressed messages without a connection or reply`, windowsOnly, async t => {
+for (const entrypoint of ['cli', 'sdk-cli']) test(`Claude and Codex ${entrypoint} can initiate independent addressed messages without a connection or reply`, windowsOnly, async t => {
   const setup = await setupMcp(t, { envThreadId: 'environment-fallback', entrypoint });
   const meta = metadata('origin-mcp-chat');
   const listed = toolValue(await callTool(setup.client, 'list_claude_sessions'));
   assert.match(JSON.stringify(listed), new RegExp(setup.sessionId));
-  assert.equal(listed.find(session => session.sessionId === setup.sessionId).entrypoint, entrypoint);
+  assert.equal(listed.sessions.find(session => session.session_id === setup.sessionId).entrypoint, entrypoint);
   assert.doesNotMatch(JSON.stringify(listed), new RegExp(setup.token));
   const plainMessage = 'For information: the first part is ready. No reply needed. 🦊\n{"branch":"feature/unicode","custom":{"revision":7}}';
   toolValue(await callTool(setup.client, 'send_to_claude', { session_id: setup.sessionId, message: plainMessage, message_id: 'info-one' }, meta));
@@ -616,16 +615,16 @@ for (const entrypoint of ['cli', 'sdk-cli']) test(`Codex and Claude ${entrypoint
   assert.equal(setup.notifications[0].arguments.prompt,
     `[From Claude Code CLI session "${setup.sessionId}"; bridge message "claude-info-one"]\n\n${independent}`);
   for (const call of setup.notifications) assert.equal(call.arguments.threadId, 'origin-mcp-chat');
-  const codexStatus = toolValue(await callTool(setup.client, 'bridge_status', { limit: 10 }, meta));
-  const claudeStatus = toolValue(await callTool(peer, 'bridge_status', { limit: 10 }));
+  const codexStatus = toolValue(await callTool(setup.client, 'list_deliveries', { limit: 10 }, meta));
+  const claudeStatus = toolValue(await callTool(peer, 'list_deliveries', { limit: 10 }));
   assert.equal(claudeStatus.application, 'claude');
   assert.equal(claudeStatus.sender_id, setup.sessionId);
   assert.match(JSON.stringify(codexStatus), /first part is ready/);
   assert.doesNotMatch(JSON.stringify(codexStatus), /Independent Claude note/);
   assert.match(JSON.stringify(claudeStatus), /Independent Claude note/);
   assert.doesNotMatch(JSON.stringify(claudeStatus), /first part is ready/);
-  assert.ok(codexStatus.messages.every(message => message.route.from.kind === 'codex' && message.route.from.id === 'origin-mcp-chat'));
-  assert.ok(claudeStatus.messages.every(message => message.route.from.kind === 'claude' && message.route.from.id === setup.sessionId));
+  assert.ok(codexStatus.deliveries.every(message => message.from.app === 'codex' && message.from.id === 'origin-mcp-chat'));
+  assert.ok(claudeStatus.deliveries.every(message => message.from.app === 'claude' && message.from.id === setup.sessionId));
   assert.equal(getSession({ stateDir: setup.stateDir, threadId: 'environment-fallback' }), null);
   assert.equal(getSession({ stateDir: setup.stateDir, threadId: `claude:${staleSessionId}` }), null);
   for (const [client, args, application] of [[setup.client, meta, 'codex'], [peer, undefined, 'claude']]) {
@@ -645,11 +644,11 @@ for (const entrypoint of ['cli', 'sdk-cli']) test(`the MCP panel lists a ${entry
   const panel = toolValue(await callTool(setup.client, 'bridge_panel', {}, meta));
   assert.equal(panel.owner_thread_id, owner);
   assert.equal(panel.application, 'codex');
-  assert.deepEqual(panel.chats.map(chat => [chat.session_id, chat.entrypoint, chat.live]), [[setup.sessionId, entrypoint, true]]);
+  assert.deepEqual(panel.sessions.map(chat => [chat.session_id, chat.entrypoint, chat.live]), [[setup.sessionId, entrypoint, true]]);
   assert.equal(setup.notifications.length, 0, 'opening the panel must not send anything');
   const args = { session_id: setup.sessionId, message: 'CLI manual message. 🦊\nFull second line.', message_id: 'cli-panel-manual' };
-  const sent = toolValue(await callTool(setup.client, 'bridge_ui_send', args, meta));
-  assert.equal(sent.message.status, 'submitted');
+  const sent = toolValue(await callTool(setup.client, 'panel_send', args, meta));
+  assert.equal(sent.delivery.status, 'submitted');
   assert.equal(sent.manual, true);
   assert.equal(sent.notice_status, 'submitted');
   const deliveries = setup.claude.messages.filter(entry => entry.message.type === 'user');
@@ -660,13 +659,13 @@ for (const entrypoint of ['cli', 'sdk-cli']) test(`the MCP panel lists a ${entry
   assert.equal(setup.notifications[0].arguments.threadId, owner);
   assert.equal(setup.notifications[0].arguments.prompt,
     `[User sent to Claude session "${setup.sessionId}"; bridge message "${args.message_id}"; context only]\n\n${args.message}`);
-  const history = toolValue(await callTool(setup.client, 'bridge_ui_history', { session_id: setup.sessionId }, meta));
+  const history = toolValue(await callTool(setup.client, 'panel_history', { session_id: setup.sessionId }, meta));
   assert.equal(history.session_id, setup.sessionId);
   assert.deepEqual(history.messages.map(message => [message.id, message.message, message.manual]),
     [[args.message_id, args.message, true]]);
-  const otherHistory = toolValue(await callTool(setup.client, 'bridge_ui_history', { session_id: setup.sessionId }, metadata('other-panel-owner')));
+  const otherHistory = toolValue(await callTool(setup.client, 'panel_history', { session_id: setup.sessionId }, metadata('other-panel-owner')));
   assert.deepEqual(otherHistory.messages, []);
-  toolValue(await callTool(setup.client, 'bridge_ui_send', args, meta));
+  toolValue(await callTool(setup.client, 'panel_send', args, meta));
   assert.equal(setup.claude.messages.filter(entry => entry.message.type === 'user').length, 1);
   assert.equal(setup.notifications.length, 1);
 });
@@ -675,12 +674,12 @@ test('Claude can discover and address a Codex chat before receiving any bridge m
   const setup = await setupMcp(t);
   const peer = startMcp(t, claudeEnv(setup));
   await initialize(peer);
-  const chats = toolValueWithoutDaemon(await callTool(peer, 'list_codex_chats', { limit: 10 }));
+  const chats = toolValueWithoutDaemon(await callTool(peer, 'list_codex_threads', { limit: 10 }));
   assert.match(JSON.stringify(chats), /Target Codex A/);
   assert.match(JSON.stringify(chats), /Target Codex B/);
   assert.ok(setup.catalogCalls.length > 0);
   assert.equal(setup.catalogCalls[0].threadId, 'known-host-context');
-  toolValueWithoutDaemon(await callTool(peer, 'list_codex_chats', { limit: 50 }));
+  toolValueWithoutDaemon(await callTool(peer, 'list_codex_threads', { limit: 50 }));
   assert.equal(setup.notifications.length, 0, 'listing does not send messages');
   assert.equal(setup.claude.messages.length, 0);
   toolValue(await callTool(peer, 'send_to_codex', { thread_id: 'codex-target-b', message: 'Claude started this conversation.', message_id: 'claude-first' }));
@@ -693,7 +692,7 @@ test('Claude can discover and address a Codex chat before receiving any bridge m
   assert.equal(setup.notifications[1].arguments.threadId, olderThreadId);
   toolValue(await callTool(setup.client, 'send_to_claude', { session_id: setup.sessionId, message: 'Codex responds to the sender.', message_id: 'codex-second' }, metadata('codex-target-b')));
   assert.equal(setup.claude.messages.filter(entry => entry.message.type === 'user').length, 1);
-  const otherStatus = await callTool(setup.client, 'bridge_status', {}, metadata('codex-target-a'));
+  const otherStatus = await callTool(setup.client, 'list_deliveries', {}, metadata('codex-target-a'));
   assert.doesNotMatch(JSON.stringify(otherStatus), /Claude started this conversation/);
   assert.ok(setup.catalogCalls.every(call => call.arguments.limit >= 1 && call.arguments.limit <= 50));
 });
@@ -705,7 +704,7 @@ test('Claude chooses an older live Codex host when the latest registered pipe di
     threadId: 'stopped-context', pid: 2_147_483_647 });
   const peer = startMcp(t, claudeEnv(setup));
   await initialize(peer);
-  const chats = toolValueWithoutDaemon(await callTool(peer, 'list_codex_chats', { limit: 2 }));
+  const chats = toolValueWithoutDaemon(await callTool(peer, 'list_codex_threads', { limit: 2 }));
   assert.equal(chats.length, 2);
   toolValue(await callTool(peer, 'send_to_codex', {
     thread_id: 'codex-target-a', message: 'Fallback host receives this.', message_id: 'fallback-host',
@@ -720,7 +719,7 @@ test('Claude chooses a retained Codex context when the latest task was removed',
     threadId: 'removed-context', pid: 2_147_483_647 });
   const peer = startMcp(t, claudeEnv(setup));
   await initialize(peer);
-  const chats = toolValueWithoutDaemon(await callTool(peer, 'list_codex_chats', { limit: 2 }));
+  const chats = toolValueWithoutDaemon(await callTool(peer, 'list_codex_threads', { limit: 2 }));
   assert.equal(chats.length, 2);
   assert.ok(setup.catalogCalls.some(call => call.threadId === 'removed-context'));
   assert.ok(setup.catalogCalls.some(call => call.threadId === 'known-host-context'));
@@ -772,9 +771,9 @@ test('a recorded failure cannot look successful when retried with the same messa
   assert.ok(isToolFailure(repeated));
   assert.match(JSON.stringify(repeated), /new message_id/);
   assert.equal(setup.notifications.length, 0);
-  const status = toolValue(await callTool(peer, 'bridge_status'));
-  assert.equal(status.messages.length, 1);
-  assert.equal(status.messages[0].status, 'failed');
+  const status = toolValue(await callTool(peer, 'list_deliveries'));
+  assert.equal(status.deliveries.length, 1);
+  assert.equal(status.deliveries[0].status, 'failed');
 });
 
 test('a crashed send reports uncertain delivery instead of a successful duplicate', windowsOnly, async t => {
@@ -792,8 +791,8 @@ test('a crashed send reports uncertain delivery instead of a successful duplicat
   assert.ok(isToolFailure(response));
   assert.match(JSON.stringify(response), /uncertain delivery/);
   assert.equal(setup.notifications.length, 0);
-  const status = toolValue(await callTool(peer, 'bridge_status'));
-  assert.equal(status.messages[0].status, 'uncertain');
+  const status = toolValue(await callTool(peer, 'list_deliveries'));
+  assert.equal(status.deliveries[0].status, 'uncertain');
 });
 
 test('shared-server Codex metadata isolates sibling tasks and rejects malformed identities', windowsOnly, async t => {
@@ -802,10 +801,10 @@ test('shared-server Codex metadata isolates sibling tasks and rejects malformed 
   toolValue(await callTool(setup.client, 'send_to_claude', { session_id: setup.sessionId, message: 'Private owner information.', message_id: 'owner-private' }, meta));
   const otherMeta = { 'x-codex-turn-metadata': JSON.stringify({ thread_id: 'other-chat' }) };
   toolValue(await callTool(setup.client, 'send_to_claude', { session_id: setup.sessionId, message: 'Independent sibling message.', message_id: 'sibling' }, otherMeta));
-  assert.doesNotMatch(JSON.stringify(await callTool(setup.client, 'bridge_status', {}, otherMeta)), /Private owner information/);
-  assert.doesNotMatch(JSON.stringify(await callTool(setup.client, 'bridge_status', {}, meta)), /Independent sibling message/);
+  assert.doesNotMatch(JSON.stringify(await callTool(setup.client, 'list_deliveries', {}, otherMeta)), /Private owner information/);
+  assert.doesNotMatch(JSON.stringify(await callTool(setup.client, 'list_deliveries', {}, meta)), /Independent sibling message/);
   // The startup task ID cannot identify a call from a shared MCP server.
-  const missingIdentityStatus = await callTool(setup.client, 'bridge_status');
+  const missingIdentityStatus = await callTool(setup.client, 'list_deliveries');
   assert.ok(isToolFailure(missingIdentityStatus));
   assert.doesNotMatch(JSON.stringify(missingIdentityStatus), /Private owner information/);
   assert.ok(isToolFailure(await callTool(setup.client, 'send_to_claude', {
@@ -816,7 +815,7 @@ test('shared-server Codex metadata isolates sibling tasks and rejects malformed 
     { 'x-codex-turn-metadata': { thread_id: 123 } },
     { 'x-codex-turn-metadata': { thread_id: '' } },
     { 'x-codex-turn-metadata': 'not-json' },
-  ]) assert.ok(isToolFailure(await callTool(setup.client, 'bridge_status', {}, invalid)));
+  ]) assert.ok(isToolFailure(await callTool(setup.client, 'list_deliveries', {}, invalid)));
   assert.equal(setup.claude.messages.filter(entry => entry.message.type === 'user').length, 2);
 });
 
@@ -831,9 +830,9 @@ test('a v0.1.0 pairing record cannot constrain direct sends or leak into new sta
   toolValue(await callTool(setup.client, 'send_to_claude', {
     session_id: setup.sessionId, message: 'New direct delivery.', message_id: 'new-message',
   }, metadata(threadId)));
-  const status = toolValue(await callTool(setup.client, 'bridge_status', {}, metadata(threadId)));
-  assert.equal(status.messages.length, 1);
-  assert.equal(status.messages[0].route.to.id, setup.sessionId);
+  const status = toolValue(await callTool(setup.client, 'list_deliveries', {}, metadata(threadId)));
+  assert.equal(status.deliveries.length, 1);
+  assert.equal(status.deliveries[0].to.id, setup.sessionId);
   assert.doesNotMatch(JSON.stringify(status), /Old private delivery|legacy-claude-session/);
   assert.deepEqual(readSession(ledger).desktop, legacyDesktop);
   assert.equal(setup.claude.messages.filter(entry => entry.message.type === 'user').length, 1);
@@ -873,15 +872,15 @@ test('two Codex tasks can address simultaneous Claude Desktop and CLI sessions w
   ]);
   for (const codexId of ['codex-target-a', 'codex-target-b']) {
     assert.ok([...deliveriesA, ...deliveriesB].some(entry => entry.message.message.content.includes(`From Codex Desktop task "${codexId}"; bridge message`)));
-    const status = toolValue(await callTool(setup.client, 'bridge_status', {}, metadata(codexId)));
-    assert.equal(status.messages.length, 2);
-    assert.ok(status.messages.every(message => message.route.from.kind === 'codex' && message.route.from.id === codexId));
+    const status = toolValue(await callTool(setup.client, 'list_deliveries', {}, metadata(codexId)));
+    assert.equal(status.deliveries.length, 2);
+    assert.ok(status.deliveries.every(message => message.from.app === 'codex' && message.from.id === codexId));
   }
   for (const [peer, claudeId, otherId] of [[peerA, setup.sessionId, sessionB], [peerB, sessionB, setup.sessionId]]) {
-    const status = toolValue(await callTool(peer, 'bridge_status'));
+    const status = toolValue(await callTool(peer, 'list_deliveries'));
     assert.equal(status.sender_id, claudeId);
-    assert.equal(status.messages.length, 2);
-    assert.ok(status.messages.every(message => message.route.from.kind === 'claude' && message.route.from.id === claudeId));
+    assert.equal(status.deliveries.length, 2);
+    assert.ok(status.deliveries.every(message => message.from.app === 'claude' && message.from.id === claudeId));
     assert.doesNotMatch(JSON.stringify(status), new RegExp(`From ${otherId} to`));
   }
   for (const [index, call] of setup.notifications.entries()) {
@@ -897,7 +896,7 @@ test('an unregistered parent cannot impersonate Claude by supplying its socket p
   const impostor = startMcp(t, { ...claudeEnv(setup), CLAUDE_CODE_MESSAGING_SOCKET: setup.claude.pipePath }, { parentProxy: true });
   await initialize(impostor);
   assert.ok(isToolFailure(await callTool(impostor, 'send_to_codex', { thread_id: 'codex-target-a', message: 'Forged parent.' })));
-  assert.ok(isToolFailure(await callTool(impostor, 'bridge_status')));
+  assert.ok(isToolFailure(await callTool(impostor, 'list_deliveries')));
   assert.equal(setup.notifications.length, 0);
 });
 
@@ -927,21 +926,21 @@ test('an in-flight send from one Claude session does not block another session w
 
   // MCP requests are serialized per process. A second process of the same
   // verified caller can inspect the ledger while the first send is pending.
-  const statusAInFlight = toolValue(await callTool(peerATwin, 'bridge_status'));
-  const statusBDone = toolValue(await callTool(peerB, 'bridge_status'));
-  assert.equal(statusAInFlight.messages.length, 1);
-  assert.equal(statusAInFlight.messages[0].status, 'sending');
-  assert.equal(statusBDone.messages.length, 1);
-  assert.equal(statusBDone.messages[0].status, 'submitted');
+  const statusAInFlight = toolValue(await callTool(peerATwin, 'list_deliveries'));
+  const statusBDone = toolValue(await callTool(peerB, 'list_deliveries'));
+  assert.equal(statusAInFlight.deliveries.length, 1);
+  assert.equal(statusAInFlight.deliveries[0].status, 'sending');
+  assert.equal(statusBDone.deliveries.length, 1);
+  assert.equal(statusBDone.deliveries[0].status, 'submitted');
   assert.doesNotMatch(JSON.stringify(statusAInFlight), /Independent message from Claude B/);
   assert.doesNotMatch(JSON.stringify(statusBDone), /Delayed message from Claude A/);
 
   setup.releaseFirstNotification();
   toolValue(await delayed);
-  const statusAFinished = toolValue(await callTool(peerA, 'bridge_status'));
-  assert.equal(statusAFinished.messages[0].status, 'submitted');
-  assert.equal(statusAFinished.messages[0].route.from.id, setup.sessionId);
-  assert.equal(statusBDone.messages[0].route.from.id, sessionB);
+  const statusAFinished = toolValue(await callTool(peerA, 'list_deliveries'));
+  assert.equal(statusAFinished.deliveries[0].status, 'submitted');
+  assert.equal(statusAFinished.deliveries[0].from.id, setup.sessionId);
+  assert.equal(statusBDone.deliveries[0].from.id, sessionB);
 });
 
 test('an unrelated abandoned state directory does not break Claude discovery or direct messages', windowsOnly, async t => {
@@ -951,12 +950,12 @@ test('an unrelated abandoned state directory does not break Claude discovery or 
   fs.writeFileSync(path.join(abandoned, 'unfinished.tmp'), 'Unrelated unfinished session initialization.');
   const peer = startMcp(t, claudeEnv(setup));
   await initialize(peer);
-  assert.deepEqual(toolValue(await callTool(peer, 'bridge_status')).messages, []);
-  assert.match(JSON.stringify(toolValueWithoutDaemon(await callTool(peer, 'list_codex_chats'))), /Target Codex A/);
+  assert.deepEqual(toolValue(await callTool(peer, 'list_deliveries')).deliveries, []);
+  assert.match(JSON.stringify(toolValueWithoutDaemon(await callTool(peer, 'list_codex_threads'))), /Target Codex A/);
   toolValue(await callTool(peer, 'send_to_codex', { thread_id: 'codex-target-a', message: 'Claude works despite unrelated incomplete state.', message_id: 'abandoned-directory-note' }));
   assert.equal(setup.notifications.length, 1);
   assert.equal(setup.notifications[0].arguments.threadId, 'codex-target-a');
-  const status = toolValue(await callTool(peer, 'bridge_status'));
+  const status = toolValue(await callTool(peer, 'list_deliveries'));
   assert.match(JSON.stringify(status), /Claude works despite unrelated incomplete state/);
   assert.equal(fs.readFileSync(path.join(abandoned, 'unfinished.tmp'), 'utf8'), 'Unrelated unfinished session initialization.');
 });

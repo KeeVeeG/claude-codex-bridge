@@ -57,6 +57,8 @@ function unzipStored(buffer) {
 
 test('canonical Agent Plugins metadata generates the checked-in native adapters and exact runtime subtree', () => {
   const bundle = checkManifests(root);
+  assert.equal(bundle.manifest.name, 'bridge-claude-codex');
+  assert.equal(bundle.packageJson.name, 'claude-codex-bridge');
   assert.equal(bundle.manifest.$schema, PLUGIN_SCHEMA);
   assert.equal(bundle.mcp.$schema, MCP_SCHEMA);
   assert.equal(bundle.files['.codex-plugin/plugin.json'].name, bundle.manifest.name);
@@ -72,7 +74,7 @@ test('canonical Agent Plugins metadata generates the checked-in native adapters 
   assert.equal(claude.plugins[0].source, './compatibility/native');
 });
 
-// The bridge serves every Codex and Claude Code client, so no listing may read as one client's add-on:
+// The bridge serves every Claude Code and Codex client, so no listing may read as one client's add-on:
 // short texts name no client, and the long description names them all.
 test('manifest and catalog texts name every supported client or none', () => {
   const { manifest, files } = checkManifests(root);
@@ -135,7 +137,11 @@ test('release ZIPs contain exactly the native or portable allowlist and reproduc
   fs.writeFileSync(path.join(source, 'state.json'), '{"local":"not-for-release"}');
   const first = buildPackages({ sourceRoot: source, outputDir: path.join(directory, 'first') });
   const second = buildPackages({ sourceRoot: source, outputDir: path.join(directory, 'second') });
-  assert.equal(first.archives.length, 3);
+  assert.deepEqual(first.archives.map(filename => path.basename(filename)), [
+    `claude-codex-bridge-${first.version}.zip`,
+    `claude-codex-bridge-marketplace-${first.version}.zip`,
+    `claude-codex-bridge-portable-${first.version}.zip`,
+  ]);
   for (let index = 0; index < first.archives.length; index++) {
     assert.deepEqual(fs.readFileSync(first.archives[index]), fs.readFileSync(second.archives[index]));
   }
@@ -144,6 +150,8 @@ test('release ZIPs contain exactly the native or portable allowlist and reproduc
   assert.equal(native.has('plugin.json'), false);
   assert.equal(native.has('mcp.json'), false);
   assert.equal(JSON.parse(native.get('config/plugin-source.json').toString()).version, first.version);
+  assert.equal(JSON.parse(native.get('config/plugin-source.json').toString()).name, 'bridge-claude-codex');
+  assert.equal(JSON.parse(native.get('package.json').toString()).name, 'claude-codex-bridge');
   const marketplace = unzipStored(fs.readFileSync(first.archives[1]));
   assert.deepEqual([...marketplace.keys()].sort(), [
     '.agents/plugins/marketplace.json', '.claude-plugin/marketplace.json',
@@ -184,7 +192,7 @@ test('portable archive expands PLUGIN_ROOT to a cached Unicode installation and 
   assert.equal(expand(config.cwd), cache);
   const env = { ...process.env, PLUGIN_ROOT: cache, PLUGIN_DATA: dataDirectory, USERPROFILE: directory, HOME: directory };
   for (const key of ['CODEX_APP_TOOLS_PIPE_PATH', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET',
-    'CLAUDE_CODE_MESSAGING_TOKEN', 'CODEX_CLAUDE_BRIDGE_STATE_DIR', 'CODEX_CLAUDE_BRIDGE_REGISTRY_DIR']) delete env[key];
+    'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODEX_BRIDGE_STATE_DIR', 'CLAUDE_CODEX_BRIDGE_REGISTRY_DIR']) delete env[key];
   const child = spawn(config.command, config.args.map(expand), { cwd: unrelated, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill(); });
   const result = await new Promise((resolve, reject) => {
@@ -203,8 +211,8 @@ test('portable archive expands PLUGIN_ROOT to a cached Unicode installation and 
   const replies = result.trim().split('\n').map(line => JSON.parse(line));
   assert.equal(replies.find(reply => reply.id === 1).result.serverInfo.version, built.version);
   assert.deepEqual(replies.find(reply => reply.id === 2).result.tools.map(tool => tool.name).sort(),
-    ['bridge_doctor', 'bridge_panel', 'bridge_status', 'bridge_ui_history', 'bridge_ui_retry_notice', 'bridge_ui_send', 'list_claude_sessions', 'list_codex_chats', 'send_to_claude', 'send_to_codex']);
-  assert.equal(fs.existsSync(path.join(directory, '.local/share', PLUGIN_NAME)), false, 'probe must not register a real app endpoint');
+    ['bridge_doctor', 'bridge_panel', 'list_claude_sessions', 'list_codex_threads', 'list_deliveries', 'panel_history', 'panel_retry_notice', 'panel_send', 'send_to_claude', 'send_to_codex']);
+  assert.equal(fs.existsSync(path.join(directory, '.local/share', 'claude-codex-bridge')), false, 'probe must not register a real app endpoint');
 });
 
 test('the generated native runtime starts and answers initialize, so every imported module is packaged', () => {
@@ -217,7 +225,7 @@ test('the generated native runtime starts and answers initialize, so every impor
 });
 
 test('the generated native runtime can import the lazily loaded service graph, so every module it needs is packaged', () => {
-  const service = new URL('../compatibility/native/lib/desktop-service.mjs', import.meta.url).href;
+  const service = new URL('../compatibility/native/lib/bridge-service.mjs', import.meta.url).href;
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', `await import(${JSON.stringify(service)});`],
     { encoding: 'utf8', timeout: 15000, windowsHide: true });
   assert.equal(result.status, 0, result.stderr);

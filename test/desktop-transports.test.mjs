@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
-import { sendToClaude } from '../lib/claude-desktop.mjs';
+import { sendToClaude } from '../lib/claude-sessions.mjs';
 import { MAX_CODEX_CHAT_LIMIT, listCodexTools, listCodexChats, sendToCodex } from '../lib/codex-desktop.mjs';
 import { encodeFrame, mockPipe, messageTool } from './native-helpers.mjs';
 

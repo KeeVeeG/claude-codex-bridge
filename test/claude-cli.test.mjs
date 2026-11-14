@@ -7,7 +7,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import test from 'node:test';
-import { canonicalClaudeSocket, discoverClaudeSessions, resolveClaudeCaller, resolveClaudeSession, sendToClaude } from '../lib/claude-desktop.mjs';
+import { canonicalClaudeSocket, discoverClaudeSessions, resolveClaudeCaller, resolveClaudeSession, sendToClaude } from '../lib/claude-sessions.mjs';
 import { mockPipe, nativeFixture } from './native-helpers.mjs';
 
 const nativeIdentityOnly = { skip: !['win32', 'darwin'].includes(process.platform) && 'Verified native Claude process identity supports Windows and macOS.' };

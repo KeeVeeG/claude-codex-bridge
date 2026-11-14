@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { codexIdentity, executeBridgeTool } from './desktop-service.mjs';
+import { codexIdentity, executeBridgeTool } from './bridge-service.mjs';
 import { sendToCodex } from './codex-desktop.mjs';
+import { publicDelivery } from './delivery.mjs';
 import { defaultStateDir, getSession, readSession, processAlive, withStateLock } from './store.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -151,12 +152,13 @@ function originalMessage(stateDir, route, id) {
     record.route?.to?.kind === 'claude' && record.route.to.id === route.to.id) || null;
 }
 
-function resultFor(args, route, record, message) {
-  return { message: { ...(message || {
-    id: args.message_id, route, direction: 'to_claude', message: args.message,
-    createdAt: record.createdAt, updatedAt: record.updatedAt, status: record.send_status, fingerprint: record.fingerprint,
-    ...(record.error ? { error: record.error } : {}),
-  }), status: record.send_status, ...(record.error ? { error: record.error } : {}), manual: true }, manual: true,
+function resultFor(args, route, record, message, submittedDelivery) {
+  const delivery = submittedDelivery || publicDelivery(message || {
+    id: args.message_id, route, message: args.message,
+    createdAt: record.createdAt, updatedAt: record.updatedAt, status: record.send_status,
+  });
+  return { delivery: { ...delivery, status: record.send_status,
+    ...(record.error ? { error: record.error } : {}), manual: true }, manual: true,
   notice_status: record.notice_status, notice_retryable: record.notice_retryable === true,
   ...(record.notice_error ? { notice_error: record.notice_error } : {}) };
 }
@@ -192,7 +194,7 @@ function owningCodexContext(context) {
   const env = context.env || process.env;
   if (env.CLAUDE_CODE_MESSAGING_SOCKET) throw new Error('Manual sending is available only from the owning Codex Desktop task.');
   const identity = codexIdentity(context.metadata || {}, env);
-  const stateDir = context.stateDir || env.CODEX_CLAUDE_BRIDGE_STATE_DIR || defaultStateDir({ env });
+  const stateDir = context.stateDir || defaultStateDir({ env });
   return { identity, stateDir };
 }
 
@@ -245,11 +247,12 @@ export async function manualSend(args, context = {}) {
     return { created: !message, record: { ...record } };
   });
   let record = reservation.record;
+  let submittedDelivery;
   if (reservation.created) {
     try {
       const submitted = await executeBridgeTool('send_to_claude', args, { ...context, stateDir, manual: true });
-      message = submitted.message;
-      if (message?.status !== 'submitted') throw Object.assign(new Error('Manual Claude send returned an unsupported outcome.'), { deliveryUnknown: true });
+      submittedDelivery = submitted.delivery;
+      if (submittedDelivery?.status !== 'submitted') throw Object.assign(new Error('Manual Claude send returned an unsupported outcome.'), { deliveryUnknown: true });
       record = updateLedger(paths, ledger => {
         const saved = ledger.records[key]; saved.send_status = 'submitted'; saved.updatedAt = Date.now();
         return { ...saved };
@@ -265,7 +268,7 @@ export async function manualSend(args, context = {}) {
       return resultFor(args, route, record, message ? { ...message, status: record.send_status } : null);
     }
   }
-  if (record.send_status !== 'submitted') return resultFor(args, route, record, message);
+  if (record.send_status !== 'submitted') return resultFor(args, route, record, message, submittedDelivery);
   const claim = updateLedger(paths, ledger => {
     const saved = ledger.records[key];
     if (saved.notice_status !== 'pending' || saved.notice_attempted) return { claimed: false, record: { ...saved } };
@@ -273,9 +276,9 @@ export async function manualSend(args, context = {}) {
     return { claimed: true, record: { ...saved } };
   });
   record = claim.record;
-  if (!claim.claimed) return resultFor(args, route, record, message);
+  if (!claim.claimed) return resultFor(args, route, record, message, submittedDelivery);
   record = await submitNotice(args, context, identity, paths, key);
-  return resultFor(args, route, record, message);
+  return resultFor(args, route, record, message, submittedDelivery);
 }
 
 /** Explicit human retry after a definite owner-notice rejection. The original

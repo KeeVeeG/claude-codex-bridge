@@ -5,8 +5,8 @@ import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { executeBridgeTool } from '../lib/desktop-service.mjs';
-import { canonicalClaudeSocket, sendToClaude, probeClaudeInbox } from '../lib/claude-desktop.mjs';
+import { executeBridgeTool } from '../lib/bridge-service.mjs';
+import { canonicalClaudeSocket, sendToClaude, probeClaudeInbox } from '../lib/claude-sessions.mjs';
 import { listCodexTools, sendToCodex } from '../lib/codex-desktop.mjs';
 import { getMessages, getSession } from '../lib/store.mjs';
 import { getCodexHosts, publishCodexHost } from '../lib/codex-host.mjs';
@@ -54,7 +54,7 @@ test('doctor reports missing configuration without registering a host or creatin
   assert.ok(result.checks.every(check => Object.keys(check).sort().join(',') === 'detail,name,status'));
 });
 
-for (const entrypoint of ['claude-desktop', 'cli', 'sdk-cli']) test(`doctor validates ${entrypoint} endpoints without sending model messages or persisting state`, windowsOnly, async t => {
+for (const entrypoint of ['claude-desktop', 'cli', 'sdk-cli']) test(`doctor validates ${entrypoint} endpoints without sending model messages and registers its verified Codex caller`, windowsOnly, async t => {
   const fixture = await claudeFixture(t, undefined, entrypoint);
   const codex = await mockPipe(t, { framed: true, onMessage(message, socket) {
     if (message.method === 'tools/list') answer(socket, message.id, { tools: [messageTool, listTool] });
@@ -70,7 +70,8 @@ for (const entrypoint of ['claude-desktop', 'cli', 'sdk-cli']) test(`doctor vali
   assert.equal(result.application, 'codex');
   assert.equal(result.ready, true);
   assert.equal(result.checks.find(check => check.name === 'claude_inbox').status, 'pass');
-  assert.equal(fs.existsSync(fixture.stateDir), false, 'doctor must not publish its caller or create a ledger');
+  assert.equal(getCodexHosts({ stateDir: fixture.stateDir })[0].threadId, 'doctor-context');
+  assert.equal(fs.readdirSync(fixture.stateDir).some(name => /^[a-f0-9]{64}$/.test(name)), false, 'doctor creates no message ledger');
   assert.equal(fixture.inbox.messages.length, 0, 'connectivity probe sends no auth frame or user prompt');
   assert.equal(codex.messages.filter(entry => entry.message.method === 'tools/call').length, 1);
   assert.doesNotMatch(JSON.stringify(result), new RegExp(fixture.token));
@@ -134,7 +135,7 @@ test('doctor reaches an older valid context after three removed Codex chats', wi
   assert.equal(fixture.inbox.messages.length, 0);
 });
 
-test('doctor cancellation stops a stalled catalog probe without state writes', async t => {
+test('doctor cancellation stops a stalled catalog probe after registering the caller', async t => {
   const fixture = await nativeFixture(t);
   const controller = new AbortController();
   const codex = await mockPipe(t, { framed: true, onMessage() { controller.abort('private cancellation reason'); } });
@@ -145,7 +146,7 @@ test('doctor cancellation stops a stalled catalog probe without state writes', a
     assert.doesNotMatch(error.message, /private cancellation reason/);
     return true;
   });
-  assert.equal(fs.existsSync(fixture.stateDir), false);
+  assert.equal(getCodexHosts({ stateDir: fixture.stateDir })[0].threadId, 'doctor-context');
   assert.equal(codex.messages.length, 1);
 });
 
@@ -253,7 +254,7 @@ test('catalog cancellation never reports message delivery uncertainty', async t 
 
 function claudeCaller(fixture) {
   return { stateDir: fixture.stateDir, registryDir: fixture.registryDir, parentPid: process.pid,
-    env: { CLAUDE_CODE_MESSAGING_SOCKET: fixture.inbox.pipePath, CODEX_CLAUDE_BRIDGE_DAEMON: 'off' },
+    env: { CLAUDE_CODE_MESSAGING_SOCKET: fixture.inbox.pipePath, CLAUDE_CODEX_BRIDGE_DAEMON: 'off' },
     desktop: { catalogMs: 500, listMs: 400, budgetMs: 5000 } };
 }
 
@@ -271,7 +272,7 @@ test('a stalled Desktop is reported as stalled, not hidden behind endpoints of e
   publishCodexHost({ stateDir: fixture.stateDir, pipePath: earlier.pipePath, threadId: 'earlier-launch' });
   await earlier.close();
   const context = claudeCaller(fixture);
-  await assert.rejects(executeBridgeTool('list_codex_chats', { limit: 5 }, context), error => {
+  await assert.rejects(executeBridgeTool('list_codex_threads', { limit: 5 }, context), error => {
     assert.match(error.message, /running but did not answer in time; restart Codex Desktop/);
     assert.match(error.message, /1 saved endpoint belongs to earlier Codex Desktop launches\./);
     assert.doesNotMatch(error.message, /ENOENT|Last error|Open a Codex Desktop task/);
@@ -290,14 +291,14 @@ test('a stalled Desktop is reported as stalled, not hidden behind endpoints of e
   assert.equal(calls(), 2);
 });
 
-test('bridge_status from a Codex Desktop task registers its endpoint, as the recovery advice says', async t => {
+test('bridge_doctor from a Codex Desktop task registers its endpoint, as the recovery advice says', async t => {
   const fixture = await nativeFixture(t);
   const codex = await mockPipe(t, { framed: true });
-  await executeBridgeTool('bridge_status', {}, { env: { CODEX_APP_TOOLS_PIPE_PATH: codex.pipePath },
-    metadata: { 'openai/threadId': 'status-context' }, stateDir: fixture.stateDir });
+  await executeBridgeTool('bridge_doctor', {}, { env: { CODEX_APP_TOOLS_PIPE_PATH: codex.pipePath, CLAUDE_CODEX_BRIDGE_DAEMON: 'off' },
+    metadata: { 'openai/threadId': 'doctor-context' }, stateDir: fixture.stateDir, registryDir: path.join(fixture.root, 'absent') });
   assert.deepEqual(getCodexHosts({ stateDir: fixture.stateDir }).map(host => [host.pipePath, host.threadId]),
-    [[codex.pipePath, 'status-context']]);
-  assert.equal(codex.connections.length, 0, 'registration sends nothing to Desktop');
+    [[codex.pipePath, 'doctor-context']]);
+  assert.ok(codex.messages.every(entry => entry.message.method === 'tools/list'), 'registration and diagnostics send no model message');
 });
 
 test('only endpoints of earlier launches point to opening Codex Desktop', windowsOnly, async t => {
@@ -305,7 +306,7 @@ test('only endpoints of earlier launches point to opening Codex Desktop', window
   const earlier = await mockPipe(t);
   publishCodexHost({ stateDir: fixture.stateDir, pipePath: earlier.pipePath, threadId: 'earlier-launch' });
   await earlier.close();
-  await assert.rejects(executeBridgeTool('list_codex_chats', {}, claudeCaller(fixture)),
+  await assert.rejects(executeBridgeTool('list_codex_threads', {}, claudeCaller(fixture)),
     /1 saved endpoint belongs to earlier Codex Desktop launches\. Open a Codex Desktop task with the bridge enabled/);
 });
 
@@ -320,16 +321,16 @@ test('a send reuses the context Desktop accepted earlier even while chat discove
   } });
   publishCodexHost({ stateDir: fixture.stateDir, pipePath: codex.pipePath, threadId: 'host-context' });
   const context = claudeCaller(fixture);
-  const listed = await executeBridgeTool('list_codex_chats', { limit: 5 }, context);
-  assert.deepEqual(listed.chats.map(chat => chat.thread_id), ['target-task']);
+  const listed = await executeBridgeTool('list_codex_threads', { limit: 5 }, context);
+  assert.deepEqual(listed.threads.map(chat => chat.thread_id), ['target-task']);
   stalled = true;
   // Diagnosing the stall must not cost the context that sends still work with.
-  await assert.rejects(executeBridgeTool('list_codex_chats', { limit: 5 }, context), /did not answer in time/);
+  await assert.rejects(executeBridgeTool('list_codex_threads', { limit: 5 }, context), /did not answer in time/);
   assert.equal((await executeBridgeTool('bridge_doctor', {}, context)).checks
     .find(entry => entry.name === 'codex_context').status, 'fail');
   const sent = await executeBridgeTool('send_to_codex', { thread_id: 'target-task', transport: 'desktop',
     message: 'Arrives while discovery stalls.' }, context);
-  assert.equal(sent.message.status, 'submitted');
+  assert.equal(sent.delivery.status, 'submitted');
   const calls = codex.messages.filter(entry => entry.message.method === 'tools/call').map(entry => entry.message.params);
   assert.deepEqual(calls.map(call => call.tool), ['list_threads', 'list_threads', 'list_threads', 'send_message_to_thread']);
   assert.equal(calls[3].threadId, 'host-context');

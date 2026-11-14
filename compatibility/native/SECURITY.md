@@ -12,6 +12,6 @@ Claude sessions must have a live registered process and inbox. Windows checks th
 
 The Claude peer envelope retains `from-mode="bypass"` on supported platforms for the issue #1 compatibility fix. This wire classification does not change the receiving session's tool permissions; explicit inbound hold/refuse rules remain effective. Local process checks and the bridge ledger do not create a security boundary against other software running as the same OS user.
 
-Please report a vulnerability through [GitHub private vulnerability reporting](https://github.com/KeeVeeG/codex-claude-bridge/security/advisories/new). Include the affected version, operating system and application versions, transport, a minimal reproduction, and the expected impact. Avoid posting credentials, private conversation text, or live routing addresses in public issues.
+Please report a vulnerability through [GitHub private vulnerability reporting](https://github.com/KeeVeeG/claude-codex-bridge/security/advisories/new). Include the affected version, operating system and application versions, transport, a minimal reproduction, and the expected impact. Avoid posting credentials, private conversation text, or live routing addresses in public issues.
 
-For installation and usage problems that do not expose sensitive data, [open a public issue](https://github.com/KeeVeeG/codex-claude-bridge/issues/new).
+For installation and usage problems that do not expose sensitive data, [open a public issue](https://github.com/KeeVeeG/claude-codex-bridge/issues/new).

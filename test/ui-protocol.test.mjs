@@ -70,17 +70,17 @@ test('UI helper tools preserve trusted host metadata and reject widget-supplied 
   await initialize(client);
   const metadata = { thread_id: 'actual-owner', threadId: 'actual-owner' };
   const target = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
-  const response = await client.rpc('tools/call', { name: 'bridge_ui_history',
+  const response = await client.rpc('tools/call', { name: 'panel_history',
     arguments: { session_id: target }, _meta: metadata });
   assert.deepEqual(response.result.structuredContent.messages, []);
   assert.deepEqual(calls[0].metadata, metadata);
   for (const field of ['owner_thread_id', 'thread_id', 'threadId', 'manual']) {
-    const invalid = await client.rpc('tools/call', { name: 'bridge_ui_send', _meta: metadata,
+    const invalid = await client.rpc('tools/call', { name: 'panel_send', _meta: metadata,
       arguments: { session_id: target, message_id: 'one', message: 'user text', [field]: 'spoofed' } });
     assert.equal(invalid.result.isError, true);
   }
   assert.equal(calls.length, 1);
-  for (const name of ['bridge_ui_send', 'bridge_ui_retry_notice']) {
+  for (const name of ['panel_send', 'panel_retry_notice']) {
     const tool = TOOLS.find(item => item.name === name);
     assert.deepEqual(tool._meta.ui.visibility, ['app']);
     assert.equal(tool.annotations.destructiveHint, true);

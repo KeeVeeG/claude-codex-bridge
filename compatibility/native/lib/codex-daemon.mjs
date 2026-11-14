@@ -21,14 +21,14 @@ function checkCancellation(signal) {
   if (signal?.aborted) throw cancelled();
 }
 
-const CMD_SHIM_MESSAGE = 'CODEX_CLAUDE_BRIDGE_CODEX_BIN must point to codex.exe, not the codex.cmd shim.';
+const CMD_SHIM_MESSAGE = 'CLAUDE_CODEX_BRIDGE_CODEX_BIN must point to codex.exe, not the codex.cmd shim.';
 // Node cannot spawn a .cmd/.bat shim without a shell, and this module never uses one.
 const isDirectExecutable = executable => /\.exe$/i.test(executable);
 
 // Accept the usual spellings of "off", so an opt-out is never silently ignored.
 const DISABLED = /^(off|0|false|no|disabled?)$/i;
 const disabledValue = env => {
-  const value = String(env.CODEX_CLAUDE_BRIDGE_DAEMON ?? '').trim();
+  const value = String(env.CLAUDE_CODEX_BRIDGE_DAEMON ?? '').trim();
   return DISABLED.test(value) ? value : null;
 };
 
@@ -46,11 +46,11 @@ function resolveExecutable({ effective, command }) {
   if (command) return command;
   const disabled = disabledValue(effective);
   if (disabled !== null) {
-    throw new DaemonUnavailableError(`Codex terminal support is disabled by CODEX_CLAUDE_BRIDGE_DAEMON=${disabled}.`);
+    throw new DaemonUnavailableError(`Codex terminal support is disabled by CLAUDE_CODEX_BRIDGE_DAEMON=${disabled}.`);
   }
   const executable = resolveCodexExecutable({ env: effective });
   if (!executable) {
-    throw new DaemonUnavailableError('The Codex executable was not found. Install the Codex CLI, or set CODEX_CLAUDE_BRIDGE_CODEX_BIN to the path of codex.exe.');
+    throw new DaemonUnavailableError('The Codex executable was not found. Install the Codex CLI, or set CLAUDE_CODEX_BRIDGE_CODEX_BIN to the path of codex.exe.');
   }
   if (!isDirectExecutable(executable)) throw new DaemonUnavailableError(CMD_SHIM_MESSAGE);
   return executable;
@@ -154,7 +154,7 @@ export function openDaemon({ env = process.env, command, args, signal, timeoutMs
 
     async function afterUpgrade() {
       try {
-        await request('initialize', { clientInfo: { name: 'codex-claude-desktop-bridge', title: 'Codex–Claude Bridge', version: runtimeVersion } });
+        await request('initialize', { clientInfo: { name: 'claude-codex-bridge', title: 'Claude–Codex Bridge', version: runtimeVersion } });
         notify('initialized', {});
         opened = true;
         clearTimeout(connectTimer);

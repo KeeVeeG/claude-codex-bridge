@@ -1,19 +1,19 @@
 {
-  "name": "codex-claude-desktop-bridge",
+  "name": "claude-codex-bridge",
   "version": "0.4.2",
   "author": "KeeVeeG",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/KeeVeeG/codex-claude-bridge.git"
+    "url": "git+https://github.com/KeeVeeG/claude-codex-bridge.git"
   },
-  "homepage": "https://github.com/KeeVeeG/codex-claude-bridge#readme",
+  "homepage": "https://github.com/KeeVeeG/claude-codex-bridge#readme",
   "bugs": {
-    "url": "https://github.com/KeeVeeG/codex-claude-bridge/issues"
+    "url": "https://github.com/KeeVeeG/claude-codex-bridge/issues"
   },
   "private": true,
   "type": "module",
-  "description": "Asynchronous two-way messaging between Codex and Claude Code conversations.",
+  "description": "Asynchronous two-way messaging between Claude Code and Codex conversations.",
   "engines": {
     "node": ">=20"
   },

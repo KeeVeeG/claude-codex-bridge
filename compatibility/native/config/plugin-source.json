@@ -1,14 +1,14 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
-  "name": "codex-claude-desktop-bridge",
+  "name": "bridge-claude-codex",
   "version": "0.4.2",
-  "description": "Asynchronous two-way messaging between Codex and Claude Code conversations.",
+  "description": "Asynchronous two-way messaging between Claude Code and Codex conversations.",
   "author": {
     "name": "KeeVeeG",
     "url": "https://github.com/KeeVeeG"
   },
-  "homepage": "https://github.com/KeeVeeG/codex-claude-bridge",
-  "repository": "https://github.com/KeeVeeG/codex-claude-bridge",
+  "homepage": "https://github.com/KeeVeeG/claude-codex-bridge",
+  "repository": "https://github.com/KeeVeeG/claude-codex-bridge",
   "license": "MIT",
   "keywords": [
     "desktop",
@@ -21,26 +21,27 @@
   "extensions": {
     "com.openai": {
       "interface": {
-        "displayName": "Codex–Claude Bridge",
-        "shortDescription": "Send messages between Codex and Claude Code.",
-        "longDescription": "Find conversations and send text between Codex and Claude Code. Works with Codex and Claude in their desktop apps and terminals. Either side can start a conversation or reply. Windows uses native local transports; macOS reaches Codex through a configured SSH host.",
+        "displayName": "Claude–Codex Bridge",
+        "shortDescription": "Send messages between Claude Code and Codex.",
+        "longDescription": "Find conversations and send text between Claude Code and Codex. Works with Claude and Codex in their desktop apps and terminals. Either side can start a conversation or reply. Windows uses native local transports; macOS reaches Codex through a configured SSH host.",
         "developerName": "KeeVeeG",
         "category": "Productivity",
         "capabilities": [
           "Read",
           "Write"
         ],
-        "websiteURL": "https://github.com/KeeVeeG/codex-claude-bridge",
-        "supportURL": "https://github.com/KeeVeeG/codex-claude-bridge/issues",
-        "privacyPolicyURL": "https://github.com/KeeVeeG/codex-claude-bridge/blob/main/docs/PRIVACY.md",
-        "termsOfServiceURL": "https://github.com/KeeVeeG/codex-claude-bridge/blob/main/docs/TERMS.md",
+        "websiteURL": "https://github.com/KeeVeeG/claude-codex-bridge",
+        "supportURL": "https://github.com/KeeVeeG/claude-codex-bridge/issues",
+        "privacyPolicyURL": "https://github.com/KeeVeeG/claude-codex-bridge/blob/main/docs/PRIVACY.md",
+        "termsOfServiceURL": "https://github.com/KeeVeeG/claude-codex-bridge/blob/main/docs/TERMS.md",
         "composerIcon": "./assets/bridge.svg",
         "composerIconDark": "./assets/bridge-dark.svg",
         "logo": "./assets/bridge.svg",
         "logoDark": "./assets/bridge-dark.svg",
         "defaultPrompt": [
-          "Open the Claude conversation panel beside this Codex chat so I can search chats, read history, and send a message manually.",
           "Find the Claude Code session I name and send it my message.",
+          "Find the Codex thread I name and send it my message.",
+          "Open the conversation panel to search Claude sessions, read exchanged messages, and send manually.",
           "Check the bridge status and recent outgoing deliveries."
         ]
       }

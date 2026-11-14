@@ -271,7 +271,7 @@
     if (message.method === 'ui/notifications/tool-result') {
       try {
         const data = mcpData(message.params);
-        if (Array.isArray(data.chats) && data.application === 'codex') {
+        if (Array.isArray(data.sessions) && data.application === 'codex') {
           if (!initialLoad && !state.ready) receiveInitialPanel(data);
           applyPanel(data);
         }
@@ -292,7 +292,7 @@
       throw new Error('The Codex context changed. Reopen the panel in the intended chat.');
     }
     state.owner = data.owner_thread_id;
-    state.chats = data.chats.filter(chat => object(chat) && typeof chat.session_id === 'string' && chat.session_id)
+    state.chats = data.sessions.filter(chat => object(chat) && typeof chat.session_id === 'string' && chat.session_id)
       .map(chat => ({ ...chat, title: string(chat.title) || 'Claude chat', cwd: string(chat.cwd), live: chat.live === true }));
     state.ready = true; showConnectionError('');
     $('connection-label').textContent = demo ? 'Demo' : 'Desktop connected';
@@ -453,7 +453,7 @@
   async function loadHistory(sessionId, quiet = false) {
     const cache = history(sessionId); if (cache.loading) return;
     cache.loading = true; if (!cache.loaded && state.selected === sessionId) renderTimeline();
-    try { applyHistory(sessionId, await call('bridge_ui_history', { session_id: sessionId, limit: 100 }), false); }
+    try { applyHistory(sessionId, await call('panel_history', { session_id: sessionId, limit: 100 }), false); }
     catch (error) { cache.error = error.message; cache.loading = false; if (state.selected === sessionId) { renderTimeline({ preserve: true }); renderAlert(); } if (!quiet) announce('Could not load history.'); }
     finally { cache.loading = false; }
   }
@@ -461,7 +461,7 @@
     const sessionId = state.selected; if (!sessionId) return;
     const cache = history(sessionId); if (!cache.nextCursor || cache.olderLoading) return;
     const height = $('timeline').scrollHeight; cache.olderLoading = true; renderTimeline({ preserve: true });
-    try { applyHistory(sessionId, await call('bridge_ui_history', { session_id: sessionId, limit: 100, cursor: cache.nextCursor }), true);
+    try { applyHistory(sessionId, await call('panel_history', { session_id: sessionId, limit: 100, cursor: cache.nextCursor }), true);
       if (state.selected === sessionId) renderTimeline({ prependHeight: height }); }
     catch (error) { cache.error = error.message; if (state.selected === sessionId) renderAlert(); }
     finally { cache.olderLoading = false; if (state.selected === sessionId) renderTimeline({ preserve: true }); }
@@ -480,9 +480,9 @@
     const pending = { id: crypto.randomUUID(), message, createdAt: Date.now(), outcome: 'sending' };
     state.sends.set(sessionId, pending); renderTimeline(); renderComposer(); renderAlert();
     try {
-      const data = await call('bridge_ui_send', { session_id: sessionId, message, message_id: pending.id });
-      if (!object(data.message) || data.message.id !== pending.id) throw new Error('Could not match the response to the sent message.');
-      const record = { ...data.message, created_at: data.message.created_at ?? data.message.createdAt ?? pending.createdAt,
+      const data = await call('panel_send', { session_id: sessionId, message, message_id: pending.id });
+      if (!object(data.delivery) || data.delivery.message_id !== pending.id) throw new Error('Could not match the response to the sent message.');
+      const record = { ...data.delivery, id: data.delivery.message_id, created_at: data.delivery.created_at,
         direction: 'to_claude', manual: data.manual === true, notice_status: data.notice_status, notice_retryable: data.notice_retryable === true };
       const cache = history(sessionId); cache.messages = cache.messages.filter(item => item.id !== pending.id); cache.messages.push(record);
       if (record.status === 'submitted') {
@@ -507,8 +507,8 @@
     if (!message || message.manual !== true || message.status !== 'submitted' || message.notice_status !== 'failed' || message.notice_retryable !== true || noticeRetries.has(key)) return;
     noticeRetries.add(key); renderTimeline({ preserve: true });
     try {
-      const data = await call('bridge_ui_retry_notice', { session_id: sessionId, message_id: messageId });
-      if (!object(data.message) || data.message.id !== messageId) throw new Error('Could not match the notification response.');
+      const data = await call('panel_retry_notice', { session_id: sessionId, message_id: messageId });
+      if (!object(data.delivery) || data.delivery.message_id !== messageId) throw new Error('Could not match the notification response.');
       message.notice_status = data.notice_status;
       message.notice_retryable = data.notice_retryable === true;
       cache.warning = data.notice_status === 'submitted' ? '' : 'The message was already sent to Claude. The retry Codex notification is unconfirmed.';
@@ -555,11 +555,11 @@
     ['demo-new', []],
   ]);
   async function demoCall(name, args) {
-    if (name === 'bridge_panel') return { owner_thread_id: 'demo-owner', application: 'codex', chats: demoChats, ...(initialLoad ? {} : { selected_session_id: 'demo-interface' }) };
-    if (name === 'bridge_ui_history') return { session_id: args.session_id, messages: args.cursor ? [{ id: 'demo-older', direction: 'to_claude', message: 'Starting the Desktop Bridge discussion.', created_at: demoNow - 86400000, status: 'submitted' }] : demoMessages.get(args.session_id) || [], has_more: args.session_id === 'demo-interface' && !args.cursor, next_cursor: args.session_id === 'demo-interface' && !args.cursor ? 'demo-older' : null };
-    if (name === 'bridge_ui_send') {
+    if (name === 'bridge_panel') return { owner_thread_id: 'demo-owner', application: 'codex', sessions: demoChats, ...(initialLoad ? {} : { selected_session_id: 'demo-interface' }) };
+    if (name === 'panel_history') return { session_id: args.session_id, messages: args.cursor ? [{ id: 'demo-older', direction: 'to_claude', message: 'Starting the Desktop Bridge discussion.', created_at: demoNow - 86400000, status: 'submitted' }] : demoMessages.get(args.session_id) || [], has_more: args.session_id === 'demo-interface' && !args.cursor, next_cursor: args.session_id === 'demo-interface' && !args.cursor ? 'demo-older' : null };
+    if (name === 'panel_send') {
       const message = { id: args.message_id, direction: 'to_claude', message: args.message, created_at: Date.now(), status: 'submitted', manual: true, notice_status: 'submitted' };
-      demoMessages.get(args.session_id).push(message); return { message, manual: true, notice_status: 'submitted' };
+      demoMessages.get(args.session_id).push(message); return { delivery: { message_id: message.id, from: { app: 'codex', id: 'demo-owner' }, to: { app: 'claude', id: args.session_id }, message: message.message, status: message.status, manual: true, created_at: message.created_at }, manual: true, notice_status: 'submitted' };
     }
     throw new Error('This action is unavailable in the demo.');
   }

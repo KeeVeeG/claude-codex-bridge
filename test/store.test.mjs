@@ -16,9 +16,9 @@ test('both Windows desktop packages use the same home-based state directory', as
   const codex = defaultStateDir({ homeDir, env: { LOCALAPPDATA: path.join(homeDir, 'AppData', 'Local', 'Packages', 'OpenAI.Codex', 'LocalCache', 'Local') } });
   const claude = defaultStateDir({ homeDir, env: { LOCALAPPDATA: path.join(homeDir, 'AppData', 'Local', 'Packages', 'Claude', 'LocalCache', 'Local') } });
   assert.equal(codex, claude);
-  assert.equal(codex, path.join(homeDir, '.local', 'share', 'codex-claude-desktop-bridge'));
+  assert.equal(codex, path.join(homeDir, '.local', 'share', 'claude-codex-bridge'));
   const override = path.join(setup.root, 'explicit-shared-state');
-  assert.equal(defaultStateDir({ homeDir, env: { LOCALAPPDATA: 'ignored', CODEX_CLAUDE_BRIDGE_STATE_DIR: override } }), override);
+  assert.equal(defaultStateDir({ homeDir, env: { LOCALAPPDATA: 'ignored', CLAUDE_CODEX_BRIDGE_STATE_DIR: override } }), override);
 });
 
 test('default shared state location is independent of the project working directory', async t => {

@@ -146,7 +146,7 @@ async function listNativeCodexChats({ pipePath, contextThreadId, limit = 30, sig
     threadId: contextThreadId, callId: `bridge-list-${randomUUID()}`, turnId: `bridge-list-${randomUUID()}`,
   }, { timeoutMs, signal }).catch(error => {
     if (error.message === 'Codex Desktop: Codex app tool request failed') {
-      throw Object.assign(new Error('Codex Desktop rejected the registered task context. Ask an open Codex task to call bridge_status, then retry discovery.'),
+      throw Object.assign(new Error('Codex Desktop rejected the registered task context. Ask an open Codex Desktop task to call bridge_doctor, then retry discovery.'),
         { code: 'CONTEXT_REJECTED' });
     }
     throw error;

@@ -31,23 +31,23 @@ test('an unreachable daemon is reported as unavailable and is never started', as
 });
 
 test('a missing Codex executable and the kill switch are reported as unavailable', async () => {
-  await assert.rejects(() => openDaemon({ env: { CODEX_CLAUDE_BRIDGE_DAEMON: '', CODEX_CLAUDE_BRIDGE_CODEX_BIN: '', PATH: '' } }),
+  await assert.rejects(() => openDaemon({ env: { CLAUDE_CODEX_BRIDGE_DAEMON: '', CLAUDE_CODEX_BRIDGE_CODEX_BIN: '', PATH: '' } }),
     error => error instanceof DaemonUnavailableError && /not found/.test(error.message));
   // A partial env must not lift the kill switch forced on the test process.
   await assert.rejects(() => openDaemon({ env: { PATH: process.env.PATH } }),
     error => error instanceof DaemonUnavailableError && /disabled/.test(error.message));
-  await assert.rejects(() => openDaemon({ env: { CODEX_CLAUDE_BRIDGE_DAEMON: 'off' } }),
+  await assert.rejects(() => openDaemon({ env: { CLAUDE_CODEX_BRIDGE_DAEMON: 'off' } }),
     error => error instanceof DaemonUnavailableError && /disabled/.test(error.message));
 });
 
 test('the kill switch accepts the usual spellings of off, and nothing else disables terminal support', async () => {
   for (const value of ['OFF', ' off ', '0', 'false', 'No', 'disabled']) {
-    await assert.rejects(() => openDaemon({ env: { CODEX_CLAUDE_BRIDGE_DAEMON: value } }),
+    await assert.rejects(() => openDaemon({ env: { CLAUDE_CODEX_BRIDGE_DAEMON: value } }),
       error => error instanceof DaemonUnavailableError && /disabled/.test(error.message), JSON.stringify(value));
-    assert.equal(await readDaemonVersions({ env: { CODEX_CLAUDE_BRIDGE_DAEMON: value } }), null);
+    assert.equal(await readDaemonVersions({ env: { CLAUDE_CODEX_BRIDGE_DAEMON: value } }), null);
   }
   for (const value of ['', 'on', 'offline']) {
-    await assert.rejects(() => openDaemon({ env: { CODEX_CLAUDE_BRIDGE_DAEMON: value, CODEX_CLAUDE_BRIDGE_CODEX_BIN: '', PATH: '' } }),
+    await assert.rejects(() => openDaemon({ env: { CLAUDE_CODEX_BRIDGE_DAEMON: value, CLAUDE_CODEX_BRIDGE_CODEX_BIN: '', PATH: '' } }),
       error => /not found/.test(error.message), JSON.stringify(value));
   }
 });
@@ -414,7 +414,7 @@ test('a codex.cmd shim is refused with a clear message instead of throwing from 
   const fixture = await nativeFixture(t);
   const shim = path.join(fixture.root, 'codex.cmd');
   fs.writeFileSync(shim, '');
-  const env = { CODEX_CLAUDE_BRIDGE_CODEX_BIN: shim, CODEX_CLAUDE_BRIDGE_DAEMON: '' };
+  const env = { CLAUDE_CODEX_BRIDGE_CODEX_BIN: shim, CLAUDE_CODEX_BRIDGE_DAEMON: '' };
   await assert.rejects(() => openDaemon({ env }),
     error => error instanceof DaemonUnavailableError && /must point to codex\.exe/.test(error.message));
   assert.equal(await readDaemonVersions({ env }), null);
@@ -555,6 +555,6 @@ test('the queue route honors the kill switch and refuses a codex.cmd shim', asyn
   const shim = path.join(fixture.root, 'codex.cmd');
   fs.writeFileSync(shim, '');
   await assert.rejects(() => queueToTerminalThread({ threadId: QUEUE_TARGET_ID, text: 'y',
-    env: { CODEX_CLAUDE_BRIDGE_CODEX_BIN: shim, CODEX_CLAUDE_BRIDGE_DAEMON: '' } }),
+    env: { CLAUDE_CODEX_BRIDGE_CODEX_BIN: shim, CLAUDE_CODEX_BRIDGE_DAEMON: '' } }),
     error => error instanceof DaemonUnavailableError && /must point to codex\.exe/.test(error.message));
 });

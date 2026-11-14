@@ -6,7 +6,7 @@ import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { manualSend, retryManualNotice, readManualRecords } from '../lib/manual-service.mjs';
-import { executeBridgeTool } from '../lib/desktop-service.mjs';
+import { executeBridgeTool } from '../lib/bridge-service.mjs';
 import { nativeFixture, mockPipe, encodeFrame, messageTool } from './native-helpers.mjs';
 
 const windowsOnly = { skip: process.platform !== 'win32' && 'Manual native messaging requires verified Windows Desktop sessions.' };
@@ -43,7 +43,7 @@ async function setup(t, { noticeFailure, onNotice } = {}) {
   fs.writeFileSync(keyPath, JSON.stringify({ peerToken: token, procStartFt: processStart, pidDomain }));
   const owner = 'manual-owner-task';
   const env = { CODEX_APP_TOOLS_PIPE_PATH: codex.pipePath, CODEX_THREAD_ID: 'untrusted-startup-thread',
-    CODEX_CLAUDE_BRIDGE_STATE_DIR: fixture.stateDir, CODEX_CLAUDE_BRIDGE_REGISTRY_DIR: registryDir };
+    CLAUDE_CODEX_BRIDGE_STATE_DIR: fixture.stateDir, CLAUDE_CODEX_BRIDGE_REGISTRY_DIR: registryDir };
   const context = { env, metadata: { 'x-codex-turn-metadata': { thread_id: owner } } };
   const args = { session_id: sessionId, message: 'Full user text: Unicode 🦊\nSecond line.', message_id: 'manual-fixture-one' };
   const ledgerFile = path.join(fixture.stateDir, 'manual', hash(owner), 'state.json');
@@ -55,8 +55,8 @@ const userFrames = claude => claude.messages.filter(entry => entry.message.type 
 test('human manual send preserves full text and provenance and posts one context notice only to the verified owning Codex task', windowsOnly, async t => {
   const setup = await setupFixture(t);
   const result = await manualSend(setup.args, setup.context);
-  assert.equal(result.message.status, 'submitted');
-  assert.equal(result.message.manual, true);
+  assert.equal(result.delivery.status, 'submitted');
+  assert.equal(result.delivery.manual, true);
   assert.equal(result.manual, true);
   assert.equal(result.notice_status, 'submitted');
   assert.equal(userFrames(setup.claude).length, 1);
@@ -123,11 +123,11 @@ test('failed Claude resolution produces an honest failed result with no owner no
   const fixture = await setup(t);
   fs.unlinkSync(fixture.keyPath);
   const failed = await manualSend(fixture.args, fixture.context);
-  assert.equal(failed.message.status, 'failed');
-  assert.match(failed.message.error, /key/);
+  assert.equal(failed.delivery.status, 'failed');
+  assert.match(failed.delivery.error, /key/);
   assert.equal(failed.notice_status, 'pending');
   const retry = await manualSend(fixture.args, fixture.context);
-  assert.equal(retry.message.status, 'failed');
+  assert.equal(retry.delivery.status, 'failed');
   assert.equal(userFrames(fixture.claude).length, 0);
   assert.equal(fixture.notices.length, 0);
 });
@@ -137,7 +137,7 @@ test('definite and uncertain Codex notice failures never resend the Claude messa
     await t.test(noticeFailure, async sub => {
       const fixture = await setup(sub, { noticeFailure });
       const first = await manualSend(fixture.args, fixture.context);
-      assert.equal(first.message.status, 'submitted');
+      assert.equal(first.delivery.status, 'submitted');
       assert.equal(first.notice_status, expected);
       const noticeCount = fixture.notices.length;
       const connectionCount = fixture.codex.connections.length;
@@ -166,7 +166,7 @@ test('a posted owner notice whose local receipt cannot be saved becomes uncertai
   try { first = await manualSend(fixture.args, fixture.context); }
   finally { fs.renameSync = originalRename; }
   assert.equal(injected, true);
-  assert.equal(first.message.status, 'submitted');
+  assert.equal(first.delivery.status, 'submitted');
   assert.equal(first.notice_status, 'uncertain');
   assert.equal((await manualSend(fixture.args, fixture.context)).notice_status, 'uncertain');
   assert.equal(userFrames(fixture.claude).length, 1);
@@ -184,7 +184,7 @@ test('an abandoned send reservation is uncertain and never invokes either native
   fs.writeFileSync(fixture.ledgerFile, JSON.stringify({ schemaVersion: 1, owner_thread_id: fixture.owner,
     records: { [recordKey(fixture.args)]: record } }));
   const result = await manualSend(fixture.args, fixture.context);
-  assert.equal(result.message.status, 'uncertain');
+  assert.equal(result.delivery.status, 'uncertain');
   assert.equal(userFrames(fixture.claude).length, 0);
   assert.equal(fixture.notices.length, 0);
 });
@@ -246,13 +246,13 @@ test('one verified owner can manually send the same ID independently to exact De
 test('explicit notice retry after definite failure restores full context without resending Claude', windowsOnly, async t => {
   const fixture = await setup(t, { noticeFailure: 'schema' });
   const first = await manualSend(fixture.args, fixture.context);
-  assert.equal(first.message.status, 'submitted');
+  assert.equal(first.delivery.status, 'submitted');
   assert.equal(first.notice_status, 'failed');
   assert.equal(first.notice_retryable, true);
   fixture.failureMode.current = null;
   const args = { session_id: fixture.args.session_id, message_id: fixture.args.message_id };
   const retried = await retryManualNotice(args, fixture.context);
-  assert.equal(retried.message.status, 'submitted');
+  assert.equal(retried.delivery.status, 'submitted');
   assert.equal(retried.notice_status, 'submitted');
   assert.equal(retried.notice_retryable, false);
   assert.equal(userFrames(fixture.claude).length, 1);
@@ -295,7 +295,7 @@ test('missing supplementary notice history cannot authorize a duplicate notice o
   await manualSend(fixture.args, fixture.context);
   fs.unlinkSync(fixture.ledgerFile);
   const retry = await manualSend(fixture.args, fixture.context);
-  assert.equal(retry.message.status, 'submitted');
+  assert.equal(retry.delivery.status, 'submitted');
   assert.equal(retry.notice_status, 'uncertain');
   assert.equal(retry.notice_retryable, false);
   assert.match(retry.notice_error, /record is missing/);

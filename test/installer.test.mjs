@@ -293,7 +293,7 @@ test('both staged plugins share a profile state path despite different MSIX LOCA
   const { homeDir } = fixture(t);
   const sourceFile = path.join(root, '.mcp.json');
   const sourceBefore = fs.readFileSync(sourceFile, 'utf8');
-  const expected = path.join(homeDir, '.local', 'share', PLUGIN_NAME);
+  const expected = path.join(homeDir, '.local', 'share', 'claude-codex-bridge');
   const statePaths = [];
   for (const application of ['Codex', 'Claude']) {
     const localAppData = path.join(homeDir, 'Packages', application, 'LocalCache', 'Local');
@@ -302,10 +302,10 @@ test('both staged plugins share a profile state path despite different MSIX LOCA
     assert.ok(path.isAbsolute(prepared.stateDir));
     assert.ok(!prepared.stateDir.startsWith(localAppData));
     for (const manifestDirectory of ['.codex-plugin', '.claude-plugin']) {
-      statePaths.push(stagedServer(prepared.destination, manifestDirectory).env.CODEX_CLAUDE_BRIDGE_STATE_DIR);
+      statePaths.push(stagedServer(prepared.destination, manifestDirectory).env.CLAUDE_CODEX_BRIDGE_STATE_DIR);
     }
     const canonicalMcp = JSON.parse(fs.readFileSync(path.join(prepared.destination, 'config/mcp-source.json'), 'utf8'));
-    assert.equal(canonicalMcp.mcpServers[PLUGIN_NAME].env.CODEX_CLAUDE_BRIDGE_STATE_DIR, expected);
+    assert.equal(canonicalMcp.mcpServers[PLUGIN_NAME].env.CLAUDE_CODEX_BRIDGE_STATE_DIR, expected);
     assert.equal(fs.existsSync(path.join(prepared.destination, 'plugin.json')), false, 'native install must retain Codex env_vars forwarding');
     assert.equal(fs.existsSync(path.join(prepared.destination, 'mcp.json')), false);
     const aligned = checkManifests(prepared.destination);
@@ -321,15 +321,15 @@ test('installer pins an explicit shared state override without changing portable
   const sourceBefore = fs.readFileSync(sourceFile, 'utf8');
   const override = path.join(homeDir, 'chosen-shared-state');
   const prepared = prepareInstallation({ sourceRoot: root, homeDir, codex: false, claude: true,
-    env: { CODEX_CLAUDE_BRIDGE_STATE_DIR: override, LOCALAPPDATA: path.join(homeDir, 'app-private') } });
+    env: { CLAUDE_CODEX_BRIDGE_STATE_DIR: override, LOCALAPPDATA: path.join(homeDir, 'app-private') } });
   const config = JSON.parse(fs.readFileSync(path.join(prepared.destination, '.mcp.json'), 'utf8'));
   assert.equal(prepared.stateDir, override);
-  assert.equal(config.mcpServers[PLUGIN_NAME].env.CODEX_CLAUDE_BRIDGE_STATE_DIR, override);
-  assert.equal(stagedServer(prepared.destination, '.codex-plugin').env.CODEX_CLAUDE_BRIDGE_STATE_DIR, override);
+  assert.equal(config.mcpServers[PLUGIN_NAME].env.CLAUDE_CODEX_BRIDGE_STATE_DIR, override);
+  assert.equal(stagedServer(prepared.destination, '.codex-plugin').env.CLAUDE_CODEX_BRIDGE_STATE_DIR, override);
   assert.equal(fs.readFileSync(sourceFile, 'utf8'), sourceBefore);
 });
 
-test('staged Codex and Claude configurations start the complete MCP catalog from Unicode paths and an unrelated working directory', async t => {
+test('staged Claude and Codex configurations start the complete MCP catalog from Unicode paths and an unrelated working directory', async t => {
   const { homeDir } = fixture(t);
   const sourceCodexPath = path.join(root, '.codex-plugin', 'plugin.json');
   const sourceClaudeConfigPath = path.join(root, '.mcp.json');
@@ -353,9 +353,9 @@ test('staged Codex and Claude configurations start the complete MCP catalog from
   assert.equal(codex.cwd, './');
   assert.ok(codex.args.every(value => !value.includes('${CLAUDE_PLUGIN_ROOT}')));
   assert.ok(claude.args.some(value => value.includes('${CLAUDE_PLUGIN_ROOT}')));
-  const expectedTools = ['bridge_doctor', 'bridge_panel', 'bridge_status', 'bridge_ui_history', 'bridge_ui_retry_notice', 'bridge_ui_send', 'list_claude_sessions', 'list_codex_chats', 'send_to_claude', 'send_to_codex'];
+  const expectedTools = ['bridge_doctor', 'bridge_panel', 'list_deliveries', 'panel_history', 'panel_retry_notice', 'panel_send', 'list_claude_sessions', 'list_codex_threads', 'send_to_claude', 'send_to_codex'];
   for (const [application, config] of [['Codex', codex], ['Claude', claude]]) {
-    assert.equal(config.env.CODEX_CLAUDE_BRIDGE_STATE_DIR, prepared.stateDir);
+    assert.equal(config.env.CLAUDE_CODEX_BRIDGE_STATE_DIR, prepared.stateDir);
     const env = { ...process.env, ...config.env, HOME: homeDir, USERPROFILE: homeDir, LOCALAPPDATA: path.join(homeDir, `${application} app cache`) };
     for (const key of ['CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CODEX_APP_TOOLS_PIPE_PATH',
       'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN']) delete env[key];
@@ -370,7 +370,7 @@ test('staged Codex and Claude configurations start the complete MCP catalog from
     const result = await probeMcpStartup(launch, launchCwd, env);
     assert.equal(result.initialize.serverInfo.version, codexManifest.version);
     assert.deepEqual(result.initialize.capabilities.tools, {});
-    assert.deepEqual(result.tools.map(tool => tool.name).sort(), expectedTools, `${application} startup must expose the complete catalog without a tool call`);
+    assert.deepEqual(result.tools.map(tool => tool.name).sort(), [...expectedTools].sort(), `${application} startup must expose the complete catalog without a tool call`);
   }
   assert.equal(fs.readFileSync(sourceCodexPath, 'utf8'), originalCodex);
   assert.equal(fs.readFileSync(sourceClaudeConfigPath, 'utf8'), originalClaude);
@@ -382,7 +382,7 @@ test('staging retries transient Windows sharing errors without losing the prepar
   const rename = fs.renameSync;
   let transientFailures = 0;
   fs.renameSync = (source, destination) => {
-    if (String(source).includes('.codex-claude-desktop-bridge.stage-') && transientFailures < 2) {
+    if (String(source).includes('.bridge-claude-codex.stage-') && transientFailures < 2) {
       transientFailures++;
       const error = new Error('simulated scanner sharing violation');
       error.code = 'EPERM';
@@ -407,7 +407,7 @@ test('staging rollback survives a transient replacement move failure', windowsOn
   const rename = fs.renameSync;
   let transientFailures = 0;
   fs.renameSync = (source, destination) => {
-    if (String(source).includes('.codex-claude-desktop-bridge.stage-') && transientFailures < 1) {
+    if (String(source).includes('.bridge-claude-codex.stage-') && transientFailures < 1) {
       transientFailures++;
       const error = new Error('simulated scanner sharing violation');
       error.code = 'EBUSY';
@@ -435,16 +435,16 @@ test('a native deployment can prepare a new installation without depending on th
   assert.equal(bundle.native, true);
   assert.equal(bundle.manifest.version, `${JSON.parse(fs.readFileSync(path.join(root, 'plugin.json'), 'utf8')).version}+codex.${second.build}`);
   assert.equal(bundle.packageJson.version, bundle.manifest.version);
-  assert.equal(bundle.mcp.mcpServers[PLUGIN_NAME].env.CODEX_CLAUDE_BRIDGE_STATE_DIR, second.stateDir);
-  assert.equal(stagedServer(second.destination, '.codex-plugin').env.CODEX_CLAUDE_BRIDGE_STATE_DIR, second.stateDir);
-  assert.equal(stagedServer(second.destination, '.claude-plugin').env.CODEX_CLAUDE_BRIDGE_STATE_DIR, second.stateDir);
+  assert.equal(bundle.mcp.mcpServers[PLUGIN_NAME].env.CLAUDE_CODEX_BRIDGE_STATE_DIR, second.stateDir);
+  assert.equal(stagedServer(second.destination, '.codex-plugin').env.CLAUDE_CODEX_BRIDGE_STATE_DIR, second.stateDir);
+  assert.equal(stagedServer(second.destination, '.claude-plugin').env.CLAUDE_CODEX_BRIDGE_STATE_DIR, second.stateDir);
   assert.ok(stagedServer(second.destination, '.codex-plugin').env_vars.includes('CODEX_APP_TOOLS_PIPE_PATH'));
 });
 
 test('explicit Claude permission grant creates only the exact send_to_codex allow rule', t => {
   const { homeDir } = fixture(t);
   const settingsFile = path.join(homeDir, '.claude', 'settings.json');
-  assert.equal(CLAUDE_SEND_PERMISSION, 'mcp__plugin_codex-claude-desktop-bridge_codex-claude-desktop-bridge__send_to_codex');
+  assert.equal(CLAUDE_SEND_PERMISSION, 'mcp__plugin_bridge-claude-codex_bridge-claude-codex__send_to_codex');
   grantClaudeSendPermission({ homeDir, env: {} });
   assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile, 'utf8')), {
     permissions: { allow: [CLAUDE_SEND_PERMISSION] },

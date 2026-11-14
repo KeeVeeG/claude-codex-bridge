@@ -13,9 +13,9 @@ npm run package
 
 The packager writes these artifacts under `dist/`:
 
-- `codex-claude-desktop-bridge-<version>.zip`: the native compatibility plugin and local installer for Windows or the configured macOS SSH workflow.
-- `codex-claude-desktop-bridge-marketplace-<version>.zip`: a self-contained marketplace for both applications.
-- `codex-claude-desktop-bridge-portable-<version>.zip`: the Agent Plugins 1.0 package for hosts that provide the required native application context.
+- `claude-codex-bridge-<version>.zip`: the native compatibility plugin and local installer for Windows or the configured macOS SSH workflow.
+- `claude-codex-bridge-marketplace-<version>.zip`: a self-contained marketplace for both applications.
+- `claude-codex-bridge-portable-<version>.zip`: the Agent Plugins 1.0 package for hosts that provide the required native application context.
 - `marketplace/`: the same marketplace unpacked for inspection.
 - `SHA256SUMS`: SHA-256 checksums for all three archives.
 
@@ -29,6 +29,8 @@ claude plugin validate dist/marketplace
 ```
 
 Edit release identity, version, and presentation in root `plugin.json`, and the portable stdio command in root `mcp.json`. Run `npm run manifests:sync` to update `package.json`, the legacy adapters, and the generated `compatibility/native/` tree. Commit that generated tree together with the root changes: the Git marketplaces install it. The packager refuses mismatched versions, modified adapters, unexpected native files, or stale runtime copies.
+
+The plugin identity and skill namespace are `bridge-claude-codex`; the npm package and release archives keep the product identity `claude-codex-bridge`. Manifest synchronization preserves that distinction while aligning versions. Repository URLs, transport client identity, and the default state directory also retain `claude-codex-bridge`.
 
 The installer adds cache-specific build suffixes to all staged manifests and `package.json` together. Canonical sources in the native package live in `config/plugin-source.json` and `config/mcp-source.json`; they are kept outside the root portable discovery paths deliberately.
 
@@ -49,9 +51,9 @@ git tag -a $tag -m "Release $tag"
 git push origin $tag
 npm run package
 gh release create $tag `
-  "dist/codex-claude-desktop-bridge-$version.zip" `
-  "dist/codex-claude-desktop-bridge-marketplace-$version.zip" `
-  "dist/codex-claude-desktop-bridge-portable-$version.zip" `
+  "dist/claude-codex-bridge-$version.zip" `
+  "dist/claude-codex-bridge-marketplace-$version.zip" `
+  "dist/claude-codex-bridge-portable-$version.zip" `
   dist/SHA256SUMS `
   --title $tag `
   --generate-notes
@@ -62,24 +64,24 @@ Do not commit `dist/`; it is ignored and is regenerated for each release. Keep t
 ## Local marketplace
 
 ```powershell
-codex plugin marketplace add ./dist/marketplace
-codex plugin add codex-claude-desktop-bridge@keeveeg-desktop-bridge --json
 claude plugin marketplace add ./dist/marketplace
-claude plugin install codex-claude-desktop-bridge@keeveeg-desktop-bridge --scope user --json
+claude plugin install bridge-claude-codex@keeveeg --scope user --json
+codex plugin marketplace add ./dist/marketplace
+codex plugin add bridge-claude-codex@keeveeg --json
 ```
 
-The generated catalogs use `./plugins/codex-claude-desktop-bridge`. Keep that directory and both catalogs together.
+The generated catalogs use `./plugins/bridge-claude-codex`. Keep that directory and both catalogs together.
 
 ## Git marketplace
 
 ```powershell
-codex plugin marketplace add https://github.com/KeeVeeG/codex-claude-bridge.git
-codex plugin add codex-claude-desktop-bridge@keeveeg-desktop-bridge --json
-claude plugin marketplace add https://github.com/KeeVeeG/codex-claude-bridge.git
-claude plugin install codex-claude-desktop-bridge@keeveeg-desktop-bridge --scope user --json
+claude plugin marketplace add https://github.com/KeeVeeG/claude-codex-bridge.git
+claude plugin install bridge-claude-codex@keeveeg --scope user --json
+codex plugin marketplace add https://github.com/KeeVeeG/claude-codex-bridge.git
+codex plugin add bridge-claude-codex@keeveeg --json
 ```
 
-The Git catalog is named `keeveeg-desktop-bridge`. Both source catalogs select the generated `compatibility/native/` directory; Codex uses a Git subdirectory source. The local installer's separate Claude catalog is named `codex-claude-desktop-local`.
+The Git catalog is named `keeveeg`. Both source catalogs select the generated `compatibility/native/` directory; Codex uses a Git subdirectory source. The local installer's separate Claude catalog is named `claude-codex-local`.
 
 ## Directory submission references
 

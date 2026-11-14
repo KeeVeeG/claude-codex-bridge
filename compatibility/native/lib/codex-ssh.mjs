@@ -200,8 +200,8 @@ async function connected(options) {
   const rpc = new SshRpc(options);
   try {
     await rpc.ready;
-    await rpc.request('initialize', { clientInfo: { name: 'codex_claude_desktop_bridge',
-      title: 'Codex–Claude Bridge', version: runtimeVersion } });
+    await rpc.request('initialize', { clientInfo: { name: 'claude-codex-bridge',
+      title: 'Claude–Codex Bridge', version: runtimeVersion } });
     rpc.notify('initialized'); return rpc;
   } catch (error) { rpc.close(); throw error; }
 }

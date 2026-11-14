@@ -10,7 +10,7 @@ export const RUNTIME_IDENTITY_ENV_VARS = ['CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUD
 
 // Keep every test process off the real Codex daemon. Always force it (an inherited
 // value such as "on" must not win); only an explicitly injected fake command bypasses it.
-process.env.CODEX_CLAUDE_BRIDGE_DAEMON = 'off';
+process.env.CLAUDE_CODEX_BRIDGE_DAEMON = 'off';
 // A run started inside a Claude Code or Codex session inherits that session's runtime
 // identity, which would override the fixtures' own callers. Drop the ambient values.
 for (const name of RUNTIME_IDENTITY_ENV_VARS) delete process.env[name];
@@ -40,7 +40,7 @@ export function encodeFrame(value) {
 
 export async function mockPipe(t, { framed = false, onMessage, onConnection } = {}) {
   const pipePath = process.platform === 'win32'
-    ? `\\\\.\\pipe\\codex-claude-bridge-test-${randomUUID()}`
+    ? `\\\\.\\pipe\\claude-codex-bridge-test-${randomUUID()}`
     : `/tmp/codex-claude-test-${randomUUID()}.sock`;
   const connections = [];
   const messages = [];

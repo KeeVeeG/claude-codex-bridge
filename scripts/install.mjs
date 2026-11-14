@@ -6,11 +6,23 @@ import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { defaultStateDir, withStateLock } from '../lib/store.mjs';
+import { defaultStatePath } from '../lib/state-directory.mjs';
+import { legacyEnvironmentWarnings } from '../lib/legacy-environment.mjs';
 import { validateSshHostAlias } from '../lib/codex-ssh.mjs';
 import { PLUGIN_NAME, COMMON_RUNTIME_FILES, NATIVE_RUNTIME_FILES, checkManifests, compatibilityFiles } from './manifests.mjs';
 
 export { PLUGIN_NAME };
-export const CLAUDE_MARKETPLACE = 'codex-claude-desktop-local';
+export const CLAUDE_MARKETPLACE = 'claude-codex-local';
+const LEGACY_PLUGIN = 'codex-claude-desktop-bridge';
+const LEGACY_LOCAL = 'codex-claude-desktop-local';
+const LEGACY_MARKETPLACE = 'keeveeg-desktop-bridge';
+const LEGACY_PREFIX = `mcp__plugin_${LEGACY_PLUGIN}_${LEGACY_PLUGIN}`;
+const TOOL_PREFIX = `mcp__plugin_${PLUGIN_NAME}_${PLUGIN_NAME}`;
+
+function checkEnvironment(env) {
+  const warnings = legacyEnvironmentWarnings(env);
+  if (warnings.length) throw new Error(warnings.join('\n'));
+}
 // Claude scopes plugin MCP tools by plugin name and server name. Marketplace
 // names and cache versions are not part of this permission identifier.
 export const CLAUDE_SEND_PERMISSION = `mcp__plugin_${PLUGIN_NAME}_${PLUGIN_NAME}__send_to_codex`;
@@ -155,7 +167,7 @@ function permissionRuleMatches(rule, toolName) {
 export function grantClaudeSendPermission({ homeDir = os.homedir(), env = process.env } = {}) {
   const configDir = path.resolve(env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude'));
   const settingsPath = path.join(configDir, 'settings.json');
-  const lockDirectory = path.join(configDir, '.codex-claude-desktop-bridge-permissions-lock');
+  const lockDirectory = path.join(configDir, `.${PLUGIN_NAME}-permissions-lock`);
   return withStateLock(lockDirectory, () => {
     const previous = readRawIfPresent(settingsPath);
     let settings;
@@ -185,6 +197,84 @@ export function grantClaudeSendPermission({ homeDir = os.homedir(), env = proces
   });
 }
 
+/** Migrate user choices before applying the normal narrow send grant. */
+function migrateClaudeSettings({ homeDir, env, log }) {
+  const configDir = path.resolve(env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude'));
+  const filename = path.join(configDir, 'settings.json');
+  if (!fs.existsSync(filename)) return;
+  withStateLock(path.join(configDir, `.${PLUGIN_NAME}-permissions-lock`), () => {
+    const previous = readRawIfPresent(filename);
+    const settings = JSON.parse(previous.replace(/^\uFEFF/, ''));
+    if (!object(settings)) throw new Error('Claude settings.json must contain an object. No migration was made.');
+    let changed = false;
+    for (const field of ['allow', 'ask', 'deny']) {
+      const rules = settings.permissions?.[field];
+      if (!Array.isArray(rules)) continue;
+      settings.permissions[field] = rules.map(rule => {
+        if (typeof rule !== 'string' || !rule.startsWith(LEGACY_PREFIX)) return rule;
+        changed = true;
+        return TOOL_PREFIX + rule.slice(LEGACY_PREFIX.length);
+      });
+    }
+    if (object(settings.enabledPlugins)) {
+      for (const id of Object.keys(settings.enabledPlugins)) {
+        if (id === LEGACY_PLUGIN || id.startsWith(`${LEGACY_PLUGIN}@`)) {
+          delete settings.enabledPlugins[id]; changed = true;
+        }
+      }
+    }
+    if (!changed) return;
+    const backup = writeJsonAtomic(filename, settings, { expectedPrevious: previous, label: 'Claude settings' });
+    log(`Migrated Claude bridge permission rules and enabled-plugin entries in ${filename}`);
+    if (backup) log(`Previous Claude settings backup: ${backup}`);
+  });
+}
+
+/** Remove released legacy registrations through supported non-interactive CLIs only. */
+export function migrateLegacyInstallation({ homeDir = os.homedir(), env = process.env,
+  execute = run, log = console.log, claude = true, codex = true } = {}) {
+  checkEnvironment(env);
+  for (const app of ['claude', 'codex']) {
+    if (!(app === 'claude' ? claude : codex)) continue;
+    const installed = readList(execute(app, ['plugin', 'list', '--json']), app === 'claude' ? 'plugins' : 'installed');
+    for (const entry of installed) {
+      const selector = entry.pluginId || entry.id || (entry.name?.includes('@') ? entry.name
+        : entry.name && (entry.marketplaceName || entry.marketplace) ? `${entry.name}@${entry.marketplaceName || entry.marketplace}` : entry.name);
+      if (typeof selector !== 'string' || !(selector === LEGACY_PLUGIN || selector.startsWith(`${LEGACY_PLUGIN}@`))) continue;
+      const scope = app === 'claude' ? ['--scope', entry.scope || 'user'] : [];
+      execute(app, ['plugin', app === 'claude' ? 'uninstall' : 'remove', selector, ...scope, '--json'],
+        entry.projectPath ? { cwd: entry.projectPath } : undefined);
+      log(`Removed ${app} plugin ${selector}${scope.length ? ` (${entry.scope || 'user'})` : ''}`);
+    }
+    const marketplaces = readList(execute(app, ['plugin', 'marketplace', 'list', '--json']), 'marketplaces');
+    for (const entry of marketplaces) {
+      if (entry.name !== LEGACY_MARKETPLACE && !(app === 'claude' && entry.name === LEGACY_LOCAL)) continue;
+      execute(app, ['plugin', 'marketplace', 'remove', entry.name, '--json']);
+      log(`Removed ${app} marketplace ${entry.name}`);
+    }
+  }
+  if (claude) migrateClaudeSettings({ homeDir, env, log });
+  const pluginsDir = path.resolve(homeDir, 'plugins');
+  if (fs.existsSync(pluginsDir)) {
+    refuseLink(pluginsDir);
+    for (const entry of fs.readdirSync(pluginsDir, { withFileTypes: true })) {
+      if (entry.name !== LEGACY_PLUGIN && !entry.name.startsWith(`.${LEGACY_PLUGIN}.backup-`)) continue;
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const filename = path.join(pluginsDir, entry.name);
+      // A still-running application can hold the old files open. They are no longer
+      // registered anywhere, so a failed removal must not stop the new installation.
+      try {
+        fs.rmSync(filename, { recursive: true, maxRetries: 3 });
+        log(`Removed old staged bridge files: ${filename}`);
+      } catch (error) {
+        if (!['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY'].includes(error.code)) throw error;
+        log(`Could not remove old staged bridge files now (${error.code}); delete ${filename} after restarting the applications.`);
+      }
+    }
+  }
+  return defaultStateDir({ homeDir, env, log });
+}
+
 function codexMarketplacePlan(filename, content = readRawIfPresent(filename)) {
   const marketplace = (content === null ? null : JSON.parse(content.replace(/^\uFEFF/, ''))) ?? {
     name: 'personal', interface: { displayName: 'Personal' }, plugins: [],
@@ -192,6 +282,7 @@ function codexMarketplacePlan(filename, content = readRawIfPresent(filename)) {
   if (!object(marketplace) || typeof marketplace.name !== 'string' || !/^[A-Za-z0-9_-]+$/.test(marketplace.name) || !Array.isArray(marketplace.plugins)) {
     throw new Error('The existing personal marketplace must have a valid name and plugins array.');
   }
+  marketplace.plugins = marketplace.plugins.filter(entry => entry?.name !== LEGACY_PLUGIN);
   const matches = marketplace.plugins.filter(entry => entry?.name === PLUGIN_NAME);
   if (matches.length > 1) throw new Error('The personal marketplace contains duplicate entries for this plugin.');
   const source = { source: 'local', path: `./plugins/${PLUGIN_NAME}` };
@@ -218,15 +309,16 @@ function checkedSource(root, relative) {
 }
 
 /** Prepare local files only. This function never runs an application command. */
-export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.homedir(), env = process.env, codex = true, claude = true } = {}) {
-  if (!codex && !claude) throw new Error('Select Codex, Claude, or both.');
+export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.homedir(), env = process.env, codex = true, claude = true, log = console.log } = {}) {
+  checkEnvironment(env);
+  if (!codex && !claude) throw new Error('Select Claude, Codex, or both.');
   const root = fs.realpathSync(sourceRoot);
   const bundle = checkManifests(root, { checkNative: false });
-  const sshAlias = env.CODEX_CLAUDE_BRIDGE_SSH_HOST === undefined ? undefined
-    : validateSshHostAlias(env.CODEX_CLAUDE_BRIDGE_SSH_HOST);
+  const sshAlias = env.CLAUDE_CODEX_BRIDGE_SSH_HOST === undefined ? undefined
+    : validateSshHostAlias(env.CLAUDE_CODEX_BRIDGE_SSH_HOST);
   const pluginsDir = path.resolve(homeDir, 'plugins');
   const destination = path.join(pluginsDir, PLUGIN_NAME);
-  const stateDir = path.resolve(defaultStateDir({ homeDir, env }));
+  const stateDir = path.resolve(defaultStateDir({ homeDir, env, log }));
   const marketplacePath = path.resolve(homeDir, '.agents', 'plugins', 'marketplace.json');
   let marketplace = codex ? codexMarketplacePlan(marketplacePath) : null;
   const publisherName = bundle.manifest.author?.name;
@@ -237,8 +329,8 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
   const portableServer = portableMcp.mcpServers[PLUGIN_NAME];
   // Preserve the shared home-profile state despite application-specific MSIX
   // environments. Regenerate both native adapters from this pinned source.
-  portableServer.env = { ...(portableServer.env ?? {}), CODEX_CLAUDE_BRIDGE_STATE_DIR: stateDir };
-  if (sshAlias !== undefined) portableServer.env.CODEX_CLAUDE_BRIDGE_SSH_HOST = sshAlias;
+  portableServer.env = { ...(portableServer.env ?? {}), CLAUDE_CODEX_BRIDGE_STATE_DIR: path.resolve(env.CLAUDE_CODEX_BRIDGE_STATE_DIR || defaultStatePath(homeDir)) };
+  if (sshAlias !== undefined) portableServer.env.CLAUDE_CODEX_BRIDGE_SSH_HOST = sshAlias;
   const sources = COMMON_RUNTIME_FILES.map(relative => ({ relative, filename: checkedSource(root, relative) }));
   refuseLink(pluginsDir);
   refuseLink(destination);
@@ -275,7 +367,7 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
     fs.writeFileSync(path.join(temporary, '.claude-plugin', 'marketplace.json'), jsonText({
       name: CLAUDE_MARKETPLACE,
       owner: { name: publisherName },
-      plugins: [{ name: PLUGIN_NAME, source: './', description: 'Asynchronous two-way messaging between Codex and Claude Code conversations.' }],
+      plugins: [{ name: PLUGIN_NAME, source: './', description: 'Asynchronous two-way messaging between Claude Code and Codex conversations.' }],
     }));
     if (fs.existsSync(destination)) {
       backupDirectory = path.join(pluginsDir, `.${PLUGIN_NAME}.backup-${build}-${randomUUID()}`);
@@ -298,7 +390,7 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
   }
   let marketplaceBackup = null;
   if (codex) {
-    const lockDirectory = path.join(path.dirname(marketplacePath), '.codex-claude-desktop-bridge-marketplace-lock');
+    const lockDirectory = path.join(path.dirname(marketplacePath), `.${PLUGIN_NAME}-marketplace-lock`);
     withStateLock(lockDirectory, () => {
       // Staging may take time: merge into the latest catalog under a short lock.
       // The final comparison also detects changes from non-cooperating writers
@@ -306,6 +398,9 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
       const expectedPrevious = readRawIfPresent(marketplacePath);
       marketplace = codexMarketplacePlan(marketplacePath, expectedPrevious);
       marketplaceBackup = writeJsonAtomic(marketplacePath, marketplace, { expectedPrevious });
+      if (expectedPrevious && JSON.parse(expectedPrevious.replace(/^\uFEFF/, '')).plugins.some(entry => entry?.name === LEGACY_PLUGIN)) {
+        log(`Removed old bridge entry from ${marketplacePath}`);
+      }
     });
   }
   return { destination, stateDir, marketplacePath: marketplace ? marketplacePath : null,
@@ -313,10 +408,10 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
     build, backupDirectory, marketplaceBackup, codex, claude };
 }
 
-function run(command, args) {
+function run(command, args, { cwd } = {}) {
   const executable = process.platform === 'win32' ? `${command}.exe` : command;
   const result = spawnSync(executable, args, {
-    shell: false, windowsHide: true, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    cwd, shell: false, windowsHide: true, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 120000, maxBuffer: 4 * 1024 * 1024,
   });
   if (result.error) throw new Error(`Could not run ${command}: ${result.error.message}`);
@@ -330,7 +425,7 @@ function run(command, args) {
 function readList(output, key) {
   const parsed = JSON.parse(output);
   const list = Array.isArray(parsed) ? parsed : parsed?.[key];
-  if (!Array.isArray(list)) throw new Error(`The Claude CLI returned an unsupported ${key} listing.`);
+  if (!Array.isArray(list)) throw new Error(`The application CLI returned an unsupported ${key} listing.`);
   return list;
 }
 
@@ -389,14 +484,20 @@ export function installApplications(prepared, { execute = run, homeDir = os.home
 export async function main(args = process.argv.slice(2), { homeDir = os.homedir(), env = process.env,
   execute = run, log = console.log } = {}) {
   if (args.includes('--help') || args.includes('-h')) {
-    log('Usage: node scripts/install.mjs [--all | --codex | --claude] [--prepare-only]\nDefault: install for both apps. A normal Claude installation grants only its send_to_codex MCP tool in user permissions.allow. --prepare-only stages files and local catalogs without invoking either app CLI or changing tool permissions.');
+    log('Usage: node scripts/install.mjs [--all | --claude | --codex] [--prepare-only]\nDefault: install for both apps. A normal Claude installation grants only its send_to_codex MCP tool in user permissions.allow. --prepare-only stages files and local catalogs without invoking either app CLI or changing tool permissions.');
     return;
   }
   for (const arg of args) if (!['--all', '--codex', '--claude', '--prepare-only'].includes(arg)) throw new Error(`Unknown option: ${arg}`);
   const selected = args.filter(arg => ['--all', '--codex', '--claude'].includes(arg));
-  if (selected.length > 1) throw new Error('Choose exactly one of --all, --codex, or --claude.');
+  if (selected.length > 1) throw new Error('Choose exactly one of --all, --claude, or --codex.');
+  checkEnvironment(env);
   const target = selected[0] ?? '--all';
-  const prepared = prepareInstallation({ homeDir, env, codex: target !== '--claude', claude: target !== '--codex' });
+  const selection = { codex: target !== '--claude', claude: target !== '--codex' };
+  // Refuse an invalid source or route before removing a working legacy install.
+  checkManifests(projectRoot, { checkNative: false });
+  if (env.CLAUDE_CODEX_BRIDGE_SSH_HOST !== undefined) validateSshHostAlias(env.CLAUDE_CODEX_BRIDGE_SSH_HOST);
+  if (!args.includes('--prepare-only')) migrateLegacyInstallation({ homeDir, env, execute, log, ...selection });
+  const prepared = prepareInstallation({ homeDir, env, log, ...selection });
   log(`Prepared ${PLUGIN_NAME} in ${prepared.destination}`);
   if (prepared.backupDirectory) log(`Previous staged files: ${prepared.backupDirectory}`);
   if (prepared.marketplaceBackup) log(`Personal marketplace backup: ${prepared.marketplaceBackup}`);

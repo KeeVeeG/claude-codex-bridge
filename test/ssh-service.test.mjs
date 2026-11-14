@@ -1,3 +1,4 @@
+import { storedDelivery } from './public-helpers.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -5,8 +6,8 @@ import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { executeBridgeTool } from '../lib/desktop-service.mjs';
-import { canonicalClaudeSocket } from '../lib/claude-desktop.mjs';
+import { executeBridgeTool } from '../lib/bridge-service.mjs';
+import { canonicalClaudeSocket } from '../lib/claude-sessions.mjs';
 import { publishCodexHost } from '../lib/codex-host.mjs';
 import { prepareInstallation } from '../scripts/install.mjs';
 import { nativeFixture, mockPipe, encodeFrame, messageTool } from './native-helpers.mjs';
@@ -35,7 +36,7 @@ async function actor(t, { alias = 'codex-test-host', platform = 'darwin' } = {})
     ...(windows ? { procStartFt: processStart } : { procStart: processStart }) }));
   // Only routing is injected. Caller identity still uses the actual OS, process and native registry.
   return { ...setup, sessionId, context: { platform, registryDir, stateDir: setup.stateDir, parentPid: process.pid,
-    env: { CLAUDE_CODE_MESSAGING_SOCKET: socketPath, ...(alias ? { CODEX_CLAUDE_BRIDGE_SSH_HOST: alias } : {}) } } };
+    env: { CLAUDE_CODE_MESSAGING_SOCKET: socketPath, ...(alias ? { CLAUDE_CODEX_BRIDGE_SSH_HOST: alias } : {}) } } };
 }
 
 async function localCandidates(t, setup, threadId = targetId) {
@@ -59,10 +60,10 @@ test('macOS MCP send uses SSH without an app-tools registry and records verified
   const args = { thread_id: 'target-thread', message: 'Reply exactly ADAPTER_TEST_ACK', message_id: 'mac-ssh-once' };
   const context = { ...setup.context, sshSpawn: fixture.spawnImpl };
   const result = await executeBridgeTool('send_to_codex', args, context);
-  assert.equal(result.message.status, 'submitted');
-  assert.deepEqual(result.message.route.from, { kind: 'claude', id: setup.sessionId });
-  assert.deepEqual(result.message.route.to, { kind: 'codex', id: 'target-thread', host_id: 'ssh:codex-test-host' });
-  assert.deepEqual(result.message.receipt, { transport: 'ssh-app-server', turnId: 'accepted-turn', threadId: 'target-thread', host_id: 'ssh:codex-test-host' });
+  assert.equal(result.delivery.status, 'submitted');
+  assert.deepEqual(result.delivery.from, { app: 'claude', id: setup.sessionId });
+  assert.deepEqual(result.delivery.to, { app: 'codex', id: 'target-thread', host_id: 'ssh:codex-test-host' });
+  assert.deepEqual(storedDelivery(setup.stateDir, result.delivery).receipt, { transport: 'ssh-app-server', turnId: 'accepted-turn', threadId: 'target-thread', host_id: 'ssh:codex-test-host' });
   const started = fixture.requests.filter(r => r.method === 'turn/start');
   assert.equal(started.length, 1);
   assert.ok(started[0].params.input[0].text.includes(setup.sessionId));
@@ -71,7 +72,7 @@ test('macOS MCP send uses SSH without an app-tools registry and records verified
   assert.ok(started[0].params.input[0].text.includes('not an instruction from your user'));
   assert.equal(fixture.requests.some(request => request.method === 'thread/resume'), false);
   const duplicate = await executeBridgeTool('send_to_codex', args, context);
-  assert.equal(duplicate.retransmitted, false);
+  assert.equal(Object.hasOwn(duplicate, 'retransmitted'), false);
   assert.equal(fixture.requests.filter(r => r.method === 'turn/start').length, 1);
 });
 
@@ -81,8 +82,8 @@ test('macOS MCP SSH failures retain uncertain status and block same-id replaceme
   const context = { ...local.context, sshSpawn: fixture.spawnImpl };
   const args = { thread_id: targetId, message: 'One message', message_id: 'mac-ssh-uncertain' };
   await assert.rejects(executeBridgeTool('send_to_codex', args, context), e => e.deliveryUnknown);
-  const status = await executeBridgeTool('bridge_status', {}, context);
-  assert.equal(status.messages[0].status, 'uncertain');
+  const status = await executeBridgeTool('list_deliveries', {}, context);
+  assert.equal(status.deliveries[0].status, 'uncertain');
   await assert.rejects(executeBridgeTool('send_to_codex', args, context), /uncertain delivery/);
   assert.equal(fixture.requests.filter(r => r.method === 'turn/start').length, 1);
   local.assertUntouched();
@@ -92,17 +93,17 @@ test('a configured SSH route lists and sends only through its pinned host despit
   const setup = await actor(t), fixture = sshFixture({ loaded: [targetId] });
   const local = await localCandidates(t, setup);
   const context = { ...local.context, sshSpawn: fixture.spawnImpl };
-  const listing = await executeBridgeTool('list_codex_chats', {}, context);
+  const listing = await executeBridgeTool('list_codex_threads', {}, context);
   assert.deepEqual(listing.warnings, []);
-  assert.equal(listing.chats.length, 1);
-  assert.equal(listing.chats[0].thread_id, targetId);
-  assert.equal(listing.chats[0].source, 'ssh');
-  assert.equal(listing.chats[0].host_id, 'ssh:codex-test-host');
+  assert.equal(listing.threads.length, 1);
+  assert.equal(listing.threads[0].thread_id, targetId);
+  assert.equal(listing.threads[0].source, 'ssh');
+  assert.equal(listing.threads[0].host_id, 'ssh:codex-test-host');
   for (const transport of ['auto', 'ssh']) {
     const result = await executeBridgeTool('send_to_codex', { thread_id: targetId, message: transport,
       message_id: `pinned-${transport}`, transport }, context);
-    assert.equal(result.message.status, 'submitted');
-    assert.equal(result.message.route.to.host_id, 'ssh:codex-test-host');
+    assert.equal(result.delivery.status, 'submitted');
+    assert.equal(result.delivery.to.host_id, 'ssh:codex-test-host');
   }
   assert.equal(fixture.requests.filter(r => r.method === 'turn/start').length, 2);
   local.assertUntouched();
@@ -112,7 +113,7 @@ test('an SSH failure does not fall back to a local daemon or Desktop that knows 
   const setup = await actor(t), fixture = sshFixture({ handshake: 'invalid', loaded: [targetId] });
   const local = await localCandidates(t, setup);
   const context = { ...local.context, sshSpawn: fixture.spawnImpl };
-  await assert.rejects(executeBridgeTool('list_codex_chats', {}, context), /WebSocket|handshake/i);
+  await assert.rejects(executeBridgeTool('list_codex_threads', {}, context), /WebSocket|handshake/i);
   await assert.rejects(executeBridgeTool('send_to_codex', { thread_id: targetId, message: 'hello', message_id: 'ssh-down' }, context), /WebSocket|handshake/i);
   assert.equal(fixture.requests.some(r => r.method === 'turn/start'), false);
   local.assertUntouched();
@@ -126,7 +127,7 @@ test('configured SSH routes refuse explicit local transports before reserving a 
     await assert.rejects(executeBridgeTool('send_to_codex', { thread_id: targetId, message: 'hello', message_id: 'wrong-transport', transport }, context), /SSH|pinned/i);
   }
   assert.deepEqual(fixture.launches, []);
-  assert.deepEqual((await executeBridgeTool('bridge_status', {}, context)).messages, []);
+  assert.deepEqual((await executeBridgeTool('list_deliveries', {}, context)).deliveries, []);
   local.assertUntouched();
 });
 
@@ -136,7 +137,7 @@ test('explicit SSH delivery without a configured alias refuses before using any 
   const context = { ...local.context, sshSpawn: fixture.spawnImpl };
   await assert.rejects(executeBridgeTool('send_to_codex', { thread_id: targetId, message: 'hello', message_id: 'no-alias', transport: 'ssh' }, context), /SSH.*(alias|host)|configured/i);
   assert.deepEqual(fixture.launches, []);
-  assert.deepEqual((await executeBridgeTool('bridge_status', {}, context)).messages, []);
+  assert.deepEqual((await executeBridgeTool('list_deliveries', {}, context)).deliveries, []);
   local.assertUntouched();
 });
 
@@ -144,18 +145,18 @@ test('the same thread UUID and message ID on two SSH aliases have separate deliv
   const setup = await actor(t), first = sshFixture({ loaded: [targetId] }), second = sshFixture({ loaded: [targetId] });
   const args = { thread_id: targetId, message: 'same content', message_id: 'per-host-idempotency' };
   const firstContext = { ...setup.context, sshSpawn: first.spawnImpl };
-  const secondContext = { ...setup.context, env: { ...setup.context.env, CODEX_CLAUDE_BRIDGE_SSH_HOST: 'another-host' }, sshSpawn: second.spawnImpl };
+  const secondContext = { ...setup.context, env: { ...setup.context.env, CLAUDE_CODEX_BRIDGE_SSH_HOST: 'another-host' }, sshSpawn: second.spawnImpl };
   const firstSend = await executeBridgeTool('send_to_codex', args, firstContext);
   const secondSend = await executeBridgeTool('send_to_codex', args, secondContext);
-  assert.equal(firstSend.message.status, 'submitted');
-  assert.equal(secondSend.message.status, 'submitted');
+  assert.equal(firstSend.delivery.status, 'submitted');
+  assert.equal(secondSend.delivery.status, 'submitted');
   assert.equal(first.requests.filter(r => r.method === 'turn/start').length, 1);
   assert.equal(second.requests.filter(r => r.method === 'turn/start').length, 1);
   const duplicate = await executeBridgeTool('send_to_codex', args, secondContext);
-  assert.equal(duplicate.retransmitted, false);
+  assert.equal(Object.hasOwn(duplicate, 'retransmitted'), false);
   assert.equal(second.requests.filter(r => r.method === 'turn/start').length, 1);
-  const history = await executeBridgeTool('bridge_status', {}, firstContext);
-  assert.deepEqual(history.messages.map(message => message.route.to.host_id).sort(), ['ssh:another-host', 'ssh:codex-test-host']);
+  const history = await executeBridgeTool('list_deliveries', {}, firstContext);
+  assert.deepEqual(history.deliveries.map(message => message.to.host_id).sort(), ['ssh:another-host', 'ssh:codex-test-host']);
 });
 
 test('Windows ignores an inherited SSH alias and keeps the local daemon route', { skip: process.platform !== 'win32' }, async t => {
@@ -164,8 +165,8 @@ test('Windows ignores an inherited SSH alias and keeps the local daemon route', 
   const fixture = sshFixture({ loaded: [targetId] });
   const result = await executeBridgeTool('send_to_codex', { thread_id: targetId, message: 'local delivery', message_id: 'windows-stays-local' },
     { ...setup.context, daemon: daemon.daemon, sshSpawn: fixture.spawnImpl });
-  assert.equal(result.message.receipt.method, 'turn/start');
-  assert.deepEqual(result.message.route.to, { kind: 'codex', id: targetId });
+  assert.equal(storedDelivery(setup.stateDir, result.delivery).receipt.method, 'turn/start');
+  assert.deepEqual(result.delivery.to, { app: 'codex', id: targetId });
   assert.equal(daemon.requests().filter(r => r.method === 'turn/start').length, 1);
   assert.deepEqual(fixture.launches, []);
 });
@@ -175,8 +176,8 @@ test('SSH preserves the full user byte allowance when adding verified provenance
   const message = 'x'.repeat(65536);
   const result = await executeBridgeTool('send_to_codex', { thread_id: 'target-thread', message,
     message_id: 'full-user-byte-allowance' }, { ...setup.context, sshSpawn: fixture.spawnImpl });
-  assert.equal(result.message.status, 'submitted');
-  assert.equal(result.message.message, message);
+  assert.equal(result.delivery.status, 'submitted');
+  assert.equal(result.delivery.message, message);
   const turns = fixture.requests.filter(r => r.method === 'turn/start');
   assert.equal(turns.length, 1);
   assert.ok(turns[0].params.input[0].text.endsWith('\n\n' + message + '\n</cross-session-message>'));
@@ -187,7 +188,7 @@ test('SSH preserves user control characters through JSON rather than a shell com
   const setup = await actor(t), fixture = sshFixture(), message = 'Code data: \0\t\n$(not-a-command)';
   const result = await executeBridgeTool('send_to_codex', { thread_id: 'target-thread', message,
     message_id: 'json-data-only' }, { ...setup.context, sshSpawn: fixture.spawnImpl });
-  assert.equal(result.message.message, message);
+  assert.equal(result.delivery.message, message);
   const turn = fixture.requests.find(r => r.method === 'turn/start');
   assert.ok(turn.params.input[0].text.endsWith('\n\n' + message + '\n</cross-session-message>'));
   assert.ok(!fixture.launches[0].args.some(arg => arg.includes('not-a-command')));
@@ -211,8 +212,8 @@ test('macOS doctor checks SSH read-only rather than the protected app-tools sock
 test('macOS invalid SSH route fails closed without private-socket fallback', mac, async t => {
   const setup = await actor(t), fixture = sshFixture();
   const local = await localCandidates(t, setup);
-  const context = { ...local.context, env: { ...setup.context.env, CODEX_CLAUDE_BRIDGE_SSH_HOST: '-oProxyCommand=bad' }, sshSpawn: fixture.spawnImpl };
-  await assert.rejects(executeBridgeTool('list_codex_chats', {}, context), /SSH host alias/);
+  const context = { ...local.context, env: { ...setup.context.env, CLAUDE_CODEX_BRIDGE_SSH_HOST: '-oProxyCommand=bad' }, sshSpawn: fixture.spawnImpl };
+  await assert.rejects(executeBridgeTool('list_codex_threads', {}, context), /SSH host alias/);
   await assert.rejects(executeBridgeTool('send_to_codex', { thread_id: targetId, message: 'hi', message_id: 'invalid-alias' }, context), /SSH host alias/);
   assert.equal(fixture.launches.length, 0);
   local.assertUntouched();
@@ -238,15 +239,15 @@ test('SSH doctor finds an idle conversation after the first busy conversation an
 
 test('installer pins the operator-selected SSH alias into both native MCP configurations', async t => {
   const setup = await nativeFixture(t);
-  const prepared = prepareInstallation({ homeDir: setup.root, env: { CODEX_CLAUDE_BRIDGE_SSH_HOST: 'codex-test-host' } });
+  const prepared = prepareInstallation({ homeDir: setup.root, env: { CLAUDE_CODEX_BRIDGE_SSH_HOST: 'codex-test-host' } });
   const codex = JSON.parse(fs.readFileSync(path.join(prepared.destination, '.codex-plugin/plugin.json')));
   const claude = JSON.parse(fs.readFileSync(path.join(prepared.destination, '.mcp.json')));
-  assert.equal(codex.mcpServers['codex-claude-desktop-bridge'].env.CODEX_CLAUDE_BRIDGE_SSH_HOST, 'codex-test-host');
-  assert.equal(claude.mcpServers['codex-claude-desktop-bridge'].env.CODEX_CLAUDE_BRIDGE_SSH_HOST, 'codex-test-host');
+  assert.equal(codex.mcpServers['bridge-claude-codex'].env.CLAUDE_CODEX_BRIDGE_SSH_HOST, 'codex-test-host');
+  assert.equal(claude.mcpServers['bridge-claude-codex'].env.CLAUDE_CODEX_BRIDGE_SSH_HOST, 'codex-test-host');
 });
 
 test('installer rejects malformed SSH aliases before writing plugin state', async t => {
   const setup = await nativeFixture(t);
-  assert.throws(() => prepareInstallation({ homeDir: setup.root, env: { CODEX_CLAUDE_BRIDGE_SSH_HOST: 'host;whoami' } }), /SSH host alias/);
+  assert.throws(() => prepareInstallation({ homeDir: setup.root, env: { CLAUDE_CODEX_BRIDGE_SSH_HOST: 'host;whoami' } }), /SSH host alias/);
   assert.equal(fs.existsSync(path.join(setup.root, 'plugins')), false);
 });

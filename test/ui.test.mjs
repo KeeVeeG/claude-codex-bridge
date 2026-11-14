@@ -50,14 +50,14 @@ function harness(hash = '') {
     async choose(sessionId, messages = [], page = {}) {
       const button = nodes.get('chat-list').children.find(child => child.dataset.sessionId === sessionId);
       assert.ok(button, `Conversation ${sessionId} must be visible.`); button.dispatch('click'); await flush();
-      const request = requests('bridge_ui_history').at(-1);
+      const request = requests('panel_history').at(-1);
       if (request?.message.params.arguments.session_id === sessionId) { reply(request, { session_id: sessionId, messages, has_more: false, next_cursor: null, ...page }); await flush(); }
     },
   };
 }
 
 const panel = {
-  owner_thread_id: 'codex-owner', application: 'codex', chats: [
+  owner_thread_id: 'codex-owner', application: 'codex', sessions: [
     { session_id: 'a', title: 'Bridge interface', cwd: 'C:/projects/bridge', live: true, last_contact_at: 1000, last_activity_at: 4000 },
     { session_id: 'b', title: 'Test review', cwd: 'C:/projects/tests', live: true, last_contact_at: 2000, last_activity_at: 3000 },
     { session_id: 'c', title: 'Archive', cwd: 'C:/projects/history', live: false, last_contact_at: 1000, last_activity_at: 2000 },
@@ -69,16 +69,17 @@ async function live(h = harness()) {
   h.emit({ jsonrpc: '2.0', id: request.message.id, result: { protocolVersion: '2026-01-26', hostContext: { theme: 'dark' } } });
   await flush(); h.emit({ jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: { structuredContent: panel } }); await flush(); await h.bootstrap; return h;
 }
+const delivery = (id, text, extra = {}) => ({ message_id: id, message: text, from: { app: 'codex', id: 'codex-owner' }, to: { app: 'claude', id: 'a' }, created_at: 1000, status: 'submitted', ...extra });
 const record = (id, text, extra = {}) => ({ id, message: text, direction: 'to_claude', created_at: 1000, status: 'submitted', ...extra });
 
 test('panel distinguishes live CLI and Desktop recipients while preserving exact selected IDs', async () => {
   const h = await live();
-  const chats = panel.chats.map(chat => ({ ...chat,
+  const chats = panel.sessions.map(chat => ({ ...chat,
     ...(chat.session_id === 'a' ? { entrypoint: 'cli' } : chat.session_id === 'b' ? { entrypoint: 'claude-desktop' }
       : chat.session_id === 'd' ? { entrypoint: 'sdk-cli' } : {}) }));
   chats.push({ session_id: 'e', title: 'Editor session', cwd: 'C:/projects/editor', live: true, last_contact_at: null,
     last_activity_at: 500, entrypoint: 'claude-vscode' });
-  h.emit({ jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: { structuredContent: { ...panel, chats } } });
+  h.emit({ jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: { structuredContent: { ...panel, sessions: chats } } });
   await flush();
   const cli = h.node('chat-list').children.find(node => node.dataset.sessionId === 'a');
   const desktop = h.node('chat-list').children.find(node => node.dataset.sessionId === 'b');
@@ -94,7 +95,7 @@ test('panel distinguishes live CLI and Desktop recipients while preserving exact
   assert.match(h.node('conversation-subtitle').textContent, /Claude CLI/);
   h.node('message').value = 'CLI recipient message'; h.node('message').dispatch('input');
   h.node('composer').dispatch('submit'); await flush();
-  assert.equal(h.requests('bridge_ui_send').at(-1).message.params.arguments.session_id, 'a');
+  assert.equal(h.requests('panel_send').at(-1).message.params.arguments.session_id, 'a');
 });
 
 test('panel negotiates the MCP Apps bridge and pins both parent source and origin', async () => {
@@ -107,8 +108,8 @@ test('panel negotiates the MCP Apps bridge and pins both parent source and origi
   assert.ok(h.outgoing.some(entry => entry.message.method === 'ui/notifications/initialized'));
   h.emit({ jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: { structuredContent: panel } }, { origin: 'https://untrusted.example' }); await flush(); assert.equal(h.node('chat-count').textContent, '0');
   h.emit({ jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: { structuredContent: panel } }); await flush(); await h.bootstrap; assert.equal(h.node('chat-count').textContent, '3 / 4');
-  assert.equal(h.requests('bridge_ui_history').length, 0, 'No destination may be selected implicitly.');
-  assert.equal(h.requests('bridge_ui_send').length, 0);
+  assert.equal(h.requests('panel_history').length, 0, 'No destination may be selected implicitly.');
+  assert.equal(h.requests('panel_send').length, 0);
 });
 
 test('unsupported UI protocol fails visibly without loading tools', async () => {
@@ -122,7 +123,7 @@ test('history errors replace the loading placeholder with a retryable state', as
   const h = await live();
   const button = h.node('chat-list').children.find(child => child.dataset.sessionId === 'a');
   button.dispatch('click'); await flush();
-  const request = h.requests('bridge_ui_history').at(-1);
+  const request = h.requests('panel_history').at(-1);
   h.emit({ jsonrpc: '2.0', id: request.message.id, error: { message: 'History unavailable.' } }); await flush();
   assert.match(h.node('timeline').textContent, /History unavailable/);
   assert.doesNotMatch(h.node('timeline').textContent, /Loading history/);
@@ -169,7 +170,7 @@ test('per-chat drafts survive selection, search finds projects, and inactive his
   await h.choose('a'); assert.equal(h.node('message').value, 'Draft A');
   await h.choose('c', [record('archive', 'History is available.')]);
   assert.equal(h.node('composer').hidden, true); assert.match(h.node('inactive-title').textContent, /inactive/);
-  h.node('message').dispatch('keydown', { key: 'Enter', ctrlKey: true }); await flush(); assert.equal(h.requests('bridge_ui_send').length, 0);
+  h.node('message').dispatch('keydown', { key: 'Enter', ctrlKey: true }); await flush(); assert.equal(h.requests('panel_send').length, 0);
   h.node('tab-all').dispatch('click'); h.node('search').value = 'prototype'; h.node('search').dispatch('input');
   assert.deepEqual(h.node('chat-list').children.map(node => node.dataset.sessionId), ['d']);
 });
@@ -178,33 +179,33 @@ test('composer follows Codex keyboard behavior: Enter sends and Shift+Enter inse
   const h = await live(); await h.choose('a');
   h.node('message').value = 'Send with Enter'; h.node('message').dispatch('input');
   h.node('message').dispatch('keydown', { key: 'Enter' }); await flush();
-  assert.equal(h.requests('bridge_ui_send').length, 1);
-  const send = h.requests('bridge_ui_send').at(-1);
-  h.reply(send, { message: record(send.message.params.arguments.message_id, 'Send with Enter', { manual: true, notice_status: 'submitted' }), manual: true, notice_status: 'submitted' }); await flush();
-  h.reply(h.requests('bridge_ui_history').at(-1), { session_id: 'a', messages: [record('sent', 'Send with Enter')], has_more: false, next_cursor: null }); await flush();
+  assert.equal(h.requests('panel_send').length, 1);
+  const send = h.requests('panel_send').at(-1);
+  h.reply(send, { delivery: delivery(send.message.params.arguments.message_id, 'Send with Enter', { manual: true, notice_status: 'submitted' }), manual: true, notice_status: 'submitted' }); await flush();
+  h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [record('sent', 'Send with Enter')], has_more: false, next_cursor: null }); await flush();
 
   const second = await live(); await second.choose('a');
   second.node('message').value = 'First line'; second.node('message').dispatch('input');
   second.node('message').dispatch('keydown', { key: 'Enter', shiftKey: true }); await flush();
-  assert.equal(second.requests('bridge_ui_send').length, 0);
+  assert.equal(second.requests('panel_send').length, 0);
   assert.equal(second.node('message').value, 'First line');
 });
 
 test('uncertain manual delivery keeps one UUID, blocks resend, and recovers only from recorded history', async () => {
   const h = await live(); await h.choose('a'); h.node('message').value = 'Exact text'; h.node('message').dispatch('input');
   h.node('composer').dispatch('submit'); await flush();
-  const send = h.requests('bridge_ui_send').at(-1); const args = send.message.params.arguments;
+  const send = h.requests('panel_send').at(-1); const args = send.message.params.arguments;
   assert.deepEqual(Object.keys(args).sort(), ['message', 'message_id', 'session_id']); assert.equal(args.session_id, 'a'); assert.equal(args.message, 'Exact text');
   h.emit({ jsonrpc: '2.0', id: send.message.id, result: { isError: true, content: [{ type: 'text', text: 'Transport ended.' }] } }); await flush();
   assert.equal(h.uuidCount(), 1); assert.equal(h.node('composer').hidden, true); assert.match(h.node('inactive-detail').textContent, /message ID were saved/);
   h.node('composer').dispatch('submit'); h.node('message').dispatch('keydown', { key: 'Enter', metaKey: true }); await flush();
-  assert.equal(h.requests('bridge_ui_send').length, 1);
+  assert.equal(h.requests('panel_send').length, 1);
   h.node('refresh').dispatch('click'); await flush(); h.reply(h.requests('bridge_panel').at(-1), panel); await flush();
-  h.reply(h.requests('bridge_ui_history').at(-1), { session_id: 'a', messages: [record(args.message_id, args.message, { status: 'uncertain', manual: true })], has_more: false, next_cursor: null }); await flush();
+  h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [record(args.message_id, args.message, { status: 'uncertain', manual: true })], has_more: false, next_cursor: null }); await flush();
   assert.equal(h.node('composer').hidden, true); assert.equal(h.uuidCount(), 1);
   h.node('refresh').dispatch('click'); await flush(); h.reply(h.requests('bridge_panel').at(-1), panel); await flush();
-  h.reply(h.requests('bridge_ui_history').at(-1), { session_id: 'a', messages: [record(args.message_id, args.message, { manual: true })], has_more: false, next_cursor: null }); await flush();
-  assert.equal(h.node('composer').hidden, false); assert.equal(h.node('message').value, ''); assert.equal(h.requests('bridge_ui_send').length, 1);
+  h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [record(args.message_id, args.message, { manual: true })], has_more: false, next_cursor: null }); await flush();
+  assert.equal(h.node('composer').hidden, false); assert.equal(h.node('message').value, ''); assert.equal(h.requests('panel_send').length, 1);
 });
 
 test('messages remain literal text and pagination prepends without moving the visible anchor', async () => {
@@ -213,7 +214,7 @@ test('messages remain literal text and pagination prepends without moving the vi
   const pane = h.node('timeline'); assert.ok(descendants(pane).some(node => node.className === 'bubble' && node.textContent === text));
   pane.scrollTop = 50; const height = pane.scrollHeight;
   descendants(pane).find(node => node.tagName === 'button' && node.textContent === 'Load earlier messages').dispatch('click'); await flush();
-  const request = h.requests('bridge_ui_history').at(-1); assert.equal(request.message.params.arguments.cursor, 'older-page');
+  const request = h.requests('panel_history').at(-1); assert.equal(request.message.params.arguments.cursor, 'older-page');
   h.reply(request, { session_id: 'a', messages: [record('older', 'Earlier message', { created_at: 500 })], has_more: false, next_cursor: null }); await flush();
   assert.deepEqual(descendants(pane).filter(node => node.className === 'bubble').map(node => node.textContent), ['Earlier message', text, 'Reply']);
   assert.equal(pane.scrollTop, 50 + pane.scrollHeight - height);
@@ -225,7 +226,7 @@ test('background refresh preserves an earlier reading position while merging new
   await h.choose('a', messages); const pane = h.node('timeline'); pane.scrollTop = 30;
   h.intervals[0](); await flush(); h.reply(h.requests('bridge_panel').at(-1), panel); await flush();
   assert.equal(pane.scrollTop, 30, 'Refreshing chat metadata must not jump to the latest message.');
-  h.reply(h.requests('bridge_ui_history').at(-1), { session_id: 'a', messages: [...messages, record('four', 'New', { created_at: 4000 })], has_more: false, next_cursor: null }); await flush();
+  h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [...messages, record('four', 'New', { created_at: 4000 })], has_more: false, next_cursor: null }); await flush();
   assert.equal(pane.scrollTop, 30); assert.ok(descendants(pane).some(node => node.className === 'bubble' && node.textContent === 'New'));
 });
 
@@ -236,12 +237,12 @@ test('Codex notice retry is explicit and available only after definitive failure
     record('unsafe', 'Result write failed.', { manual: true, notice_status: 'failed', notice_retryable: false }),
   ]);
   const buttons = descendants(h.node('timeline')).filter(node => node.textContent === 'Retry Codex notification'); assert.equal(buttons.length, 1);
-  assert.equal(h.requests('bridge_ui_retry_notice').length, 0); buttons[0].dispatch('click'); buttons[0].dispatch('click'); await flush();
-  const retry = h.requests('bridge_ui_retry_notice').at(-1); assert.deepEqual(retry.message.params.arguments, { session_id: 'a', message_id: 'safe' });
-  assert.equal(h.requests('bridge_ui_retry_notice').length, 1); assert.equal(h.requests('bridge_ui_send').length, 0);
+  assert.equal(h.requests('panel_retry_notice').length, 0); buttons[0].dispatch('click'); buttons[0].dispatch('click'); await flush();
+  const retry = h.requests('panel_retry_notice').at(-1); assert.deepEqual(retry.message.params.arguments, { session_id: 'a', message_id: 'safe' });
+  assert.equal(h.requests('panel_retry_notice').length, 1); assert.equal(h.requests('panel_send').length, 0);
   h.reply(retry, { message: record('safe', 'Already delivered to Claude.'), manual: true, notice_status: 'submitted', notice_retryable: false }); await flush();
-  h.reply(h.requests('bridge_ui_history').at(-1), { session_id: 'a', messages: [record('safe', 'Already delivered to Claude.', { manual: true, notice_status: 'submitted' })], has_more: false, next_cursor: null }); await flush();
-  assert.equal(h.requests('bridge_ui_send').length, 0);
+  h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [record('safe', 'Already delivered to Claude.', { manual: true, notice_status: 'submitted' })], has_more: false, next_cursor: null }); await flush();
+  assert.equal(h.requests('panel_send').length, 0);
 });
 
 test('owner-context changes disable sending, and demo never calls a real host', async () => {

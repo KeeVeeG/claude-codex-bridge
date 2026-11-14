@@ -4,16 +4,18 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 
-export const PLUGIN_NAME = 'codex-claude-desktop-bridge';
+export const PLUGIN_NAME = 'bridge-claude-codex';
+// The npm/archive identity is independent of the native plugin namespace.
+export const PACKAGE_NAME = 'claude-codex-bridge';
 export const PLUGIN_SCHEMA = 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json';
 export const MCP_SCHEMA = 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json';
 export const NATIVE_DIRECTORY = 'compatibility/native';
 export const COMMON_RUNTIME_FILES = [
   '.codex-plugin/plugin.json', '.claude-plugin/plugin.json', '.mcp.json',
-  'lib/store.mjs', 'lib/claude-desktop.mjs', 'lib/claude-process.mjs', 'lib/local-socket.mjs', 'lib/codex-desktop.mjs', 'lib/codex-ssh.mjs',
-  'lib/desktop-service.mjs', 'lib/codex-host.mjs', 'scripts/mcp.mjs',
+  'lib/store.mjs', 'lib/state-directory.mjs', 'lib/delivery.mjs', 'lib/legacy-environment.mjs', 'lib/claude-sessions.mjs', 'lib/claude-process.mjs', 'lib/local-socket.mjs', 'lib/codex-desktop.mjs', 'lib/codex-ssh.mjs',
+  'lib/bridge-service.mjs', 'lib/codex-host.mjs', 'scripts/mcp.mjs',
   'lib/claude-history.mjs', 'lib/bridge-history.mjs', 'lib/manual-service.mjs', 'lib/codex-settings.mjs', 'lib/ws-jsonrpc.mjs', 'lib/codex-binary.mjs', 'lib/codex-daemon.mjs', 'lib/codex-peer.mjs', 'ui/bridge.html',
-  'scripts/manifests.mjs', 'scripts/install.mjs', 'skills/claude-bridge/SKILL.md',
+  'scripts/manifests.mjs', 'scripts/install.mjs', 'skills/bridge/SKILL.md',
   'package.json', 'README.md', 'LICENSE', 'SECURITY.md', 'docs/PRIVACY.md', 'docs/PUBLISHING.md', 'docs/TERMS.md',
   'assets/bridge.svg', 'assets/bridge-dark.svg',
 ];
@@ -24,11 +26,11 @@ const object = value => value !== null && typeof value === 'object' && !Array.is
 const stringArray = value => Array.isArray(value) && value.every(item => typeof item === 'string');
 const json = value => JSON.stringify(value, null, 2) + '\n';
 export const CODEX_CONTEXT_ENV_VARS = ['CODEX_APP_TOOLS_PIPE_PATH', 'CODEX_THREAD_ID', 'CODEX_HOME', 'USERPROFILE', 'HOME', 'PATH',
-  'CLAUDE_CONFIG_DIR', 'CODEX_CLAUDE_BRIDGE_STATE_DIR', 'CODEX_CLAUDE_BRIDGE_REGISTRY_DIR',
-  'CODEX_CLAUDE_BRIDGE_CODEX_BIN', 'CODEX_CLAUDE_BRIDGE_DAEMON', 'CODEX_CLAUDE_BRIDGE_SSH_HOST'];
+  'CLAUDE_CONFIG_DIR', 'CLAUDE_CODEX_BRIDGE_STATE_DIR', 'CLAUDE_CODEX_BRIDGE_REGISTRY_DIR',
+  'CLAUDE_CODEX_BRIDGE_CODEX_BIN', 'CLAUDE_CODEX_BRIDGE_DAEMON', 'CLAUDE_CODEX_BRIDGE_SSH_HOST'];
 export const CLAUDE_CONTEXT_ENV_VARS = ['CODEX_APP_TOOLS_PIPE_PATH', 'CODEX_THREAD_ID', 'CLAUDE_CODE_MESSAGING_SOCKET',
-  'LOCALAPPDATA', 'USERPROFILE', 'HOME', 'PATH', 'CLAUDE_CONFIG_DIR', 'CODEX_CLAUDE_BRIDGE_STATE_DIR', 'CODEX_CLAUDE_BRIDGE_REGISTRY_DIR',
-  'CODEX_CLAUDE_BRIDGE_CODEX_BIN', 'CODEX_CLAUDE_BRIDGE_DAEMON', 'CODEX_HOME', 'CODEX_CLAUDE_BRIDGE_SSH_HOST'];
+  'LOCALAPPDATA', 'USERPROFILE', 'HOME', 'PATH', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODEX_BRIDGE_STATE_DIR', 'CLAUDE_CODEX_BRIDGE_REGISTRY_DIR',
+  'CLAUDE_CODEX_BRIDGE_CODEX_BIN', 'CLAUDE_CODEX_BRIDGE_DAEMON', 'CODEX_HOME', 'CLAUDE_CODEX_BRIDGE_SSH_HOST'];
 
 function readBytes(rootDirectory, relative) {
   const filename = path.join(rootDirectory, relative);
@@ -103,8 +105,8 @@ export function readCanonicalBundle(sourceRoot = root) {
 
 export function checkManifests(sourceRoot = root, { checkNative = true } = {}) {
   const bundle = readCanonicalBundle(sourceRoot);
-  if (bundle.packageJson.name !== bundle.manifest.name || bundle.packageJson.version !== bundle.manifest.version) {
-    throw new Error('package.json name/version differs from canonical plugin.json. Run npm run manifests:sync.');
+  if (bundle.packageJson.name !== PACKAGE_NAME || bundle.packageJson.version !== bundle.manifest.version) {
+    throw new Error('package.json name or version differs from the product package name or canonical plugin version. Run npm run manifests:sync.');
   }
   const files = compatibilityFiles(bundle.manifest, bundle.mcp);
   for (const [relative, expected] of Object.entries(files)) {
@@ -174,7 +176,7 @@ export function syncManifests(sourceRoot = root) {
   const bundle = readCanonicalBundle(sourceRoot);
   const files = compatibilityFiles(bundle.manifest, bundle.mcp);
   for (const [relative, value] of Object.entries(files)) fs.writeFileSync(path.join(bundle.source, relative), json(value));
-  fs.writeFileSync(path.join(bundle.source, 'package.json'), json({ ...bundle.packageJson, name: bundle.manifest.name, version: bundle.manifest.version }));
+  fs.writeFileSync(path.join(bundle.source, 'package.json'), json({ ...bundle.packageJson, name: PACKAGE_NAME, version: bundle.manifest.version }));
   if (!bundle.native) syncNativeDeployment(bundle);
   return checkManifests(bundle.source);
 }

@@ -6,7 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { PLUGIN_NAME, PORTABLE_RUNTIME_FILES, checkManifests, nativeBundleEntries } from './manifests.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const catalogName = 'keeveeg-desktop-bridge';
+const catalogName = 'keeveeg';
 const crcTable = Array.from({ length: 256 }, (_, index) => {
   let value = index;
   for (let i = 0; i < 8; i++) value = (value >>> 1) ^ ((value & 1) ? 0xedb88320 : 0);
@@ -116,19 +116,19 @@ export function buildPackages({ sourceRoot = root, outputDir = path.join(root, '
           realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) throw new Error(`Invalid runtime entry: ${relative}`);
       put(safeChild(portable, relative), fs.readFileSync(filename));
     }
-    const codexCatalog = { name: catalogName, interface: { displayName: 'Codex–Claude Bridge' }, plugins: [{
+    const codexCatalog = { name: catalogName, interface: { displayName: 'Claude–Codex Bridge' }, plugins: [{
       name: PLUGIN_NAME, source: { source: 'local', path: `./plugins/${PLUGIN_NAME}` },
       policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' }, category: 'Productivity',
     }] };
     const claudeCatalog = { name: catalogName, owner: { name: 'KeeVeeG' },
-      description: 'Asynchronous two-way messaging between Codex and Claude Code conversations.',
+      description: 'Asynchronous two-way messaging between Claude Code and Codex conversations.',
       plugins: [{ name: PLUGIN_NAME, source: `./plugins/${PLUGIN_NAME}` }],
     };
     put(path.join(marketplaceSource, '.agents', 'plugins', 'marketplace.json'), json(codexCatalog));
     put(path.join(marketplaceSource, '.claude-plugin', 'marketplace.json'), json(claudeCatalog));
-    const pluginName = `${PLUGIN_NAME}-${version}.zip`;
-    const marketplaceName = `${PLUGIN_NAME}-marketplace-${version}.zip`;
-    const portableName = `${PLUGIN_NAME}-portable-${version}.zip`;
+    const pluginName = `${bundle.packageJson.name}-${version}.zip`;
+    const marketplaceName = `${bundle.packageJson.name}-marketplace-${version}.zip`;
+    const portableName = `${bundle.packageJson.name}-portable-${version}.zip`;
     const pluginEntries = entriesFrom(plugin);
     const archives = [
       { name: pluginName, data: zipEntries(pluginEntries) },
