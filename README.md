@@ -40,7 +40,7 @@ After installing or updating, load the new server in each client:
 
 - **Claude Code CLI:** `/reload-plugins`, then check `/mcp`. If it warns that the conversation would be re-read, the reload is held: run `/reload-plugins --force`.
 - **Claude Desktop:** fully quit it, including the background instance, and reopen.
-- **Codex Desktop:** start a new task or restart the app.
+- **Codex Desktop:** fully quit the app, not only its window, and reopen it. Until then new tasks still start the old version.
 - **Codex CLI:** restart the session.
 
 A visible bridge skill does not mean its MCP server connected; if the tools are missing, read the server's startup error in `/mcp`.

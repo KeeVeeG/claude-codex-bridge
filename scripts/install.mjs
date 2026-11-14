@@ -587,7 +587,7 @@ export async function main(args = process.argv.slice(2), { homeDir = os.homedir(
     log('Registered this Codex Desktop host for local conversation discovery.');
   }
   if (prepared.claude) log('In Claude CLI, run /reload-plugins and check /mcp. If it warns that the conversation would be re-read, the reload is held: run /reload-plugins --force. In Claude Desktop, fully quit and reopen the app when convenient so its MCP process loads this version.');
-  if (prepared.codex) log('In Codex Desktop, start a new task or restart the app to load updated tools. Restart terminal Codex sessions when convenient to load updated tools.');
+  if (prepared.codex) log('Fully quit Codex Desktop, not only its window, and reopen it: until then new tasks still start the old version. Restart terminal Codex sessions when convenient to load updated tools.');
   log(`Apps were not restarted.${prepared.claude ? ' Only the exact Claude send_to_codex tool received a user-level allow rule.' : ' Claude tool permissions were not changed.'}`);
   pruneInstallationBackups(prepared, homeDir);
   return prepared;

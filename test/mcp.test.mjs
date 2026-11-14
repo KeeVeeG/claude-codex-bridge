@@ -19,13 +19,13 @@ const processStart = process.platform === 'win32'
 const windowsOnly = { skip: process.platform !== 'win32' && 'Native Claude registry uses Windows process identity.' };
 const metadata = threadId => ({ 'x-codex-turn-metadata': { thread_id: threadId } });
 
-function startMcp(t, env = {}, { parentProxy = false } = {}) {
+function startMcp(t, env = {}, { parentProxy = false, server = serverPath } = {}) {
   const childEnv = { ...process.env, CLAUDE_CODEX_BRIDGE_DAEMON: 'off' };
   for (const name of ['CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CODEX_APP_TOOLS_PIPE_PATH', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN']) delete childEnv[name];
   Object.assign(childEnv, env);
   const args = parentProxy
     ? ['-e', 'const {spawn}=require("node:child_process"); const child=spawn(process.execPath,[process.argv[1]],{stdio:"inherit",windowsHide:true}); child.on("exit",code=>process.exit(code??1));', serverPath]
-    : [serverPath];
+    : [server];
   const child = spawn(process.execPath, args, { env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   let stderr = '';
   let buffer = '';
@@ -542,6 +542,23 @@ test('MCP advertises direct, addressed messages without pair-management tools or
   assert.equal(diagnostics.application, 'unknown');
   assert.ok(diagnostics.checks.some(check => check.status === 'fail'));
   assert.equal(diagnostics.plugin_version, JSON.parse(fs.readFileSync(new URL('../plugin.json', import.meta.url), 'utf8')).version);
+});
+
+test('a running server keeps the code it started with when an update replaces its files, and the doctor says so', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-in-place-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const entry of ['scripts', 'lib', 'ui', 'plugin.json', 'package.json'])
+    fs.cpSync(fileURLToPath(new URL(`../${entry}`, import.meta.url)), path.join(root, entry), { recursive: true });
+  const client = startMcp(t, { CLAUDE_CODEX_BRIDGE_STATE_DIR: path.join(root, 'state') }, { server: path.join(root, 'scripts', 'mcp.mjs') });
+  await initialize(client);
+  const manifest = path.join(root, 'plugin.json');
+  const running = JSON.parse(fs.readFileSync(manifest, 'utf8')).version;
+  // A module read after start would now load without its exports.
+  for (const file of fs.readdirSync(path.join(root, 'lib'))) fs.writeFileSync(path.join(root, 'lib', file), 'export {};\n');
+  fs.writeFileSync(manifest, JSON.stringify({ version: '99.0.0' }));
+  const diagnostics = toolValue(await callTool(client, 'bridge_doctor'));
+  assert.equal(diagnostics.plugin_version, running);
+  assert.match(diagnostics.checks.find(check => check.name === 'plugin_version').detail, /99\.0\.0 is installed, but this server still runs/);
 });
 
 test('a rejected direct Desktop caller receives doctor registration advice through MCP', async t => {

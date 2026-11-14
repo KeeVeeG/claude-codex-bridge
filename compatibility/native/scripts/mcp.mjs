@@ -6,6 +6,14 @@ import { fileURLToPath } from 'node:url';
 import { defaultStateDir } from '../lib/store.mjs';
 import { CLAUDE_ENTRYPOINTS } from '../lib/claude-sessions.mjs';
 import { MAX_CODEX_CHAT_LIMIT } from '../lib/codex-desktop.mjs';
+// All code loads at start: the installer replaces these files in place, and a module read
+// later would mix two versions in one running server. The lib modules' dynamic imports then
+// resolve to these already loaded copies.
+import { executeBridgeTool } from '../lib/bridge-service.mjs';
+import { publishCodexHost, getCodexHost } from '../lib/codex-host.mjs';
+import '../lib/manual-service.mjs';
+import '../lib/claude-history.mjs';
+import '../lib/bridge-history.mjs';
 
 const versions = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const manifestUrl = ['../plugin.json', '../config/plugin-source.json', '../.claude-plugin/plugin.json']
@@ -206,9 +214,13 @@ function toolResult(value, isError = false, name) {
 }
 
 async function executeDefault(name, args, context) {
-  const { executeBridgeTool } = await import('../lib/bridge-service.mjs');
   const result = await executeBridgeTool(name, args, context);
-  return name === 'bridge_doctor' ? { ...result, plugin_version: runtimeVersion } : result;
+  if (name !== 'bridge_doctor') return result;
+  let installed = null;
+  try { installed = JSON.parse(fs.readFileSync(manifestUrl, 'utf8')).version; } catch { /* reported as current */ }
+  const stale = installed && installed !== runtimeVersion ? [{ name: 'plugin_version', status: 'warning',
+    detail: `Version ${installed} is installed, but this server still runs ${runtimeVersion}. Reload plugins or restart the application to load it.` }] : [];
+  return { ...result, checks: [...result.checks, ...stale], plugin_version: runtimeVersion };
 }
 
 /** Standard MCP stdio only: no channel capability, HTTP listener, or shell tool. */
@@ -293,7 +305,6 @@ export async function runMcpServer({ input = process.stdin, output = process.std
       const fromClaude = Boolean(env.CLAUDE_CODE_MESSAGING_SOCKET) ||
         fs.existsSync(path.join(claudeRegistry, `${process.ppid}.json`));
       if (env.CODEX_APP_TOOLS_PIPE_PATH && !fromClaude) {
-        const { publishCodexHost, getCodexHost } = await import('../lib/codex-host.mjs');
         const threadId = env.CODEX_THREAD_ID || getCodexHost({ stateDir: defaultStateDir({ env }) })?.threadId;
         if (threadId) publishCodexHost({ stateDir: defaultStateDir({ env }),
           pipePath: env.CODEX_APP_TOOLS_PIPE_PATH, threadId });
