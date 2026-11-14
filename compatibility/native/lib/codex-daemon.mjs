@@ -277,9 +277,9 @@ async function writeInput(connection, method, params, signal) {
 }
 
 // Matched on BOTH the JSON-RPC code and an anchored message, so an unrelated internal error
-// that merely mentions a turn can never trigger the fallback. Values recorded by the supervised
-// steering probe (2026-10-13): an idle thread answers "no active turn to steer", a wrong turn id
-// answers "expected active turn id `X` but found `Y`", both with code -32600.
+// that merely mentions a turn can never trigger the fallback. The daemon answers a steer of an idle
+// thread with "no active turn to steer" and a wrong turn id with "expected active turn id `X` but
+// found `Y`", both with code -32600.
 const STEER_STALE = { code: -32600, pattern: /^(no active turn to steer|expected active turn id)/i };
 
 function activeTurnId(thread) {
