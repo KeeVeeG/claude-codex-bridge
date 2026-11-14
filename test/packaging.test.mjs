@@ -72,15 +72,18 @@ test('canonical Agent Plugins metadata generates the checked-in native adapters 
   assert.equal(claude.plugins[0].source, './compatibility/native');
 });
 
-test('every manifest description says terminal sessions are supported, not Desktop only', () => {
+// The bridge serves every Codex and Claude Code client, so no listing may read as one client's add-on.
+test('manifest and catalog texts cover every client, not Desktop only', () => {
   const { manifest, files } = checkManifests(root);
   const face = manifest.extensions['com.openai'].interface;
-  for (const text of [manifest.description, face.shortDescription, face.longDescription, ...face.defaultPrompt.slice(1, 2),
-    files['.codex-plugin/plugin.json'].description, files['.codex-plugin/plugin.json'].interface.longDescription,
-    files['.claude-plugin/plugin.json'].description]) assert.match(text, /terminal/i, text);
-  assert.ok(manifest.keywords.includes('terminal'));
-  const claude = JSON.parse(fs.readFileSync(path.join(root, '.claude-plugin/marketplace.json'), 'utf8'));
-  for (const text of [claude.description, claude.plugins[0].description]) assert.match(text, /terminal/i, text);
+  const codex = files['.codex-plugin/plugin.json'];
+  const catalog = file => JSON.parse(fs.readFileSync(path.join(root, file), 'utf8'));
+  const claudeCatalog = catalog('.claude-plugin/marketplace.json');
+  for (const text of [manifest.description, face.displayName, face.shortDescription, face.longDescription, ...face.defaultPrompt,
+    codex.description, codex.interface.displayName, codex.interface.longDescription, files['.claude-plugin/plugin.json'].description,
+    claudeCatalog.description, claudeCatalog.plugins[0].description, catalog('.agents/plugins/marketplace.json').interface.displayName,
+  ]) assert.doesNotMatch(text, /desktop/i, text);
+  assert.ok(['desktop', 'terminal'].every(keyword => manifest.keywords.includes(keyword)));
 });
 
 test('portable configuration rejects native-only fields, unknown schemas, and reserved environment overrides', () => {

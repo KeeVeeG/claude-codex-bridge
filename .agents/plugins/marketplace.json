@@ -1,12 +1,12 @@
 {
   "name": "keeveeg-desktop-bridge",
-  "interface": { "displayName": "Codex–Claude Desktop Bridge" },
+  "interface": { "displayName": "Codex–Claude Bridge" },
   "plugins": [
     {
       "name": "codex-claude-desktop-bridge",
       "source": {
         "source": "git-subdir",
-        "url": "https://github.com/KeeVeeG/codex-claude-desktop-bridge.git",
+        "url": "https://github.com/KeeVeeG/codex-claude-bridge.git",
         "path": "./compatibility/native",
         "ref": "main"
       },

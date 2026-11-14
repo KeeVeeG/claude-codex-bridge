@@ -241,7 +241,7 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
     fs.writeFileSync(path.join(temporary, '.claude-plugin', 'marketplace.json'), jsonText({
       name: CLAUDE_MARKETPLACE,
       owner: { name: publisherName },
-      plugins: [{ name: PLUGIN_NAME, source: './', description: 'Asynchronous native messages between Codex and Claude Code, in Desktop or a terminal.' }],
+      plugins: [{ name: PLUGIN_NAME, source: './', description: 'Asynchronous two-way messaging between Codex and Claude Code conversations.' }],
     }));
     if (fs.existsSync(destination)) {
       backupDirectory = path.join(pluginsDir, `.${PLUGIN_NAME}.backup-${build}-${randomUUID()}`);

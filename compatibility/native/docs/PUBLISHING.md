@@ -73,9 +73,9 @@ The generated catalogs use `./plugins/codex-claude-desktop-bridge`. Keep that di
 ## Git marketplace
 
 ```powershell
-codex plugin marketplace add https://github.com/KeeVeeG/codex-claude-desktop-bridge.git
+codex plugin marketplace add https://github.com/KeeVeeG/codex-claude-bridge.git
 codex plugin add codex-claude-desktop-bridge@keeveeg-desktop-bridge --json
-claude plugin marketplace add https://github.com/KeeVeeG/codex-claude-desktop-bridge.git
+claude plugin marketplace add https://github.com/KeeVeeG/codex-claude-bridge.git
 claude plugin install codex-claude-desktop-bridge@keeveeg-desktop-bridge --scope user --json
 ```
 

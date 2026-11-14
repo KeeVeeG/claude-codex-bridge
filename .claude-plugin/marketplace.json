@@ -1,12 +1,12 @@
 {
   "name": "keeveeg-desktop-bridge",
-  "description": "Asynchronous messaging between Codex and Claude Code, in Desktop or a terminal.",
+  "description": "Asynchronous two-way messaging between Codex and Claude Code conversations.",
   "owner": { "name": "KeeVeeG" },
   "plugins": [
     {
       "name": "codex-claude-desktop-bridge",
       "source": "./compatibility/native",
-      "description": "Send direct native messages between Codex (Desktop tasks or terminal sessions) and Claude Code (Desktop or terminal sessions)."
+      "description": "Asynchronous two-way messaging between Codex and Claude Code conversations."
     }
   ]
 }

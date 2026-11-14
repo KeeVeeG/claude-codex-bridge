@@ -121,7 +121,7 @@ function nativeRecords(directory) {
   return records;
 }
 
-/** List live native Claude Code Desktop and CLI sessions without exposing credentials or endpoints. */
+/** List live native Claude Code sessions without exposing credentials or endpoints. */
 export function discoverClaudeSessions({ registryDir } = {}) {
   let directory;
   try { directory = registryLocation(registryDir); } catch (error) {

@@ -291,7 +291,7 @@ async function bridgeDoctor(context, config) {
   const checks = [];
   const add = (name, status, detail) => checks.push({ name, status, detail });
   add('platform', ['win32', 'darwin'].includes(config.platform) ? 'pass' : 'fail',
-    config.platform === 'win32' ? 'Codex Desktop and Claude Code Desktop/CLI transports are supported on Windows.'
+    config.platform === 'win32' ? 'Codex and Claude Code transports are supported on Windows.'
       : config.platform === 'darwin' ? 'macOS uses Claude Unix inboxes and an operator-configured Codex SSH host.'
       : 'Claude process identity verification is supported on Windows and macOS.');
   checks.push({ name: 'state_directory', ...inspectStateDirectory(config.stateDir) });
@@ -305,10 +305,10 @@ async function bridgeDoctor(context, config) {
     add('caller', 'pass', 'The calling conversation has a verified runtime identity.');
   } catch {
     add('caller', 'fail', application === 'unknown'
-      ? 'No caller identity is available. Run this tool from the intended Codex Desktop task or Claude Code Desktop/CLI session.'
+      ? 'No caller identity is available. Run this tool from the intended Codex or Claude Code conversation.'
       : application === 'codex'
       ? 'This call has no valid Codex task context. Run the tool from an open Codex task with the bridge enabled.'
-      : 'The direct Claude parent session could not be verified. Open the bridge in the intended Claude Code Desktop/CLI session.');
+      : 'The direct Claude parent session could not be verified. Open the bridge in the intended Claude Code session.');
   }
   checkCancellation(signal);
   let acceptedContext = false;
@@ -387,8 +387,8 @@ async function bridgeDoctor(context, config) {
   try {
     sessions = discoverClaudeSessions({ registryDir: config.registryDir });
     add('claude_registry', sessions.length ? 'pass' : 'fail', sessions.length
-      ? 'Live Claude Code Desktop/CLI sessions are registered.'
-      : 'No live Claude Code Desktop/CLI session with an inbox is registered. Open the intended session and check its Peer address in /status.');
+      ? 'Live Claude Code sessions are registered.'
+      : 'No live Claude Code session with an inbox is registered. Open the intended session and check its Peer address in /status.');
   } catch {
     add('claude_registry', 'fail', 'The Claude session registry is unreadable or invalid. Check Claude configuration and reopen its Code session.');
   }
@@ -412,7 +412,7 @@ async function bridgeDoctor(context, config) {
   add('claude_inbox', inboxAvailable ? 'pass' : claudeIncomplete ? 'warning' : 'fail', inboxAvailable
     ? 'A verified Claude inbox accepts local connections. This check sent no message.'
     : claudeIncomplete ? 'Some Claude inboxes were not checked within the diagnostic time budget. Availability is inconclusive.'
-    : 'No checked Claude inbox is available with a valid session key. Reopen the intended Claude Code Desktop/CLI session.');
+    : 'No checked Claude inbox is available with a valid session key. Reopen the intended Claude Code session.');
   return { application, ready: (acceptedContext || (daemonReachable && terminalSessions > 0)) && inboxAvailable && checks.every(check => check.status !== 'fail'), checks };
 }
 

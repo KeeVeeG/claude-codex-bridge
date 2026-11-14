@@ -116,12 +116,12 @@ export function buildPackages({ sourceRoot = root, outputDir = path.join(root, '
           realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) throw new Error(`Invalid runtime entry: ${relative}`);
       put(safeChild(portable, relative), fs.readFileSync(filename));
     }
-    const codexCatalog = { name: catalogName, interface: { displayName: 'KeeVeeG Desktop Bridge' }, plugins: [{
+    const codexCatalog = { name: catalogName, interface: { displayName: 'Codex–Claude Bridge' }, plugins: [{
       name: PLUGIN_NAME, source: { source: 'local', path: `./plugins/${PLUGIN_NAME}` },
       policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' }, category: 'Productivity',
     }] };
     const claudeCatalog = { name: catalogName, owner: { name: 'KeeVeeG' },
-      description: 'Asynchronous messages between Codex and Claude Code, in Desktop or a terminal.',
+      description: 'Asynchronous two-way messaging between Codex and Claude Code conversations.',
       plugins: [{ name: PLUGIN_NAME, source: `./plugins/${PLUGIN_NAME}` }],
     };
     put(path.join(marketplaceSource, '.agents', 'plugins', 'marketplace.json'), json(codexCatalog));

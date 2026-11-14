@@ -1,8 +1,8 @@
-# Codex–Claude Desktop Bridge
+# Codex–Claude Bridge
 
-[![Windows and macOS CI](https://github.com/KeeVeeG/codex-claude-desktop-bridge/actions/workflows/test.yml/badge.svg)](https://github.com/KeeVeeG/codex-claude-desktop-bridge/actions/workflows/test.yml)
+[![Windows and macOS CI](https://github.com/KeeVeeG/codex-claude-bridge/actions/workflows/test.yml/badge.svg)](https://github.com/KeeVeeG/codex-claude-bridge/actions/workflows/test.yml)
 
-Asynchronous, two-way messaging between **Codex** conversations (Desktop tasks or terminal sessions) and local **Claude Code** sessions (terminal, Claude Desktop's Code tab, or VS Code), through ordinary MCP tools. Either side can start, ask, share progress, or reply whenever useful. Every message names its exact recipient: there is no pairing step, deadline, or mandatory reply. The bridge carries text and leaves its meaning to the participants.
+Two-way messaging between any **Codex** conversation and any **Claude Code** conversation, in desktop apps and terminals alike: Codex Desktop or Codex CLI on one side, Claude Code in a terminal, Claude Desktop, or VS Code on the other. A Codex Desktop task can message a Claude Code session in a terminal, and a terminal Codex session can write to Claude in VS Code or Claude Desktop. Either side can start, ask, share progress, or reply whenever useful. Every message names its exact recipient: there is no pairing step, deadline, or mandatory reply. The bridge carries text through ordinary MCP tools and leaves its meaning to the participants.
 
 - **Windows:** Codex Desktop through its local app-tools pipe, Codex CLI through the local app-server daemon or `codex queue`, Claude through its native session inbox.
 - **macOS:** Claude through its Unix inbox; Codex only through a configured SSH host (see [macOS SSH host](#macos-ssh-host)). The merged macOS implementation has not had a live smoke test yet.
@@ -10,7 +10,7 @@ Asynchronous, two-way messaging between **Codex** conversations (Desktop tasks o
 ## Requirements
 
 - Node.js 20+ on `PATH`; no npm dependencies.
-- **Windows:** Codex Desktop or Codex CLI, and a local Claude Code session with a live messaging inbox. Claude Desktop is optional.
+- **Windows:** Codex Desktop or Codex CLI, and a local Claude Code session (CLI, Claude Desktop, or VS Code) with a live messaging inbox.
 - **macOS:** a local Claude Code session and an authenticated SSH alias for the Codex host.
 
 Out of scope: WSL, Linux (sends fail closed), remote Claude sessions, and Claude's hosted Chat conversations.
@@ -18,8 +18,8 @@ Out of scope: WSL, Linux (sends fail closed), remote Claude sessions, and Claude
 ## Installation
 
 ```powershell
-git clone https://github.com/KeeVeeG/codex-claude-desktop-bridge.git
-cd codex-claude-desktop-bridge
+git clone https://github.com/KeeVeeG/codex-claude-bridge.git
+cd codex-claude-bridge
 node scripts/install.mjs
 ```
 
@@ -30,9 +30,9 @@ For Claude it also adds exactly one rule to `permissions.allow` in the user `set
 Alternatively, install from this repository's Git marketplace. That route does not add the Claude permission; add the tool in `/permissions` yourself.
 
 ```powershell
-codex plugin marketplace add https://github.com/KeeVeeG/codex-claude-desktop-bridge.git
+codex plugin marketplace add https://github.com/KeeVeeG/codex-claude-bridge.git
 codex plugin add codex-claude-desktop-bridge@keeveeg-desktop-bridge
-claude plugin marketplace add https://github.com/KeeVeeG/codex-claude-desktop-bridge.git
+claude plugin marketplace add https://github.com/KeeVeeG/codex-claude-bridge.git
 claude plugin install codex-claude-desktop-bridge@keeveeg-desktop-bridge --scope user
 ```
 
@@ -95,11 +95,11 @@ Run `bridge_doctor` first; it sends nothing and writes nothing.
   - *belongs to earlier Codex Desktop launches* only: open a Codex Desktop task with the bridge enabled.
 - **Each app sees different state.** Both must use `~/.local/share/codex-claude-desktop-bridge`. The installer pins it for both, which avoids Windows MSIX virtualization of `LOCALAPPDATA`; an explicit `CODEX_CLAUDE_BRIDGE_STATE_DIR` must be the same for both.
 - **Claude blocks `send_to_codex`.** Add the permission above, or switch the Code tab to **Manual** and approve the prompt. A `Bash` rule does not apply to MCP tools.
-- **Claude does not receive.** `/status` must show a `Peer address`; `--bare` sessions have no inbox. Claude's `crossSessionInbound` setting can hold or refuse messages after a successful write. The bridge marks its messages `from-mode="bypass"` so Bypass sessions do not hold them silently ([issue #1](https://github.com/KeeVeeG/codex-claude-desktop-bridge/issues/1)); it never changes your inbound settings.
+- **Claude does not receive.** `/status` must show a `Peer address`; `--bare` sessions have no inbox. Claude's `crossSessionInbound` setting can hold or refuse messages after a successful write. The bridge marks its messages `from-mode="bypass"` so Bypass sessions do not hold them silently ([issue #1](https://github.com/KeeVeeG/codex-claude-bridge/issues/1)); it never changes your inbound settings.
 
 ## Compatibility
 
-Validated locally with Claude Desktop 2.7032.0.0, Claude Code 2.1.284–2.1.299, Codex backend 0.155.0-alpha.16.3 with `codex-app-tools` 0.1.4, and Codex CLI/daemon 0.162.1. These are observed versions, not a guarantee: the bridge relies on private application interfaces that can change. The macOS route was smoke-tested by the author of [PR #2](https://github.com/KeeVeeG/codex-claude-desktop-bridge/pull/2) before later changes; the merged version is covered only by simulated transport tests.
+Validated locally with Claude Desktop 2.7032.0.0, Claude Code 2.1.284–2.1.299, Codex backend 0.155.0-alpha.16.3 with `codex-app-tools` 0.1.4, and Codex CLI/daemon 0.162.1. These are observed versions, not a guarantee: the bridge relies on private application interfaces that can change. The macOS route was smoke-tested by the author of [PR #2](https://github.com/KeeVeeG/codex-claude-bridge/pull/2) before later changes; the merged version is covered only by simulated transport tests.
 
 ## Security and privacy
 

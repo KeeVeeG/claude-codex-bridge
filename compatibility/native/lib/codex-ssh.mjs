@@ -201,7 +201,7 @@ async function connected(options) {
   try {
     await rpc.ready;
     await rpc.request('initialize', { clientInfo: { name: 'codex_claude_desktop_bridge',
-      title: 'Codex–Claude Desktop Bridge', version: runtimeVersion } });
+      title: 'Codex–Claude Bridge', version: runtimeVersion } });
     rpc.notify('initialized'); return rpc;
   } catch (error) { rpc.close(); throw error; }
 }

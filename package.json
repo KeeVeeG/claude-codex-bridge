@@ -5,15 +5,15 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/KeeVeeG/codex-claude-desktop-bridge.git"
+    "url": "git+https://github.com/KeeVeeG/codex-claude-bridge.git"
   },
-  "homepage": "https://github.com/KeeVeeG/codex-claude-desktop-bridge#readme",
+  "homepage": "https://github.com/KeeVeeG/codex-claude-bridge#readme",
   "bugs": {
-    "url": "https://github.com/KeeVeeG/codex-claude-desktop-bridge/issues"
+    "url": "https://github.com/KeeVeeG/codex-claude-bridge/issues"
   },
   "private": true,
   "type": "module",
-  "description": "Asynchronous Codex and Claude Code messaging on Windows and through a configured SSH host on macOS",
+  "description": "Asynchronous two-way messaging between Codex and Claude Code conversations.",
   "engines": {
     "node": ">=20"
   },

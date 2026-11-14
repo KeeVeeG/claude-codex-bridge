@@ -1,13 +1,11 @@
 ---
 name: claude-bridge
-description: Find Codex and local Claude Code CLI or Desktop Code conversations by title, then send asynchronous messages through MCP tools. Supports native Windows transports and a configured macOS SSH route to Codex. Either side can initiate and reply when its transport is available. Only main conversations use the bridge; subagents must not call its tools.
+description: Find Codex and local Claude Code conversations by title, in desktop apps or terminals, then send asynchronous messages through MCP tools. Supports native Windows transports and a configured macOS SSH route to Codex. Either side can initiate and reply when its transport is available. Only main conversations use the bridge; subagents must not call its tools.
 ---
 
-# Codex–Claude Desktop Bridge
+# Codex–Claude Bridge
 
-On macOS, `CODEX_CLAUDE_BRIDGE_SSH_HOST` pins outbound Codex discovery and delivery to one SSH config alias. Use a supported local Claude Code session, not cloud Chat. Discovery lists only that server's loaded chats with `source: "ssh"`; `transport: "auto"` and `"ssh"` both use that host. `desktop` and `terminal` are rejected while SSH is configured, even if a local chat has the same ID. The destination must already be loaded and idle. If it is unavailable, ask the user to open the intended chat on its configured SSH connection or wait for its active work to finish. Do not start a server, call `thread/resume`, move a chat, weaken SSH checks, change permissions, or switch to a local transport to make a send succeed. Windows uses its existing native routes. The merged macOS implementation still needs live verification; do not describe simulated checks as a successful live exchange.
-
-Use the `codex-claude-desktop-bridge` MCP tools. Either agent can find a conversation in the other application and send a message directly to its exact ID. Any Codex task can message multiple Claude Code sessions, and any Claude Code session can message multiple Codex tasks. Messages can contain information, questions, proposed work, or findings; acknowledgements and replies are optional. Neither side must wait for a response before sending another useful message.
+Use the `codex-claude-desktop-bridge` MCP tools. Any Codex conversation and any Claude Code conversation can reach each other, whether it runs in a desktop app or a terminal; Claude Code also in VS Code. Either agent can find a conversation on the other side and send a message directly to its exact ID. Any Codex task can message multiple Claude Code sessions, and any Claude Code session can message multiple Codex tasks. Messages can contain information, questions, proposed work, or findings; acknowledgements and replies are optional. Neither side must wait for a response before sending another useful message.
 
 Only a main conversation uses the bridge. A subagent, such as a Codex task spawned by another task or a Claude Code subagent started by its parent session, must not call any bridge tool, including discovery, `bridge_status`, and the send tools. The bridge does not address subagents: a reply would reach the main conversation instead, and a subagent's call can disrupt later delivery to its parent. Return the finding, the intended recipient, and the proposed message to the parent conversation, which decides whether to send it.
 
@@ -25,7 +23,7 @@ A visible skill does not prove the MCP server connected. If the bridge tools rem
 
 If tools are available but discovery or delivery fails, call `bridge_doctor` to inspect caller identity, state-directory readiness, and local transport compatibility. It can report missing sender context without sending a message or changing settings. Use its failed checks to choose the relevant recovery step; transport readiness does not prove a recipient has read anything.
 
-When the user wants to browse Claude conversations, read exchanged bridge messages, or type a message manually, open the `Claude` conversation panel beside the current Codex chat. The panel binds actions to that verified chat and intentionally has no global/sidebar entrypoint. Its history covers the exact Codex/Claude pair and its catalog includes saved local Code conversations; sending requires the selected conversation's live CLI, VS Code, or Desktop Code inbox. The app-only history/send tools are panel actions. A manual-send notice in Codex reports the user's action and message text as context, not as a new task for Codex. Do not repeat a Claude send merely because its Codex notice failed.
+When the user wants to browse Claude conversations, read exchanged bridge messages, or type a message manually, open the `Claude` conversation panel beside the current Codex chat. The panel binds actions to that verified chat and intentionally has no global/sidebar entrypoint. Its history covers the exact Codex/Claude pair and its catalog includes saved local Code conversations; sending requires the selected conversation's live inbox. The app-only history/send tools are panel actions. A manual-send notice in Codex reports the user's action and message text as context, not as a new task for Codex. Do not repeat a Claude send merely because its Codex notice failed.
 
 ## Start from Codex
 
@@ -45,6 +43,10 @@ For the Windows local routes, `desktop` sends directly through Desktop app-tools
 
 The service verifies the sending Claude session through its live runtime registration. You do not need connection IDs, routing tokens, a preceding message, or a pending assignment. A normal answer in Claude's own chat is not automatically forwarded.
 
+## macOS SSH route
+
+On macOS, `CODEX_CLAUDE_BRIDGE_SSH_HOST` pins outbound Codex discovery and delivery to one SSH config alias. Use a supported local Claude Code session, not cloud Chat. Discovery lists only that server's loaded chats with `source: "ssh"`; `transport: "auto"` and `"ssh"` both use that host. `desktop` and `terminal` are rejected while SSH is configured, even if a local chat has the same ID. The destination must already be loaded and idle. If it is unavailable, ask the user to open the intended chat on its configured SSH connection or wait for its active work to finish. Do not start a server, call `thread/resume`, move a chat, weaken SSH checks, change permissions, or switch to a local transport to make a send succeed. The merged macOS implementation still needs live verification; do not describe simulated checks as a successful live exchange.
+
 ## Replies and delivery
 
 Each message identifies its verified source conversation. To reply, use that source's exact `thread_id` or `session_id` as the destination in the corresponding send tool. Do not infer a destination from the most recent conversation or treat a shared project folder as an address. Another sender may message the same recipient at any time. Do not require a response to an informational message or treat silence as a failure.
@@ -53,7 +55,7 @@ Each message identifies its verified source conversation. To reply, use that sou
 
 Claude's `crossSessionInbound` controls can hold or refuse a message after a successful transport write. The bridge cannot confirm either outcome. Check the receiving session's normal approval flow and effective settings; do not promise delivery to the model based only on `bridge_status`.
 
-The native envelope preserves v0.3.3's `from-mode="bypass"` compatibility fix for issue #1, for both Desktop and CLI on every supported platform. It does not change the receiver's mode or grant tool permissions. A prompting receiver may require inbound approval; explicit hold/refuse rules still apply. Do not remove this field as part of an unrelated transport change or change inbound settings automatically.
+The native envelope preserves v0.3.3's `from-mode="bypass"` compatibility fix for issue #1, for every Claude Code client on every supported platform. It does not change the receiver's mode or grant tool permissions. A prompting receiver may require inbound approval; explicit hold/refuse rules still apply. Do not remove this field as part of an unrelated transport change or change inbound settings automatically.
 
 Explicit message IDs contain 1–100 ASCII letters, digits, underscores, or hyphens and exclude reserved JavaScript object-property names. Omit the ID for an automatically generated UUID. MCP cancellation prevents a queued send from starting; cancellation after a transport write leaves an uncertain result. Inspect delivery before retrying, even if the cancelled call returned no response.
 
