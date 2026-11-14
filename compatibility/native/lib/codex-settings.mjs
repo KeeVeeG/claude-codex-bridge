@@ -5,7 +5,7 @@ import path from 'node:path';
 export const COMPOSER_ENTER_BEHAVIORS = ['enter', 'cmdIfMultiline', 'cmdAlways'];
 const maxConfigBytes = 256 * 1024;
 
-function codexHome({ env = process.env, homeDir = os.homedir() } = {}) {
+export function codexHome({ env = process.env, homeDir = os.homedir() } = {}) {
   const configured = typeof env.CODEX_HOME === 'string' && env.CODEX_HOME.trim();
   return path.resolve(configured || path.join(homeDir, '.codex'));
 }

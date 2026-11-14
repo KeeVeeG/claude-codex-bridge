@@ -49,18 +49,23 @@ function oldInstallation(t) {
     { id: `${oldPlugin}@${oldLocal}`, scope: 'user' },
     { id: `${oldPlugin}@${oldCatalog}`, scope: 'project', projectPath: homeDir },
     { id: `${oldPlugin}@custom`, scope: 'local', projectPath: homeDir },
-  ], marketplaces: [{ name: oldLocal }, { name: oldCatalog }, { name: 'keep' }] },
-  codex: { plugins: [{ pluginId: `${oldPlugin}@personal` }, { pluginId: `${oldPlugin}@${oldCatalog}` }], marketplaces: [{ name: oldCatalog }, { name: 'keep' }] } });
+  ], marketplaces: [{ name: oldLocal }, { name: oldCatalog }, { name: 'keep' }] } });
+  const codexConfig = path.join(homeDir, '.codex', 'config.toml');
+  fs.mkdirSync(path.dirname(codexConfig), { recursive: true });
+  fs.writeFileSync(codexConfig, ['model = "kept"\n', `[marketplaces.${oldCatalog}]\nsource_type = "git"\n`, "[marketplaces.keep]\nsource_type = \"local\"\nsource = 'C:\\missing'\n",
+    `[plugins."${oldPlugin}@personal"]\nenabled = true\n`, `[plugins.'${oldPlugin}@${oldCatalog}']\nenabled = false\n`, '[plugins."unrelated@keep"]\nenabled = true\n'].join('\n'));
   const logs = [];
   const options = { homeDir, env: {}, log: value => logs.push(value), execute(app, args, { cwd = homeDir } = {}) {
     const result = spawnSync(process.execPath, [path.join(root, 'test', 'fixtures', 'fake-plugin-cli.mjs'), homeDir, app, ...args],
       { cwd, encoding: 'utf8', windowsHide: true });
-    assert.equal(result.status, 0, result.stderr); return result.stdout;
+    if (result.status !== 0) throw new Error(`${app} ${args.slice(0, 3).join(' ')} failed (${result.status}).\n${result.stderr.trim()}`);
+    return result.stdout;
   } };
-  return { ...setup, staging, backup, marketplacePath, settingsPath, stateFile, logs, options };
+  return { ...setup, staging, backup, marketplacePath, settingsPath, stateFile, codexConfig, logs, options };
 }
 
 test('installer migrates every released artifact through fake CLIs, preserving choices and records; repeated migration is a no-op', async t => {
+  // The fake Codex cannot list plugins, as with an unreadable unrelated marketplace.
   const f = oldInstallation(t);
   const beforeCatalog = fs.readFileSync(f.marketplacePath, 'utf8');
   const prepared = await main([], f.options);
@@ -79,13 +84,38 @@ test('installer migrates every released artifact through fake CLIs, preserving c
   assert.equal(cli.calls.filter(call => call.args[1] === 'marketplace' && call.args[2] === 'remove').length, 3);
   assert.ok(cli.calls.some(call => call.app === 'claude' && call.args.includes('local') && call.cwd === f.homeDir));
   assert.ok(cli.claude.marketplaces.some(entry => entry.name === 'keep'));
-  assert.ok(cli.codex.marketplaces.some(entry => entry.name === 'keep'));
+  assert.deepEqual(fs.readFileSync(f.codexConfig, 'utf8').match(/^\[.+\]$/gm),
+    ['[marketplaces.keep]', '[plugins."unrelated@keep"]', '[plugins."bridge-claude-codex@personal"]']);
+  assert.match(fs.readFileSync(f.codexConfig, 'utf8'), /^model = "kept"/);
   assert.ok(f.logs.some(line => line.includes('Moved bridge state')));
   assert.ok(f.logs.some(line => line.includes('Removed old bridge entry')));
   const before = snapshot(f.homeDir); const callCount = cli.calls.length; f.logs.length = 0;
   migrateLegacyInstallation(f.options);
   assert.deepEqual(snapshot(f.homeDir), before); assert.deepEqual(f.logs, []);
   assert.ok(JSON.parse(fs.readFileSync(f.stateFile)).calls.slice(callCount).every(call => call.args.includes('list')));
+});
+
+for (const first of ['--claude', '--codex']) test(`${first} alone keeps the old staged files the other application still installs from`, async t => {
+  const f = oldInstallation(t);
+  put(path.join(f.homeDir, '.claude', 'plugins', 'known_marketplaces.json'), { [oldLocal]: { source: { source: 'directory', path: f.staging } } });
+  await main([first], f.options);
+  assert.ok(fs.existsSync(f.staging)); assert.equal(fs.existsSync(f.backup), false);
+  assert.ok(f.logs.some(line => line.startsWith(`Kept old staged bridge files for ${first === '--claude' ? 'Codex' : 'Claude'}`)));
+  await main([first === '--claude' ? '--codex' : '--claude'], f.options);
+  assert.equal(fs.existsSync(f.staging), false);
+});
+
+test('an old Codex plugin held open by running Codex is turned off, and a later run removes it', async t => {
+  const f = oldInstallation(t); const inUse = path.join(f.homeDir, 'codex-files-in-use'); fs.writeFileSync(inUse, '');
+  await main(['--codex'], f.options);
+  const config = fs.readFileSync(f.codexConfig, 'utf8');
+  assert.match(config, new RegExp(`\\[plugins\\."${oldPlugin}@personal"\\]\\nenabled = false\\n`));
+  assert.match(config, new RegExp(`\\[plugins\\.'${oldPlugin}@${oldCatalog}'\\]\\nenabled = false\\n`));
+  assert.match(config, /\[plugins\."bridge-claude-codex@personal"\]\nenabled = true/);
+  assert.ok(f.logs.some(line => line.startsWith(`Turned off codex plugin ${oldPlugin}@personal`) && line.includes('os error 32')));
+  fs.rmSync(inUse);
+  await main(['--codex'], f.options);
+  assert.doesNotMatch(fs.readFileSync(f.codexConfig, 'utf8'), new RegExp(oldPlugin));
 });
 
 for (const field of ['ask', 'deny']) test(`legacy ${field} blocks the renamed send tool after migration`, async t => {

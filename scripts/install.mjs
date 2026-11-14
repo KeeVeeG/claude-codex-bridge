@@ -9,6 +9,7 @@ import { defaultStateDir, withStateLock } from '../lib/store.mjs';
 import { defaultStatePath } from '../lib/state-directory.mjs';
 import { legacyEnvironmentWarnings } from '../lib/legacy-environment.mjs';
 import { validateSshHostAlias } from '../lib/codex-ssh.mjs';
+import { codexHome } from '../lib/codex-settings.mjs';
 import { PLUGIN_NAME, COMMON_RUNTIME_FILES, NATIVE_RUNTIME_FILES, checkManifests, compatibilityFiles } from './manifests.mjs';
 
 export { PLUGIN_NAME };
@@ -120,9 +121,12 @@ function writeNewFile(filename, content) {
 }
 
 /** Preserve the prior JSON as a sibling backup, then atomically replace its contents. */
-export function writeJsonAtomic(filename, value, { expectedPrevious, label = 'marketplace' } = {}) {
+export function writeJsonAtomic(filename, value, options) {
+  return writeTextAtomic(filename, jsonText(value), options);
+}
+
+function writeTextAtomic(filename, next, { expectedPrevious, label = 'marketplace' } = {}) {
   refuseLink(filename);
-  const next = jsonText(value);
   const previous = readRawIfPresent(filename);
   if (expectedPrevious !== undefined && previous !== expectedPrevious) {
     throw new Error(`The ${label} changed during installation. No replacement was made; retry from the updated file.`);
@@ -230,37 +234,107 @@ function migrateClaudeSettings({ homeDir, env, log }) {
   });
 }
 
+const isLegacyPlugin = id => typeof id === 'string' && (id === LEGACY_PLUGIN || id.startsWith(`${LEGACY_PLUGIN}@`));
+
+const codexConfigPath = ({ homeDir, env }) => path.join(codexHome({ env, homeDir }), 'config.toml');
+
+/** The `[plugins.<id>]` or `[marketplaces.<name>]` table a Codex configuration line opens. */
+function codexTable(line) {
+  const match = line.trim().match(/^\[(plugins|marketplaces)\.(?:"([^"]+)"|'([^']+)'|([\w-]+))\]\s*(?:#.*)?$/);
+  return match && { kind: match[1], name: match[2] ?? match[3] ?? match[4] };
+}
+
+/** Plugin IDs and marketplace names recorded as tables in Codex's own configuration. */
+function codexConfigTables({ homeDir, env }) {
+  const tables = { plugins: [], marketplaces: [] };
+  for (const line of (readRawIfPresent(codexConfigPath({ homeDir, env })) ?? '').split(/\r?\n/)) {
+    const table = codexTable(line);
+    if (table) tables[table.kind].push(table.name);
+  }
+  return tables;
+}
+
+/** Set `enabled = false` in one plugin's Codex table, keeping the previous file as a backup. */
+function disableCodexPlugin({ homeDir, env, id }) {
+  const filename = codexConfigPath({ homeDir, env });
+  const previous = readRawIfPresent(filename) ?? '';
+  const lines = previous.split(/(?<=\n)/);
+  const start = lines.findIndex(line => { const table = codexTable(line); return table?.kind === 'plugins' && table.name === id; });
+  if (start < 0) return null;
+  const eol = previous.includes('\r\n') ? '\r\n' : '\n';
+  if (!lines[start].endsWith('\n')) lines[start] += eol;
+  let end = lines.findIndex((line, index) => index > start && line.trimStart().startsWith('['));
+  if (end < 0) end = lines.length;
+  const at = lines.findIndex((line, index) => index > start && index < end && /^\s*enabled\s*=/.test(line));
+  if (at < 0) lines.splice(start + 1, 0, `enabled = false${eol}`);
+  else lines[at] = `enabled = false${lines[at].match(/\r?\n$/)?.[0] ?? ''}`;
+  return writeTextAtomic(filename, lines.join(''), { expectedPrevious: previous, label: 'Codex configuration' });
+}
+
+/** Whether a catalog outside this run may still install from the old staged files; unreadable counts as yes. */
+function catalogListsLegacy(filename, lists) {
+  try { return Boolean(lists(readJson(filename))); } catch (error) { return error.code !== 'ENOENT'; }
+}
+
 /** Remove released legacy registrations through supported non-interactive CLIs only. */
 export function migrateLegacyInstallation({ homeDir = os.homedir(), env = process.env,
   execute = run, log = console.log, claude = true, codex = true } = {}) {
   checkEnvironment(env);
-  for (const app of ['claude', 'codex']) {
-    if (!(app === 'claude' ? claude : codex)) continue;
-    const installed = readList(execute(app, ['plugin', 'list', '--json']), app === 'claude' ? 'plugins' : 'installed');
-    for (const entry of installed) {
-      const selector = entry.pluginId || entry.id || (entry.name?.includes('@') ? entry.name
-        : entry.name && (entry.marketplaceName || entry.marketplace) ? `${entry.name}@${entry.marketplaceName || entry.marketplace}` : entry.name);
-      if (typeof selector !== 'string' || !(selector === LEGACY_PLUGIN || selector.startsWith(`${LEGACY_PLUGIN}@`))) continue;
-      const scope = app === 'claude' ? ['--scope', entry.scope || 'user'] : [];
-      execute(app, ['plugin', app === 'claude' ? 'uninstall' : 'remove', selector, ...scope, '--json'],
-        entry.projectPath ? { cwd: entry.projectPath } : undefined);
-      log(`Removed ${app} plugin ${selector}${scope.length ? ` (${entry.scope || 'user'})` : ''}`);
+  // Find everything before removing anything, so a missing CLI or a failed listing leaves the earlier installation intact.
+  for (const app of ['claude', 'codex']) if (app === 'claude' ? claude : codex) execute(app, ['--version']);
+  const removals = [];
+  const marketplace = (app, name) => ({ app, args: ['plugin', 'marketplace', 'remove', name, '--json'], done: `Removed ${app} marketplace ${name}` });
+  if (claude) {
+    for (const entry of readList(execute('claude', ['plugin', 'list', '--json']), 'plugins')) {
+      const selector = entry.id || (entry.name?.includes('@') || !entry.marketplace ? entry.name : `${entry.name}@${entry.marketplace}`);
+      if (!isLegacyPlugin(selector)) continue;
+      const scope = entry.scope || 'user';
+      removals.push({ app: 'claude', args: ['plugin', 'uninstall', selector, '--scope', scope, '--json'],
+        options: entry.projectPath ? { cwd: entry.projectPath } : undefined, done: `Removed claude plugin ${selector} (${scope})` });
     }
-    const marketplaces = readList(execute(app, ['plugin', 'marketplace', 'list', '--json']), 'marketplaces');
-    for (const entry of marketplaces) {
-      if (entry.name !== LEGACY_MARKETPLACE && !(app === 'claude' && entry.name === LEGACY_LOCAL)) continue;
-      execute(app, ['plugin', 'marketplace', 'remove', entry.name, '--json']);
-      log(`Removed ${app} marketplace ${entry.name}`);
+    for (const entry of readList(execute('claude', ['plugin', 'marketplace', 'list', '--json']), 'marketplaces')) {
+      if (entry.name === LEGACY_MARKETPLACE || entry.name === LEGACY_LOCAL) removals.push(marketplace('claude', entry.name));
+    }
+  }
+  if (codex) {
+    // Codex refuses to list plugins while any configured marketplace is unreadable, even an
+    // unrelated one, but still adds and removes them. Its configuration records both.
+    const tables = codexConfigTables({ homeDir, env });
+    for (const id of tables.plugins.filter(isLegacyPlugin)) {
+      removals.push({ app: 'codex', args: ['plugin', 'remove', id, '--json'], done: `Removed codex plugin ${id}`,
+        // A running Codex keeps the old plugin's files open, so Codex cannot delete them yet.
+        // Turned off, the plugin no longer starts, and the next installer run removes it.
+        fallback(error) {
+          const backup = disableCodexPlugin({ homeDir, env, id });
+          log(`Turned off codex plugin ${id}: Codex could not remove it now (${error.message.trim().split('\n').at(-1).trim()}). After restarting Codex, run the installer again to remove it.`);
+          if (backup) log(`Previous Codex configuration backup: ${backup}`);
+        } });
+    }
+    if (tables.marketplaces.includes(LEGACY_MARKETPLACE)) removals.push(marketplace('codex', LEGACY_MARKETPLACE));
+  }
+  for (const { app, args, options, done, fallback } of removals) {
+    try { execute(app, args, options); log(done); } catch (error) {
+      if (!fallback) throw error;
+      fallback(error);
     }
   }
   if (claude) migrateClaudeSettings({ homeDir, env, log });
   const pluginsDir = path.resolve(homeDir, 'plugins');
   if (fs.existsSync(pluginsDir)) {
     refuseLink(pluginsDir);
+    // An application outside this run keeps installing from the old staged files until its own migration.
+    const pending = (!codex && catalogListsLegacy(path.resolve(homeDir, '.agents', 'plugins', 'marketplace.json'),
+      catalog => catalog.plugins?.some?.(entry => entry?.name === LEGACY_PLUGIN)) && 'Codex')
+      || (!claude && catalogListsLegacy(path.join(env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude'), 'plugins', 'known_marketplaces.json'),
+        registry => registry?.[LEGACY_LOCAL]) && 'Claude');
     for (const entry of fs.readdirSync(pluginsDir, { withFileTypes: true })) {
       if (entry.name !== LEGACY_PLUGIN && !entry.name.startsWith(`.${LEGACY_PLUGIN}.backup-`)) continue;
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
       const filename = path.join(pluginsDir, entry.name);
+      if (entry.name === LEGACY_PLUGIN && pending) {
+        log(`Kept old staged bridge files for ${pending}: ${filename}. Run the installer for ${pending} to finish the update.`);
+        continue;
+      }
       // A still-running application can hold the old files open. They are no longer
       // registered anywhere, so a failed removal must not stop the new installation.
       try {

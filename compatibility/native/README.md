@@ -47,7 +47,7 @@ A visible bridge skill does not mean its MCP server connected; if the tools are 
 
 ### Updating from a version before 1.0.0
 
-Version 1.0.0 renamed the plugin from `codex-claude-desktop-bridge` to `bridge-claude-codex`. Run the installer once: it removes the old plugin and its catalogs from both applications, carries your Claude permission rules over to the new tool names with their allow, ask, or deny choice intact, and moves the state folder to `~/.local/share/claude-codex-bridge`. The bridge also moves that folder itself on first start, so marketplace installs keep their history. Environment variables are now named `CLAUDE_CODEX_BRIDGE_*`; the old `CODEX_CLAUDE_BRIDGE_*` names are no longer read, the installer refuses to run while one is set, and `bridge_doctor` names the replacement.
+Version 1.0.0 renamed the plugin from `codex-claude-desktop-bridge` to `bridge-claude-codex`. Run the installer once: it removes the old plugin and its catalogs from both applications, carries your Claude permission rules over to the new tool names with their allow, ask, or deny choice intact, and moves the state folder to `~/.local/share/claude-codex-bridge`. Codex may keep running: if it holds the old plugin's files, the installer turns that plugin off instead, and the next run after restarting Codex deletes it. The bridge also moves that folder itself on first start, so marketplace installs keep their history. Environment variables are now named `CLAUDE_CODEX_BRIDGE_*`; the old `CODEX_CLAUDE_BRIDGE_*` names are no longer read, the installer refuses to run while one is set, and `bridge_doctor` names the replacement.
 
 ### macOS SSH host
 
