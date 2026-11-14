@@ -12,7 +12,7 @@ import { canonicalLocalSocket, localSocketPresence } from './local-socket.mjs';
 import { defaultStateDir, createSession, getSession, recordMessage, finishMessage, getMessages } from './store.mjs';
 import { readComposerEnterBehavior } from './codex-settings.mjs';
 import { openDaemon, listTerminalThreads, readDaemonVersions, readTerminalThread, sendToTerminalThread, normalizeCodexThreadId,
-  queueToTerminalThread, queueRefusal, queueTargetRefusal, TerminalNotLoadedError, DaemonUnavailableError, scrubPaths } from './codex-daemon.mjs';
+  queueToTerminalThread, queueRefusal, queueTargetRefusal, TerminalNotLoadedError, DaemonUnavailableError, NOT_RUNNING_MESSAGE, scrubPaths } from './codex-daemon.mjs';
 import { codexPeerContent } from './codex-peer.mjs';
 import { validateSshHostAlias } from './codex-ssh.mjs';
 
@@ -60,10 +60,11 @@ function sshHost(config) {
     ...(config.sshSpawn ? { spawnImpl: config.sshSpawn } : {}) };
 }
 
-/** A Desktop-only user without the Codex CLI should not see a terminal warning on every listing. */
+/** A Desktop-only user, without the Codex CLI or a running daemon, should not see a terminal warning on every listing;
+ * bridge_doctor still reports it. */
 export function shouldReportTerminalUnavailable(error, desktopSucceeded) {
   return !(desktopSucceeded === true && error instanceof DaemonUnavailableError &&
-    /executable was not found/i.test(error.message));
+    (/executable was not found/i.test(error.message) || error.message === NOT_RUNNING_MESSAGE));
 }
 
 function checkCancellation(signal) {

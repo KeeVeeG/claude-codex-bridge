@@ -24,10 +24,10 @@ test('a JSON-RPC error rejects with its code and message and is not delivery-unk
     error => error.rpcCode === -32600 && /thread not found/.test(error.rpcMessage) && !error.deliveryUnknown);
 });
 
-test('an unreachable daemon is reported as unavailable and is never started', async t => {
+test('a daemon that is not running is reported plainly, without the OS error, and is never started', async t => {
   const setup = await fakeDaemon(t, { unreachable: true });
   await assert.rejects(() => openDaemon({ ...setup.daemon }),
-    error => error instanceof DaemonUnavailableError && /not reachable/.test(error.message));
+    error => error instanceof DaemonUnavailableError && /No Codex daemon is running/.test(error.message) && !/os error/.test(error.message));
 });
 
 test('a missing Codex executable and the kill switch are reported as unavailable', async () => {

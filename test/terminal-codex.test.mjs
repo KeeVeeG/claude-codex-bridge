@@ -9,7 +9,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { canonicalClaudeSocket } from '../lib/claude-sessions.mjs';
 import { executeBridgeTool, shouldReportTerminalUnavailable } from '../lib/bridge-service.mjs';
-import { DaemonUnavailableError } from '../lib/codex-daemon.mjs';
+import { DaemonUnavailableError, NOT_RUNNING_MESSAGE } from '../lib/codex-daemon.mjs';
 import { publishCodexHost } from '../lib/codex-host.mjs';
 import { codexPeerContent } from '../lib/codex-peer.mjs';
 import { fakeDaemon, fakeQueue } from './codex-daemon-helpers.mjs';
@@ -325,6 +325,14 @@ claudeTest('listing fails with both reasons when neither source is available', a
     /Codex Desktop unavailable.*Codex terminal sessions unavailable/s);
 });
 
+claudeTest('listing with Desktop up and no daemon running returns Desktop chats without a terminal warning', async t => {
+  const setup = await claudeCallerSetup(t, { unreachable: true });
+  await desktopApp(t, setup, [{ id: 'desk-only', title: 'Desktop chat' }]);
+  const result = await executeBridgeTool('list_codex_threads', {}, setup.context);
+  assert.deepEqual(result.threads.map(chat => [chat.thread_id, chat.source]), [['desk-only', 'desktop']]);
+  assert.deepEqual(result.warnings, []);
+});
+
 claudeTest('bridge_doctor reports daemon reachability as optional and never fails a Desktop-only setup', async t => {
   const up = await claudeCallerSetup(t, { threads: [{ id: randomUUID(), originator: 'codex-tui' }] });
   const upReport = await executeBridgeTool('bridge_doctor', {}, up.context);
@@ -336,7 +344,7 @@ claudeTest('bridge_doctor reports daemon reachability as optional and never fail
   const downReport = await executeBridgeTool('bridge_doctor', {}, down.context);
   const check = downReport.checks.find(item => item.name === 'codex_daemon');
   assert.equal(check.status, 'warning');
-  assert.match(check.detail, /not reachable|not found|disabled/);
+  assert.match(check.detail, /No Codex daemon is running/);
   assert.equal(downReport.ready, false);
 });
 
@@ -627,7 +635,10 @@ claudeTest('a loaded idle daemon thread still goes through the daemon and makes 
   assert.equal(queue.queueCalls().length, 0);
 });
 
-test('shouldReportTerminalUnavailable hides only the missing-executable case for a Desktop-only user', () => {
+test('shouldReportTerminalUnavailable hides only a missing executable or a stopped daemon for a Desktop-only user', () => {
+  assert.equal(shouldReportTerminalUnavailable(new DaemonUnavailableError(NOT_RUNNING_MESSAGE), true), false);
+  assert.equal(shouldReportTerminalUnavailable(new DaemonUnavailableError(NOT_RUNNING_MESSAGE), false), true);
+  assert.equal(shouldReportTerminalUnavailable(new DaemonUnavailableError('The Codex daemon is not reachable (other). The bridge never starts the daemon.'), true), true);
   const missing = new DaemonUnavailableError('The Codex executable was not found. Install the Codex CLI, or set CLAUDE_CODEX_BRIDGE_CODEX_BIN to the path of codex.exe.');
   assert.equal(shouldReportTerminalUnavailable(missing, true), false);
   assert.equal(shouldReportTerminalUnavailable(missing, false), true);

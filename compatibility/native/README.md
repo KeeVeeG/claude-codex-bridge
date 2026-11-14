@@ -38,7 +38,7 @@ codex plugin add bridge-claude-codex@keeveeg
 
 After installing or updating, load the new server in each client:
 
-- **Claude Code CLI:** `/reload-plugins`, then check `/mcp`. If old tools remain, exit and `claude --resume <session_id>`.
+- **Claude Code CLI:** `/reload-plugins`, then check `/mcp`. If it warns that the conversation would be re-read, the reload is held: run `/reload-plugins --force`.
 - **Claude Desktop:** fully quit it, including the background instance, and reopen.
 - **Codex Desktop:** start a new task or restart the app.
 - **Codex CLI:** restart the session.
