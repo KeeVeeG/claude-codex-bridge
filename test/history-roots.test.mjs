@@ -4,7 +4,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import test from 'node:test';
-import { getBridgeConversation, scanBridgeExchange } from '../lib/bridge-history.mjs';
+import { getBridgeConversation, listBridgeContacts } from '../lib/bridge-history.mjs';
 import { createSession, recordMessage, finishMessage } from '../lib/store.mjs';
 import { nativeFixture } from './native-helpers.mjs';
 
@@ -50,9 +50,9 @@ test('bridge history rejects a state root replaced by a junction during director
     }
     return readdir(directory, options);
   });
-  const result = await getBridgeConversation({ stateDir: fixture.stateDir, ownerThreadId: owner, sessionId });
+  const result = await listBridgeContacts({ stateDir: fixture.stateDir, ownerThreadId: owner });
   assert.equal(changed, true);
-  assert.deepEqual(result.messages, []);
+  assert.equal(result.contacts.size, 0);
   assert.ok(result.warnings.some(warning => /state directory changed/.test(warning)));
   assert.doesNotMatch(JSON.stringify(result), /EXTERNAL_PAIRED_CONTENT|Original safe exchange/);
 });
@@ -81,9 +81,9 @@ test('bridge history discards collected records if the root changes after a boun
     }
     return handle;
   });
-  const result = await scanBridgeExchange({ stateDir: fixture.stateDir, ownerThreadId: owner, sessionId });
+  const result = await getBridgeConversation({ stateDir: fixture.stateDir, ownerThreadId: owner, sessionId });
   assert.equal(changed, true);
-  assert.deepEqual(result.records, []);
+  assert.deepEqual(result.messages, []);
   assert.ok(result.warnings.some(warning => /state directory changed/.test(warning)));
   assert.doesNotMatch(JSON.stringify(result), /EXTERNAL_AFTER_READ|Already read safe exchange/);
 });

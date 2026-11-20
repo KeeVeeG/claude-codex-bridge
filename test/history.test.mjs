@@ -5,7 +5,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { listClaudeConversations } from '../lib/claude-history.mjs';
-import { getBridgeConversation, scanBridgeExchange } from '../lib/bridge-history.mjs';
+import { getBridgeConversation, listBridgeContacts } from '../lib/bridge-history.mjs';
 import { createSession, recordMessage, finishMessage, updateSession } from '../lib/store.mjs';
 import { nativeFixture } from './native-helpers.mjs';
 
@@ -61,8 +61,8 @@ test('the local panel excludes SSH deliveries with the same owning thread UUID',
   }
   const result = await getBridgeConversation({ stateDir: fixture.stateDir, ownerThreadId, sessionId });
   assert.deepEqual(result.messages.map(record => [record.id, record.message]), [['same-id', 'Reply to the local owner.']]);
-  const exchange = await scanBridgeExchange({ stateDir: fixture.stateDir, ownerThreadId });
-  assert.equal(exchange.records.length, 1, 'catalog activity must also exclude same-UUID SSH routes');
+  const exchange = await listBridgeContacts({ stateDir: fixture.stateDir, ownerThreadId });
+  assert.deepEqual([...exchange.contacts], [[sessionId, result.messages[0].created_at]], 'catalog activity must also exclude same-UUID SSH routes');
 });
 
 test('history pagination reaches every message once even when timestamps and IDs overlap across directions', async t => {
@@ -265,7 +265,7 @@ test('history rejects missing owners, unsafe session IDs and cancellation before
   controller.abort();
   await assert.rejects(listClaudeConversations({ projectsDir: fixture.root, stateDir: fixture.stateDir,
     ownerThreadId: 'owner', signal: controller.signal }), { name: 'AbortError' });
-  await assert.rejects(scanBridgeExchange({ stateDir: fixture.stateDir, ownerThreadId: 'owner', signal: controller.signal }), { name: 'AbortError' });
+  await assert.rejects(listBridgeContacts({ stateDir: fixture.stateDir, ownerThreadId: 'owner', signal: controller.signal }), { name: 'AbortError' });
   assert.equal(fs.existsSync(fixture.stateDir), false);
 });
 
