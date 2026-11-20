@@ -28,7 +28,7 @@ async function setup(t) {
       notice_status: 'submitted', notice_attempted: true, sender_pid: process.pid, createdAt: 100, updatedAt: 101 };
   }
   return { paths, ledger, records, sessionId, row, read: options => readManualRecords({ stateDir, threadId, ...options }),
-    conversation: () => getBridgeConversation({ stateDir, ownerThreadId: threadId, sessionId }),
+    conversation: options => getBridgeConversation({ stateDir, ownerThreadId: threadId, sessionId, ...options }),
     body: key => path.join(paths.directory, `body-${key}.json`),
     overflow: key => path.join(paths.directory, `overflow-${key}.json`) };
 }
@@ -178,4 +178,35 @@ test('a directory identity change prevents publishing even a warm manual snapsho
     return lstat(sawLedger && file === f.paths.directory ? replacement : file, ...args);
   });
   assert.throws(() => f.read(), /directories changed during access/);
+});
+
+test('ST04: exact history does not synchronously stat each unrelated overflow on cold or warm reads', async t=>{
+  const f=await setup(t), other=randomUUID();
+  for(let i=0;i<48;i++) {const row=f.row('other-'+i,'Foreign',other);fs.writeFileSync(f.overflow(keyFor(row)),asJson({schemaVersion:1,owner_thread_id:f.paths.threadId,record:row}));}
+  const selected=f.row('selected');f.records[keyFor(selected)]=selected;fs.writeFileSync(f.paths.file,asJson(f.ledger));
+  const stat=fs.lstatSync;let probes=0;t.mock.method(fs,'lstatSync',(file,...args)=>{if(path.basename(String(file)).startsWith('overflow-'))probes++;return stat(file,...args)});
+  for(let i=0;i<2;i++)assert.deepEqual((await f.conversation()).messages.map(r=>r.id),['selected']); assert.equal(probes,0);
+  const fresh=f.row('new');fs.writeFileSync(f.overflow(keyFor(fresh)),asJson({schemaVersion:1,owner_thread_id:f.paths.threadId,record:fresh}));
+  assert.deepEqual((await f.conversation()).messages.map(r=>r.id).sort(),['new','selected']);
+});
+
+test('ST02: a damaged detached manual body blocks only its interval; repair resumes at the same boundary', async t => {
+  const f = await setup(t), foreign = randomUUID();
+  for (const row of ['a', 'b', 'c', 'd'].map(id => f.row(id)).concat(f.row('other', 'Unrelated', foreign))) {
+    await updateManualEntry(f.paths, keyFor(row), () => row);
+  }
+  const c = f.body(keyFor(f.row('c'))), other = f.body(keyFor(f.row('other', 'Unrelated', foreign)));
+  const envelope = JSON.parse(fs.readFileSync(c));
+  replace(c, { ...envelope, message: 'Invalid text' }); fs.unlinkSync(other);
+  for (const historyOrder of [undefined, 'commit']) {
+    const first = await f.conversation({ limit: 1, historyOrder });
+    assert.deepEqual(first.messages.map(r => r.id), ['d']); assert.notEqual(first.incomplete, true);
+    const gap = await f.conversation({ limit: 1, cursor: first.next_cursor });
+    assert.deepEqual(gap.messages, []); assert.equal(gap.incomplete, true);
+    assert.equal(gap.next_cursor, first.next_cursor); assert.equal(gap.has_more, true);
+    replace(c, envelope);
+    const repaired = await f.conversation({ cursor: gap.next_cursor });
+    assert.deepEqual(repaired.messages.map(r => r.id), ['a', 'b', 'c']); assert.notEqual(repaired.incomplete, true);
+    replace(c, { ...envelope, message: 'Invalid text' });
+  }
 });

@@ -21,6 +21,8 @@ By default, state is stored under `~/.local/share/claude-codex-bridge` in the us
 
 The local installer also saves a configured SSH alias in the staged MCP configuration. The alias identifies an operator-selected host; it is not an SSH credential. It is also a route identifier the models see: it appears after `ssh:` as `host_id` in discovery and send results and in saved deliveries returned by `list_deliveries`. Choose an alias that names no private person, company or machine.
 
+On an owner change, the panel freezes sending. Where tab-scoped session storage is available, it saves drafts for restoration only under the original Codex owner in the same tab; it does not send them as launcher or model context. If storage is unavailable, select and copy the frozen draft before reopening.
+
 These are ordinary local JSON files, not application-level encrypted storage. The bridge does not implement automatic retention expiry or a message recall operation. Local delivery records remain until the bridge state is removed; messages already delivered to either application remain under that application's controls. Releases before 0.2.0 also stored one-to-one routing metadata; upgrading does not automatically erase those older local records.
 
 The bridge never renames a live ledger. If the previous profile-default directory still exists, follow the [offline migration or explicit pinning instructions](../README.md#updating-from-a-version-before-100). An existing explicit junction or symlink is resolved to its real target; do not retarget it while the bridge is running. Use the real target path when co-running older versions.

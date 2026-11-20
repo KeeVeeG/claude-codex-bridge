@@ -976,7 +976,7 @@ async function runBridgeTool(name, args, context) {
     if (name === 'panel_send') return manualSend(args, context);
     if (name === 'panel_retry_notice') return retryManualNotice(args, context);
     if (name === 'panel_history') return getBridgeConversation({ stateDir: config.stateDir,
-      ownerThreadId: who.threadId, sessionId: args.session_id, limit: args.limit, cursor: args.cursor, signal: context.signal });
+      ownerThreadId: who.threadId, sessionId: args.session_id, limit: args.limit, cursor: args.cursor, historyOrder: args.history_order, signal: context.signal });
     const catalog = await listClaudeConversations({ registryDir: config.registryDir,
       projectsDir: path.join(config.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects'),
       stateDir: config.stateDir, ownerThreadId: who.threadId, cursor: args.cursor, signal: context.signal, probe: context.processProbe });
@@ -985,7 +985,7 @@ async function runBridgeTool(name, args, context) {
     // config.toml is not the Enter action Codex applies (K03), so the 1.0 field names the safe mode.
     return { owner_thread_id: who.threadId, application: 'codex', sessions: catalog.conversations.filter(chat => chat.live),
       warnings: [], composer_enter_behavior: 'cmdAlways',
-      [PANEL_CATALOG]: { sessions: catalog.conversations, warnings: catalog.warnings, next_cursor: catalog.next_cursor } };
+      [PANEL_CATALOG]: { history_order: 'commit', sessions: catalog.conversations, warnings: catalog.warnings, next_cursor: catalog.next_cursor } };
   }
   if (name === 'list_codex_threads') return listCodexThreads(args, context, config, who);
   if (name === 'list_deliveries') {

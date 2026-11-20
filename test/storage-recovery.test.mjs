@@ -152,13 +152,14 @@ test('rollback preserves bidirectional page boundaries and catalog recency while
   const send = id => recordMessage(session, { ...draft, id, route: { from: draft.route.from, to: recipient(id) } });
   send(sessionId); send(other); wall -= 3_600_000;
   recordMessage(incoming, { ...draft, direction: 'to_codex', route: { from: recipient(sessionId), to: draft.route.from } });
-  const page = await getBridgeConversation({ ...opts, sessionId, limit: 1 });
+  const page = await getBridgeConversation({ ...opts, sessionId, limit: 1, historyOrder: 'commit' });
   assert.deepEqual(page.messages.map(m => [m.direction, m.created_at]), [['to_codex', wall]]);
   const older = await getBridgeConversation({ ...opts, sessionId, cursor: page.next_cursor });
   assert.deepEqual(older.messages.map(m => m.id), [sessionId]);
-  const legacyBoundary = JSON.parse(Buffer.from(page.next_cursor, 'base64url')); delete legacyBoundary.order;
+  const legacyBoundary = JSON.parse(Buffer.from(page.next_cursor, 'base64url'));
+  assert.equal(legacyBoundary.v, 2); legacyBoundary.v = 1; legacyBoundary.at = wall;
   const oldCursor = Buffer.from(JSON.stringify(legacyBoundary)).toString('base64url');
-  assert.deepEqual((await getBridgeConversation({ ...opts, sessionId, cursor: oldCursor })).messages.map(m => m.id), [sessionId]);
+  assert.deepEqual((await getBridgeConversation({ ...opts, sessionId, cursor: oldCursor })).messages.map(m => m.id), []);
   const catalog = await listClaudeConversations(opts);
   assert.deepEqual(catalog.conversations.map(c => c.session_id), [sessionId, other]);
   assert.equal(catalog.conversations[0].last_contact_at, wall);
@@ -186,7 +187,7 @@ test('rearming an older failed delivery does not jump across an issued page curs
   const { owner, session, draft } = await setup(t);
   const sessionId = randomUUID(), route = { ...draft.route, to: { kind: 'claude', id: sessionId } };
   const { getBridgeConversation } = await import('../lib/bridge-history.mjs');
-  const options = { stateDir: owner.stateDir, ownerThreadId: owner.threadId, sessionId, limit: 1 };
+  const options = { stateDir: owner.stateDir, ownerThreadId: owner.threadId, sessionId, limit: 1, historyOrder: 'commit' };
   recordMessage(session, { ...draft, route });
   finishMessage(session, draft.id, { route, status: 'failed', reason: 'target_unavailable' });
   recordMessage(session, { ...draft, route, id: 'latest' });

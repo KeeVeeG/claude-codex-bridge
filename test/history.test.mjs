@@ -360,3 +360,23 @@ test('final Claude catalog validation discards native snapshots if their root ch
   assert.ok(result.warnings.some(warning => /directory changed/.test(warning)));
   assert.doesNotMatch(JSON.stringify(result), /Earlier native snapshot|Outside later title/);
 });
+
+test('ST02/EC07: an invalid matching row retains the paging interval until repair; a bad cursor names its repair',async t=>{
+  const f=await nativeFixture(t),id=randomUUID(),own=ledger(f,'reader'),from={kind:'codex',id:'reader'},to={kind:'claude',id};
+  for(const key of ['a','b','c'])message(own,from,to,key,key);
+  const page=opts=>getBridgeConversation({stateDir:f.stateDir,ownerThreadId:'reader',sessionId:id,limit:1,...opts});
+  const first=await page({});const state=JSON.parse(fs.readFileSync(own.stateFile));const row=Object.values(state.messages).find(r=>r.id==='b');row.message=null;fs.writeFileSync(own.stateFile,JSON.stringify(state));
+  const bad=await page({cursor:first.next_cursor});assert.equal(bad.incomplete,true);assert.equal(bad.next_cursor,first.next_cursor);row.message='b';fs.writeFileSync(own.stateFile,JSON.stringify(state));
+  assert.deepEqual((await page({cursor:first.next_cursor})).messages.map(r=>r.id),['b']);await assert.rejects(page({cursor:'a'}),e=>e.reason==='invalid_argument' && /Restart without cursor/i.test(e.message));
+});
+
+test('CA03: the unchanged first page and v1 continuation use civil order, independently of the opt-in v2 order',async t=>{
+  const f=await nativeFixture(t),id=randomUUID(),own=ledger(f,'reader'),from={kind:'codex',id:'reader'},to={kind:'claude',id};
+  for(const key of ['a','b','c','d'])message(own,from,to,key,key);
+  const state=JSON.parse(fs.readFileSync(own.stateFile));for(const row of Object.values(state.messages)){row.createdAt={a:50,b:100,c:200,d:300}[row.id];row.orderAt=row.id==='b'?400:row.createdAt;}fs.writeFileSync(own.stateFile,JSON.stringify(state));
+  const page=opts=>getBridgeConversation({stateDir:f.stateDir,ownerThreadId:'reader',sessionId:id,limit:1,...opts});
+  const legacy=await page({}),commit=await page({historyOrder:'commit'});assert.equal(legacy.messages[0].id,'d');assert.equal(commit.messages[0].id,'b');
+  assert.equal(JSON.parse(Buffer.from(legacy.next_cursor,'base64url')).v,1);assert.equal(JSON.parse(Buffer.from(commit.next_cursor,'base64url')).v,2);
+  assert.deepEqual((await page({cursor:legacy.next_cursor,historyOrder:'commit',limit:5})).messages.map(r=>r.id),['a','b','c']);
+  assert.deepEqual((await page({cursor:commit.next_cursor,limit:5})).messages.map(r=>r.id),['a','c','d']);
+});

@@ -19,7 +19,7 @@ class Node {
   replaceChildren(...nodes) { this.children = nodes; this._text = ''; this.scrollHeight = nodes.length * 90; }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   addEventListener(type, listener) { if (!this.listeners.has(type)) this.listeners.set(type, []); this.listeners.get(type).push(listener); }
-  dispatch(type, props = {}) { for (const listener of this.listeners.get(type) || []) listener({ preventDefault() {}, key: '', isComposing: false, ...props }); }
+  dispatch(type, props = {}) { let prevented = false; for (const listener of this.listeners.get(type) || []) listener({ preventDefault() { prevented = true; }, key: '', isComposing: false, ...props }); return prevented; }
   focus() { this.focused = true; if (this.doc) this.doc.activeElement = this; }
   get classList() {
     const change = (name, on) => { const classes = new Set(this.className.split(/\s+/).filter(Boolean)); on ? classes.add(name) : classes.delete(name); this.className = [...classes].join(' '); };
@@ -29,16 +29,16 @@ class Node {
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const flush = async () => { for (let index = 0; index < 18; index++) await Promise.resolve(); };
 
-function harness(hash = '', { now } = {}) {
+function harness(hash = '', { now, storage } = {}) {
   const document = { activeElement: null, getElementById: id => nodes.get(id), createElement: tag => new Node(tag, document), documentElement: new Node('html'), visibilityState: 'visible' };
   const nodes = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map(match => [match[1], new Node('div', document)]));
   const parent = {}; const outgoing = []; const listeners = new Map(); const timers = new Map(); const intervals = []; const cleared = [];
   let timerId = 0; let uuid = 0;
   parent.postMessage = (message, origin) => outgoing.push({ message: JSON.parse(JSON.stringify(message)), origin });
-  const window = { parent, addEventListener(type, listener) { listeners.set(type, listener); } };
+  const window = { parent, sessionStorage: storage, addEventListener(type, listener) { listeners.set(type, listener); } };
   const context = vm.createContext({ window, document, location: { hash }, TextEncoder, console,
     crypto: { randomUUID: () => `00000000-0000-4000-8000-${String(++uuid).padStart(12, '0')}` },
-    setTimeout: callback => { const id = ++timerId; timers.set(id, callback); return id; }, clearTimeout: id => timers.delete(id),
+    setTimeout: (callback, ms) => { const id = ++timerId; timers.set(id, {callback, ms}); return id; }, clearTimeout: id => timers.delete(id),
     setInterval: callback => intervals.push(callback), clearInterval: id => cleared.push(id),
   });
   if (now !== undefined) vm.runInContext(`Date.now = () => ${now};`, context);
@@ -46,7 +46,7 @@ function harness(hash = '', { now } = {}) {
   const emit = (message, { source = parent, origin = 'https://desktop.example' } = {}) => listeners.get('message')?.({ source, origin, data: message });
   const reply = (request, data, options = {}) => emit({ jsonrpc: '2.0', id: request.message.id, result: { structuredContent: data } }, options);
   const requests = name => outgoing.filter(entry => entry.message.method === 'tools/call' && entry.message.params.name === name);
-  return { nodes, outgoing, parent, emit, reply, requests, bootstrap, document, intervals, cleared,
+  return { nodes, outgoing, parent, emit, reply, requests, bootstrap, document, intervals, cleared, timers,
     node: id => nodes.get(id), uuidCount: () => uuid,
     result: (request, result) => emit({ jsonrpc: '2.0', id: request.message.id, result }),
     async choose(sessionId, messages = [], page = {}) {
@@ -193,7 +193,7 @@ test('K03, X02, U03, Z01: Enter sends only when the host reports that Codex send
   const h = await live(); await h.choose('a');
   assert.equal(h.node('composer-hint').textContent, 'Enter adds a line · Ctrl+Enter sends (Codex did not share its Enter setting)');
   type(h, 'First line');
-  h.node('message').dispatch('keydown', { key: 'Enter' }); h.node('message').dispatch('keydown', { key: 'Enter', shiftKey: true }); await flush();
+  for (const modifiers of [{}, {shiftKey: true}, {isComposing:true,ctrlKey:true}]) assert.equal(h.node('message').dispatch('keydown', {key:'Enter',...modifiers}),false); await flush();
   assert.equal(h.requests('panel_send').length, 0);
   // Launcher data cannot make Enter send: a config.toml value is not what Codex applies.
   h.emit({ jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: { ...launcher(), structuredContent: { ...launcher().structuredContent, composer_enter_behavior: 'enter' } } }); await flush();
@@ -209,7 +209,7 @@ test('K03, X02, U03, Z01: Enter sends only when the host reports that Codex send
   type(second, 'Send with Enter');
   second.node('message').dispatch('keydown', { key: 'Enter', shiftKey: true }); await flush();
   assert.equal(second.requests('panel_send').length, 0);
-  second.node('message').dispatch('keydown', { key: 'Enter' }); await flush();
+  assert.equal(second.node('message').dispatch('keydown', { key: 'Enter' }),true); await flush();
   assert.equal(second.requests('panel_send').length, 1);
 });
 
@@ -228,7 +228,7 @@ test('A08: after a lost reply, checking absent, incomplete or unresolved history
   h.emit({ jsonrpc: '2.0', id: send.message.id, result: { isError: true, content: [{ type: 'text', text: 'Transport ended.' }] } }); await flush();
   h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [], has_more: false, next_cursor: null, warnings: [] }); await flush();
   assert.equal(h.uuidCount(), 1); assert.equal(h.node('send').disabled, true);
-  assert.match(h.node('alert-text').textContent, /did not report whether this message was handed to Claude Code\. Transport ended\./);
+  assert.match(h.node('alert-text').textContent, /Codex did not confirm the handoff/);
   assert.ok(descendants(h.node('timeline')).some(node => node.textContent === 'Handoff not confirmed'));
   type(h, 'Edited meanwhile');
   h.node('composer').dispatch('submit'); h.node('message').dispatch('keydown', { key: 'Enter', ctrlKey: true }); await flush();
@@ -236,7 +236,7 @@ test('A08: after a lost reply, checking absent, incomplete or unresolved history
   const row = record(args.message_id, args.message, { manual: true });
   for (const [messages, extra] of [[[], {}], [[row], { incomplete: true }], [[{ ...row, status: undefined }], {}], [[{ ...row, status: 'uncertain' }], {}], [[{ ...row, status: 'failed' }], {}]]) {
     await checkHistoryOnly(h, messages, extra);
-    if (extra.incomplete) assert.match(h.node('alert-text').textContent, /history could not be read in full/);
+    if (extra.incomplete) assert.match(h.node('alert-text').textContent, /History is incomplete/);
     h.node('composer').dispatch('submit'); await flush();
     assert.equal(h.requests('panel_send').length, 1); assert.equal(h.uuidCount(), 1);
     assert.equal(h.node('send').disabled, true); assert.equal(h.node('message').value, 'Edited meanwhile');
@@ -428,7 +428,7 @@ test('A08 and V06: a definite refusal keeps the draft, names the reason and one 
   const first = h.requests('panel_send').at(-1); const id = first.message.params.arguments.message_id;
   h.result(first, errorResult('Message not sent. Claude session is not live.', { delivered: false, retry: 'after_fix', reason: 'target_unavailable' })); await flush();
   assert.equal(h.node('send').disabled, false); assert.equal(h.node('message').value, 'Hello');
-  assert.equal(h.node('alert-text').textContent, 'Not sent. The Claude Code conversation is not open. Open it in Claude Code, refresh the list, then send again. The draft is kept.');
+  assert.equal(h.node('alert-text').textContent, 'Not sent. The Claude Code inbox is unavailable. Check its Peer address in Claude Code, then refresh the list. The draft is kept.');
   assert.ok(alertButton(h, 'Refresh list'));
   assert.equal(descendants(h.node('timeline')).filter(node => node.className.startsWith('notice-detail')).length, 0);
   h.node('composer').dispatch('submit'); await flush();
@@ -483,7 +483,8 @@ test('V03, V10, A10: the composer names both destinations, a handoff is not call
   assert.deepEqual(h.node('chat-list').children.map(node => node.dataset.sessionId), ['twin-0000-1111']);
   await h.choose('twin-0000-1111');
   assert.equal(h.node('conversation-id').textContent, 'ID twin-0000-1111');
-  assert.equal(h.node('composer-dest').textContent, 'To “Bridge interface” in Claude Code · a copy of the full text goes to this Codex chat');
+  assert.equal(h.node('composer-dest').textContent, 'To “Bridge interface” in Claude Code');
+  assert.match(html, /id="copy-disclosure">A copy of the full text goes to this Codex chat/);
   type(h, 'Hello'); h.node('composer').dispatch('submit'); await flush();
   const send = h.requests('panel_send').at(-1);
   h.reply(send, { delivery: delivery(send.message.params.arguments.message_id, 'Hello', { manual: true, to: { app: 'claude', id: twin.session_id } }), manual: true, notice_status: 'submitted' }); await flush();
@@ -603,4 +604,117 @@ test('version skew: a 1.0 launcher result without UI metadata lists every conver
   dropped.result(dropped.requests('bridge_panel').at(-1), launcher()); await flush(); await dropped.bootstrap;
   dropped.node('tab-all').dispatch('click');
   assert.equal(dropped.node('chat-list').children.length, 4);
+});
+
+test('PN01/PN02/PN03: a late handoff survives weaker history and a definite unposted copy never says posting', async () => {
+  const h = await live(); await h.choose('a'); type(h,'Late text'); h.node('composer').dispatch('submit'); await flush();
+  const send=h.requests('panel_send').at(-1), id=send.message.params.arguments.message_id;
+  for (const timer of [...h.timers.values()]) if (timer.ms <= 25000) timer.callback();
+  h.reply(send, {delivery: delivery(id,'Late text'), manual:true, notice_status:'pending', notice_retryable:false,
+    outcome:{delivered:true,retry:'no',reason:'settlement_failed'},notice_outcome:{delivered:false,retry:'after_fix',reason:'state_unavailable'}}); await flush();
+  h.reply(h.requests('panel_history').at(-1), {session_id:'a',messages:[record(id,'Late text',{manual:true,status:'uncertain',notice_status:'pending'})],warnings:[]}); await flush();
+  assert.equal(h.node('message').value,''); const timeline=h.node('timeline').textContent;
+  assert.match(timeline,/Handed to Claude Code/); assert.match(timeline,/Copy not posted.*state/); assert.doesNotMatch(timeline,/Posting a copy|Handoff not confirmed/);
+});
+
+test('PN04/CA01/EC03: retry the refused revision under its ID, keep the edited draft and repair the verifier first', async () => {
+  const h = await live(); await h.choose('a'); type(h,'First'); h.node('composer').dispatch('submit'); await flush();
+  const send=h.requests('panel_send').at(-1), id=send.message.params.arguments.message_id; type(h,'Different draft');
+  h.reply(send,{delivery:delivery(id,'First',{status:'failed'}),manual:true,notice_status:'pending',outcome:{delivered:false,retry:'after_fix',reason:'identity_check_unavailable'}}); await flush();
+  assert.ok(bubbles(h).some(n=>n.textContent==='First')); assert.match(h.node('timeline').textContent,/process-query access/);
+  timelineButton(h,'Retry this text').dispatch('click'); await flush(); const retry=h.requests('panel_send').at(-1);
+  assert.deepEqual(retry.message.params.arguments,{session_id:'a',message:'First',message_id:id,retry_failed:true});
+  h.reply(retry,{delivery:delivery(id,'First'),manual:true,notice_status:'submitted',outcome:{delivered:true,retry:'no',reason:'submitted'}}); await flush();
+  assert.equal(h.node('message').value,'Different draft'); h.node('composer').dispatch('submit'); await flush(); assert.notEqual(h.requests('panel_send').at(-1).message.params.arguments.message_id,id);
+});
+
+test('PN05: only the original owner can restore frozen drafts; the frozen view supports copying, not sending', async () => {
+  const values=new Map(),storage={getItem:k=>values.get(k)??null,setItem:(k,v)=>values.set(k,v),removeItem:k=>values.delete(k)};
+  const h=await live(harness('',{storage})); await h.choose('a'); type(h,'Private draft');
+  h.emit({jsonrpc:'2.0',method:'ui/notifications/tool-result',params:launcher(panel.sessions,{owner:'different-owner'})}); await flush();
+  assert.equal(h.node('message').disabled,false); assert.equal(h.node('message').readOnly,true); assert.ok(alertButton(h,'Select draft')); assert.equal(h.node('send').disabled,true);
+  const other=harness('',{storage}); other.emit({jsonrpc:'2.0',id:other.outgoing[0].message.id,result:{protocolVersion:'2026-01-26'}}); await flush();
+  other.emit({jsonrpc:'2.0',method:'ui/notifications/tool-result',params:launcher(panel.sessions,{owner:'different-owner'})}); await flush(); await other.choose('a'); assert.equal(other.node('message').value,'');
+  const back=await live(harness('',{storage})); await back.choose('a'); assert.equal(back.node('message').value,'Private draft');
+});
+
+test('PN07/PN09/TL05: an explicit setting withdrawal restores newline, and teardown fences even synthetic submit', async () => {
+  const h=await live(); await h.choose('a'); type(h,'Draft'); const settings=params=>h.emit({jsonrpc:'2.0',method:'ui/notifications/host-context-changed',params});
+  settings({composer_enter_behavior:'enter'}); settings({theme:'light'}); assert.match(h.node('composer-hint').textContent,/Enter sends/);
+  settings({composer_enter_behavior:null}); assert.equal(h.node('message').dispatch('keydown',{key:'Enter'}),false); assert.equal(h.requests('panel_send').length,0);
+  h.emit({jsonrpc:'2.0',id:94,method:'ui/resource-teardown',params:{}}); assert.equal(h.node('send').disabled,true); h.node('composer').dispatch('submit'); await flush(); assert.equal(h.requests('panel_send').length,0);
+});
+
+test('PN10: an older-page warning remains beside surviving rows when the reader reaches the end', async () => {
+  const h=await live(); await h.choose('a',[record('n','New')],{next_cursor:'older',has_more:true}); timelineButton(h,'Load earlier messages').dispatch('click'); await flush();
+  h.reply(h.requests('panel_history').at(-1),{session_id:'a',messages:[record('o','Old')],warnings:['An older record needs attention.'],next_cursor:null,has_more:false}); await flush();
+  assert.ok(bubbles(h).some(n=>n.textContent==='Old')); assert.match(h.node('alert-text').textContent,/older record needs attention/);
+});
+
+test('EC02: a definite inspect-only conflict cannot turn the identical text into a fresh send', async () => {
+  const h=await live(); await h.choose('a'); type(h,'Same'); h.node('composer').dispatch('submit'); await flush(); const send=h.requests('panel_send').at(-1);
+  h.result(send,errorResult('Already used',{delivered:false,retry:'inspect',reason:'id_conflict'})); await flush(); assert.ok(alertButton(h,'Check again')); h.node('composer').dispatch('submit');
+  await checkHistoryOnly(h,[record(send.message.params.arguments.message_id,'Same',{manual:false})]); assert.equal(h.node('send').disabled,true); assert.equal(h.uuidCount(),1);
+});
+
+test('PN02: confirming a receipt once does not let a later read downgrade its primary or its posted copy', async()=>{
+  const h=await live();await h.choose('a');type(h,'Exact');h.node('composer').dispatch('submit');await flush();
+  const send=h.requests('panel_send').at(-1),id=send.message.params.arguments.message_id;
+  h.reply(send,{delivery:delivery(id,'Exact'),manual:true,notice_status:'submitted',outcome:{delivered:true,reason:'submitted',retry:'no'},notice_outcome:{delivered:true,reason:'submitted',retry:'no'}});await flush();
+  const page=row=>({session_id:'a',messages:[record(id,'Exact',{manual:true,...row})],warnings:[]});
+  h.reply(h.requests('panel_history').at(-1),page({notice_status:'submitted'}));await flush();
+  h.intervals[0]();await flush();h.result(h.requests('bridge_panel').at(-1),launcher());await flush();
+  h.reply(h.requests('panel_history').at(-1),page({status:'sending',notice_status:'pending'}));await flush();
+  assert.match(h.node('timeline').textContent,/Handed to Claude Code/);assert.match(h.node('timeline').textContent,/Copy posted in this Codex chat/);
+});
+
+test('PN09: teardown with an already-dispatched send permits its receipt but no further host calls',async()=>{
+  const h=await live();await h.choose('a');type(h,'Dispatched');h.node('composer').dispatch('submit');await flush();const first=h.requests('panel_send').at(-1);
+  h.emit({jsonrpc:'2.0',method:'ui/resource-teardown',id:'bye',params:{}});const before=h.outgoing.length;
+  h.reply(first,{delivery:delivery(first.message.params.arguments.message_id,'Dispatched'),manual:true,notice_status:'submitted'});await flush();
+  type(h,'Next');h.node('composer').dispatch('submit');await flush();assert.equal(h.outgoing.length,before);assert.equal(h.node('send').disabled,true);assert.match(h.node('timeline').textContent,/Handed to Claude Code/);
+});
+
+test('PN03/SP06: exact history can authorize only the owner copy and the next failure keeps its repair', async () => {
+  const h = await live(); await h.choose('a'); type(h, 'Try once'); h.node('composer').dispatch('submit'); await flush();
+  const send = h.requests('panel_send').at(-1), id = send.message.params.arguments.message_id;
+  const reply = (reason, retryable, status) => ({ delivery: delivery(id, 'Try once'), manual: true, notice_status: status,
+    notice_retryable: retryable, ...(retryable ? { notice_retry_action: 'panel_retry_notice' } : {}),
+    outcome: { delivered: true, retry: 'no', reason: 'submitted' }, notice_outcome: { delivered: false, reason, retry: 'after_fix' } });
+  h.reply(send, reply('state_unavailable', false, 'pending')); await flush();
+  assert.match(h.node('timeline').textContent, /Copy not posted.*Restore write access/); assert.equal(timelineButton(h, 'Post the copy now'), undefined);
+  h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [record(id, 'Try once', { manual: true, notice_status: 'pending', notice_retryable: true })] }); await flush();
+  assert.match(h.node('timeline').textContent, /Copy not posted.*Restore write access/);
+  timelineButton(h, 'Post the copy now').dispatch('click'); await flush();
+  const retry = h.requests('panel_retry_notice').at(-1); assert.deepEqual(retry.message.params.arguments, { session_id: 'a', message_id: id });
+  h.reply(retry, reply('protocol_incompatible', true, 'failed')); await flush();
+  assert.match(h.node('timeline').textContent, /Copy not posted.*target-host support/); assert.ok(timelineButton(h, 'Post the copy again')); assert.equal(h.requests('panel_send').length, 1);
+});
+
+test('PN03: an initial protocol refusal names the copy repair, not an unconditional retry or a raw diagnostic', async () => {
+  const h = await live(); await h.choose('a'); type(h, 'Exact'); h.node('composer').dispatch('submit'); await flush();
+  const send = h.requests('panel_send').at(-1), id = send.message.params.arguments.message_id;
+  h.reply(send, { delivery: delivery(id, 'Exact'), manual: true, notice_status: 'failed', notice_retryable: true,
+    notice_error: 'Private fixture diagnostic', notice_retry_action: 'panel_retry_notice', notice_outcome: { delivered: false, reason: 'protocol_incompatible', retry: 'after_fix' } }); await flush();
+  assert.match(h.node('timeline').textContent, /target-host support/); assert.ok(timelineButton(h, 'Post the copy again')); assert.doesNotMatch(h.node('timeline').textContent, /Private fixture diagnostic/);
+});
+
+test('CA03/EC07: rejected or superseded older cursors restart from an overlapping first page without losing the draft', async () => {
+  for (const change of ['typed rejection', '1.0 rejection', 'order changed']) {
+    const h = await live(); await h.choose('a', [record('x', 'Newest')], { has_more: true, next_cursor: 'obsolete' }); type(h, 'Keep draft');
+    if (change !== 'order changed') {
+      timelineButton(h, 'Load earlier messages').dispatch('click'); await flush();
+      const older = h.requests('panel_history').at(-1); assert.equal(older.message.params.arguments.cursor, 'obsolete');
+      h.result(older, change === '1.0 rejection' ? { isError: true, content: [{ type: 'text', text: 'Invalid conversation cursor.' }] }
+        : errorResult('Restart without cursor.', { delivered: false, retry: 'after_fix', reason: 'invalid_argument' })); await flush();
+      assert.equal(timelineButton(h, 'Retry earlier messages'), undefined);
+    }
+    h.node('refresh').dispatch('click'); await flush(); const catalog = launcher();
+    if (change === 'order changed') catalog._meta[CATALOG].history_order = 'commit';
+    h.result(h.requests('bridge_panel').at(-1), catalog); await flush();
+    const newest = h.requests('panel_history').at(-1); assert.equal(newest.message.params.arguments.cursor, undefined);
+    h.reply(newest, { session_id: 'a', messages: [record('x', 'Newest')], next_cursor: 'valid', has_more: true }); await flush();
+    timelineButton(h, 'Load earlier messages').dispatch('click'); await flush(); assert.equal(h.requests('panel_history').at(-1).message.params.arguments.cursor, 'valid');
+    assert.equal(h.node('message').value, 'Keep draft'); assert.equal(h.requests('panel_send').length, 0);
+  }
 });

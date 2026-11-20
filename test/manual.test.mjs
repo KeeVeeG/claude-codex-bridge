@@ -748,3 +748,22 @@ test('E01: an owner notice receipt that cannot be saved still reports both write
     assert.deepEqual([userFrames(fixture.claude).length, fixture.notices.length], [1, 1]);
   });
 });
+
+test('SP06/ST03: a retry-claim rename failure preserves the proven unposted notice and its copy-only action', windowsOnly, async t=>{
+  const f=await setup(t,{noticeFailure:'schema'});const first=await manualSend(f.args,f.context);
+  assert.equal(first.notice_retry_action,'panel_retry_notice');assert.equal(first.notice_outcome.retry,'after_fix');
+  const args={session_id:f.args.session_id,message_id:f.args.message_id},before=fs.readFileSync(f.ledgerFile),rename=fs.renameSync;
+  t.mock.method(fs,'renameSync',(a,b)=>{if(b===f.ledgerFile)throw fault('ENOSPC');return rename(a,b)});
+  const refused=await retryManualNotice(args,f.context);assert.deepEqual(fs.readFileSync(f.ledgerFile),before);
+  assert.equal(refused.notice_retryable,true);assert.equal(refused.notice_retry_action,'panel_retry_notice');assert.equal(refused.notice_outcome.reason,'state_unavailable');
+  assert.equal(refused.notice_outcome.retry,'after_fix');assert.equal(f.notices.length,0);assert.equal(userFrames(f.claude).length,1);
+});
+
+test('SP07: an exact replay verifies the shadow and returns both known handoffs while primary settlement is unwritable',windowsOnly,async t=>{
+  const f=await setup(t), primary=path.join(f.stateDir,hash(f.owner),'state.json'),rename=fs.renameSync;
+  t.mock.method(fs,'renameSync',(a,b)=>{if(b===primary && Object.values(JSON.parse(fs.readFileSync(a)).messages).some(r=>r.status==='submitted'))throw fault('EROFS');return rename(a,b)});
+  const first=await manualSend(f.args,f.context);assert.equal(first.outcome.delivered,true);assert.equal(first.notice_outcome.delivered,true);
+  const replay=await manualSend(f.args,f.context);assert.equal(replay.outcome.reason,'settlement_failed');assert.equal(replay.notice_outcome.reason,'submitted');
+  await assert.rejects(manualSend({...f.args,message:'Other body'},f.context),{reason:'id_conflict'});
+  assert.equal(f.notices.length,1);assert.equal(userFrames(f.claude).length,1);
+});

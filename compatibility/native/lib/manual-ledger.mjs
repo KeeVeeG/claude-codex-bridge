@@ -213,12 +213,54 @@ export function readManualEntry(paths, key) {
   return { record, ...(overflow ? { legacy } : {}) };
 }
 
-export function* readManualEntries(paths, sessionId) {
+// The key binds peer + message ID. A change to mutable receipt fields cannot move a
+// valid file to another peer. Cache only that membership, not its status or body.
+const peerIndexes = new Map();
+export async function selectedOverflow(paths, sessionId, signal) {
+  const before = findDirectories(paths);
+  if (!before) return { names: [], verify: () => { if (findDirectories(paths)) throw new Error('Manual directory changed.'); } };
+  const generation = before.at(-1);
+  const verify = () => {
+    throwIfStopped(signal); assertDirectories(paths, before);
+    if (!sameVersion(generation, fs.lstatSync(paths.directory, statOptions))) throw new Error('Manual directory changed.');
+  };
+  let index = peerIndexes.get(paths.directory);
+  if (!index || !sameVersion(generation, index.generation)) {
+    const peers = new Map(); let count = 0;
+    for await (const entry of await fs.promises.opendir(paths.directory)) {
+      const key = overflowName.exec(entry.name)?.[1]; if (!key) continue;
+      throwIfStopped(signal);
+      if (++count > 100000) throw new Error('Manual history index exceeds the safe read limit.');
+      const file = path.join(paths.directory, entry.name), stat = await fs.promises.lstat(file, statOptions);
+      if (!stat.isFile() || stat.size > BigInt(MAX_OVERFLOW_BYTES)) throw new Error('Invalid overflow file.');
+      const handle = await fs.promises.open(file, readFlags);
+      let value;
+      try {
+        if (!sameVersion(stat, await handle.stat(statOptions))) throw new Error('Overflow file changed.');
+        const buffer = Buffer.alloc(Number(stat.size) + 1); let used = 0;
+        while (used < buffer.length) {
+          const { bytesRead } = await handle.read(buffer, used, buffer.length - used, used); if (!bytesRead) break; used += bytesRead;
+        }
+        if (used !== Number(stat.size) || !sameVersion(stat, await handle.stat(statOptions))) throw new Error('Overflow file changed.');
+        value = JSON.parse(utf8.decode(buffer.subarray(0, used)));
+      } finally { await handle.close(); }
+      const peer = value?.record?.session_id, id = value?.record?.message_id;
+      if (value?.schemaVersion !== 1 || value.owner_thread_id !== paths.threadId || typeof peer !== 'string' || Buffer.byteLength(peer) > 256 ||
+          typeof id !== 'string' || hash(JSON.stringify([peer,id])) !== key) throw new Error('Invalid overflow routing metadata.');
+      if (!peers.has(peer)) peers.set(peer, []); peers.get(peer).push(entry.name);
+    }
+    verify(); index = { generation, peers }; peerIndexes.delete(paths.directory); peerIndexes.set(paths.directory,index);
+    if (peerIndexes.size > 4) peerIndexes.delete(peerIndexes.keys().next().value);
+  }
+  return { names: index.peers.get(sessionId) ?? [], verify };
+}
+
+export function* readManualEntries(paths, sessionId, names) {
   const directories = findDirectories(paths);
   if (!directories) return;
   const records = readLedger(paths, directories, true).records;
   const overflowKeys = new Set();
-  for (const name of fs.readdirSync(paths.directory)) {
+  for (const name of names ?? fs.readdirSync(paths.directory)) {
     const key = overflowName.exec(name)?.[1];
     if (!key) continue;
     const file = path.join(paths.directory, name);

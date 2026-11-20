@@ -6,7 +6,7 @@ import os from 'node:os';
 import { defaultStateDir } from '../lib/store.mjs';
 import { CLAUDE_ENTRYPOINTS, callerSessionId } from '../lib/claude-sessions.mjs';
 import { stopProcessProbe } from '../lib/claude-process.mjs';
-import { startCall, throwIfStopped } from '../lib/call-time.mjs';
+import { CALL_DEADLINE_MS, WRITE_RESERVE_MS, startCall, throwIfStopped } from '../lib/call-time.mjs';
 import { OUTCOME_SCHEMA, REASONS, errorOutcome, outcome, sendErrorText, tagged } from '../lib/outcome.mjs';
 import { MAX_CODEX_CHAT_LIMIT } from '../lib/codex-desktop.mjs';
 // Load tool modules at startup: late imports could mix versions after an in-place update.
@@ -55,7 +55,9 @@ const panelUri = 'ui://bridge/panel-v7.html';
 const panelUris = [panelUri, 'ui://bridge/panel-v6.html'];
 // Serve the bytes this process started with: an in-place update must not hand a newer
 // panel to an older running server, or the reverse (versions.md, UI skew).
-const panelHtml = fs.readFileSync(new URL('../ui/bridge.html', import.meta.url), 'utf8');
+const noticeRetryAction = { type: 'string', const: 'panel_retry_notice' };
+const panelHtml = fs.readFileSync(new URL('../ui/bridge.html', import.meta.url), 'utf8')
+  .replace('__BRIDGE_CALL_WAIT_MS__', String(CALL_DEADLINE_MS + WRITE_RESERVE_MS));
 // Claude-style orange starburst icon for the conversation-panel entrypoint.
 // Keep it self-contained because tool icons are data-URI images.
 const bridgeIconSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none"><rect x="1" y="1" width="18" height="18" rx="4" fill="#D97757"/><g stroke="#FFF9F1" stroke-width=".85" stroke-linecap="round"><path d="M10 4v12M4 10h12M5.75 5.75l8.5 8.5M14.25 5.75l-8.5 8.5M7.2 4.8l5.6 10.4M12.8 4.8 7.2 15.2M4.8 7.2l10.4 5.6M4.8 12.8l10.4-5.6"/></g><circle cx="10" cy="10" r=".9" fill="#FFF9F1"/></svg>';
@@ -157,6 +159,7 @@ export const TOOLS = [
     description: 'Read one page of bridge messages for the selected Claude session and this chat.',
     inputSchema: schema({ session_id: textProperty('Exact selected Claude Code conversation ID.'),
       limit: { type: 'integer', minimum: 1, maximum: 200, description: 'Messages per page; defaults to 100.' },
+      history_order: { type: 'string', enum: ['commit'], description: 'Opt into commit-order pages; omitted calls use the original civil-time order.' },
       cursor: textProperty('Opaque earlier-page cursor returned by this tool.', 2048) }, ['session_id']),
     outputSchema: schema({ session_id: outputText, messages: { type: 'array', items: uiMessage },
       next_cursor: { type: ['string', 'null'] }, has_more: { type: 'boolean' },
@@ -170,7 +173,7 @@ export const TOOLS = [
     description: 'Send the user’s text to the selected live Claude session and copy it to this Codex chat.',
     inputSchema: schema({ session_id: textProperty('Exact selected live Claude Code conversation ID.'),
       message: messageText, message_id: idField('Required stable ID for this manual send.'), retry_failed: retryFailed }, ['session_id', 'message', 'message_id']),
-    outputSchema: schema({ delivery, manual: { type: 'boolean', const: true }, notice_retryable: { type: 'boolean' }, notice_error: outputText, notice_omitted: noticeOmitted,
+    outputSchema: schema({ delivery, manual: { type: 'boolean', const: true }, notice_retryable: { type: 'boolean' }, notice_retry_action: noticeRetryAction, notice_error: outputText, notice_omitted: noticeOmitted,
       notice_status: { type: 'string', enum: ['submitted', 'failed', 'uncertain', 'pending'] },
       outcome: outcomeProperty, notice_outcome: outcomeProperty }, ['delivery', 'manual', 'notice_status']),
     _meta: appToolMeta,
@@ -178,9 +181,9 @@ export const TOOLS = [
   {
     name: 'panel_retry_notice',
     title: 'Retry the Codex manual-send notice',
-    description: 'Retry only a confirmed failed Codex copy, never the original Claude send or an uncertain copy.',
+    description: 'Retry only a safely unposted Codex copy, never the original Claude send or an uncertain copy.',
     inputSchema: schema({ session_id: textProperty('Exact original Claude recipient.'), message_id: idField('Original manual send ID.') }, ['session_id', 'message_id']),
-    outputSchema: schema({ delivery, manual: { type: 'boolean', const: true }, notice_retryable: { type: 'boolean' }, notice_error: outputText, notice_omitted: noticeOmitted,
+    outputSchema: schema({ delivery, manual: { type: 'boolean', const: true }, notice_retry_action: noticeRetryAction, notice_retryable: { type: 'boolean' }, notice_error: outputText, notice_omitted: noticeOmitted,
       notice_status: { type: 'string', enum: ['submitted', 'failed', 'uncertain', 'pending'] },
       outcome: outcomeProperty, notice_outcome: outcomeProperty }, ['delivery', 'manual', 'notice_status']),
     _meta: appToolMeta,
