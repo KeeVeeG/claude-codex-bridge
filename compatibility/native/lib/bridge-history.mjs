@@ -28,6 +28,7 @@ const stateError = code => Object.assign(new Error(code), { code });
 const omitted = {
   ROOT_CHANGED: 'The shared bridge state directory changed during the scan. Refresh its location, then retry.',
   ROOT_UNAVAILABLE: 'The shared bridge state directory could not be verified. Check that it is readable, then retry.',
+  ROOT_MISSING: 'The shared bridge state directory is missing, so earlier messages could not be read. Check that it is available, then retry.',
   LEDGER_CHANGED: 'A delivery ledger changed during the read. Refresh to try again.',
   LEDGER_UNAVAILABLE: 'Some delivery ledgers could not be read. Check access to the shared bridge state, then retry.',
   STATE_INVALID: 'Some delivery ledgers are unsafe, damaged, or use an unsupported format. Run bridge doctor and check the shared state before retrying.',
@@ -36,6 +37,9 @@ const omitted = {
   ROUTING_METADATA: 'Some delivery records lack exact routing metadata and cannot be assigned to this conversation.',
   RECORD_INVALID: 'Some invalid or duplicate bridge delivery records were skipped. Check the shared state if expected records are missing.',
 };
+
+const manualWarning = 'Manual delivery notice metadata could not be read. Refresh to retry, or check access to the shared bridge state.';
+export const historyWarnings = Object.freeze([...Object.values(omitted), manualWarning]);
 
 // Derived views only. Cache by guarded file identity, not by a TTL or just mtime/size.
 // Cold and invalidated views always fall back to the public, old-writer-compatible ledger.
@@ -120,16 +124,21 @@ const invalidCursor = () => failure('Invalid conversation cursor. Restart withou
 const detached = text => Buffer.from(text, 'utf16le').toString('utf16le');
 const claudeOf = thread => typeof thread === 'string' && thread.startsWith('claude:') ? thread.slice(7) : '';
 const integer = value => Number.isSafeInteger(value) ? value : undefined;
+const routeHash = ({ from, to }) => hash(JSON.stringify({ from: { kind: from.kind, id: from.id }, to: { kind: to.kind, id: to.id } }));
 
 function buildView(ledgerKey, owner, full, ownerLedger) {
   const outgoing = new Map();
   const incoming = new Map();
   const warnings = new Set();
   const damagedRoutes = new Set();
-  const damaged = key => {
+  // An invalid row holds the interval of the route named by its key and, when its key is damaged
+  // too, of the well-formed local route its body names in this sender's ledger (ST02, R3D02).
+  // Neither makes the row a receipt or publishes it.
+  const damaged = (key, route) => {
     warnings.add('RECORD_INVALID');
     const prefix = typeof key === 'string' && /^route:([a-f0-9]{64}):/.exec(key)?.[1];
-    if (full && prefix && !damagedRoutes.has(prefix)) { charge(192); damagedRoutes.add(prefix); }
+    if (!full) return;
+    for (const value of [prefix, route && routeHash(route)]) if (value && !damagedRoutes.has(value)) { charge(192); damagedRoutes.add(value); }
   };
   let incomingOwner;
   let weight = 1024;
@@ -157,17 +166,19 @@ function buildView(ledgerKey, owner, full, ownerLedger) {
         (incomingOwner === undefined ? hash(`claude:${from.id}`) === ledgerKey : from.id === incomingOwner));
     if (!toClaude && !toCodex) { if (full && key.startsWith('route:')) damaged(key); return; }
     if ((toClaude && (typeof to.id !== 'string' || !sessionPattern.test(to.id))) ||
-        (toCodex && (typeof to.id !== 'string' || !to.id.trim() || Buffer.byteLength(to.id) > 512 || /[\r\n\0]/.test(to.id))) ||
-        typeof record.id !== 'string' || !idPattern.test(record.id) ||
+        (toCodex && (typeof to.id !== 'string' || !to.id.trim() || Buffer.byteLength(to.id) > 512 || /[\r\n\0]/.test(to.id)))) {
+      damaged(key); return;
+    }
+    if (typeof record.id !== 'string' || !idPattern.test(record.id) ||
         typeof record.message !== 'string' || Buffer.byteLength(record.message) > 65536 ||
         !Number.isSafeInteger(record.createdAt) || record.createdAt < 0 || !statuses.has(record.status)) {
-      damaged(key); return;
+      damaged(key, record.route); return;
     }
     if (toCodex && incomingOwner === undefined) incomingOwner = detached(from.id);
     const pairs = toClaude ? outgoing : incoming;
     let pair = pairs.get(to.id);
-    const prefix = pair?.prefix ?? 'route:' + hash(JSON.stringify({ from: { kind: from.kind, id: from.id }, to: { kind: to.kind, id: to.id } })) + ':';
-    if (key !== prefix + record.id) { damaged(key); return; }
+    const prefix = pair?.prefix ?? 'route:' + routeHash(record.route) + ':';
+    if (key !== prefix + record.id) { damaged(key, record.route); return; }
     if (!pair) {
       charge(640 + 2 * to.id.length);
       pairs.set(detached(to.id), pair = { prefix, latest: record.createdAt, order: order(record), ...(full ? { byId: new Map() } : {}) });
@@ -284,7 +295,7 @@ function effectiveStatus(record) {
 
 const isRootError = code => code === 'ROOT_CHANGED' || code === 'ROOT_UNAVAILABLE';
 
-async function collectViews({ stateDir, ownerThreadId, sessionId, signal, visit }) {
+async function collectViews({ stateDir, ownerThreadId, sessionId, continuation = false, signal, visit }) {
   validateHistoryOwner(ownerThreadId);
   if (sessionId !== undefined) validateClaudeHistoryId(sessionId);
   checkCancellation(signal);
@@ -294,9 +305,10 @@ async function collectViews({ stateDir, ownerThreadId, sessionId, signal, visit 
   const result = () => ({ root, incomplete, warnings: [...warnings].map(code => omitted[code]) });
   try { root = await directorySnapshot(path.resolve(stateDir)); }
   catch (error) {
-    if (error.code !== 'ENOENT') {
+    // A missing root is fresh state on a first read, but unread history behind a cursor (R3D01).
+    if (error.code !== 'ENOENT' || continuation) {
       incomplete = true;
-      warnings.add(error.code === 'DIRECTORY_CHANGED' ? 'ROOT_CHANGED' : 'ROOT_UNAVAILABLE');
+      warnings.add(error.code === 'ENOENT' ? 'ROOT_MISSING' : error.code === 'DIRECTORY_CHANGED' ? 'ROOT_CHANGED' : 'ROOT_UNAVAILABLE');
     }
     return result();
   }
@@ -383,7 +395,7 @@ async function manualRecords(stateDir, threadId, scan, signal, selection) {
       scan.warnings.push(omitted[error.code]);
     } else {
       scan.incomplete = true; // Missing shadow-only texts can fall on either side of the requested cursor.
-      scan.warnings.push('Manual delivery notice metadata could not be read. Refresh to retry, or check access to the shared bridge state.');
+      scan.warnings.push(manualWarning);
     }
     return [];
   }
@@ -455,7 +467,7 @@ export async function getBridgeConversation({ stateDir = defaultStateDir(), owne
   const before = readCursor(cursor, ownerThreadId, sessionId);
   let outgoing;
   let incoming;
-  const scan = await collectViews({ stateDir, ownerThreadId, sessionId, signal, visit: view => {
+  const scan = await collectViews({ stateDir, ownerThreadId, sessionId, continuation: before !== null, signal, visit: view => {
     visitPairs(view, ownerThreadId, sessionId, (_peer, pair, direction) => {
       if (direction === 'to_claude') outgoing = pair;
       else incoming = pair;
@@ -513,6 +525,7 @@ export async function getBridgeConversation({ stateDir = defaultStateDir(), owne
       status: effectiveStatus(record), ...(record.manual === true || notice ? { manual: true } : {}) };
     if (noticeStatuses.has(notice?.notice_status)) visible.notice_status = notice.notice_status;
     if (typeof notice?.notice_retryable === 'boolean') visible.notice_retryable = notice.notice_retryable;
+    if (notice?.notice_status === 'pending' && notice.notice_attempted) visible.notice_claimed = true;
     if (['failed', 'uncertain'].includes(notice?.notice_status) && Object.hasOwn(REASONS, notice.notice_reason ?? '')) visible.notice_reason = notice.notice_reason;
     // The shared legacy ledger was full, so this release sent the message without an owner notice.
     if (notice?.overflow === true && notice.notice_status === 'failed' && !notice.notice_attempted) visible.notice_omitted = true;

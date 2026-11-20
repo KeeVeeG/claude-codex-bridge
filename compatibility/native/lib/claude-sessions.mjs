@@ -503,8 +503,14 @@ export async function sendToClaude({ socketPath, token, message, senderName = 'C
         // or acknowledgement, so this cannot cover a switch after this check.
         if (resolved) {
           proving = true;
-          await verifyResolvedSession(resolved, { socketPath, token, sessionId }, { signal, probe });
-          proving = false;
+          try { await verifyResolvedSession(resolved, { socketPath, token, sessionId }, { signal, probe }); }
+          finally {
+            // The last synchronous key/registration reread can outlast the deadline timer (R3S01).
+            // Classify both its match and its rejection only after the proof has settled in time.
+            proving = false;
+            if (signal?.aborted && signal.reason?.code !== 'BRIDGE_DEADLINE') throw stopError(signal);
+            if (remainingMs(signal) <= 0 || signal?.reason?.code === 'BRIDGE_DEADLINE') throw failure(...PROOF_FAILURES.target.unverified);
+          }
         }
         // Immediately before the write: a cancelled call or one past its deadline never writes.
         beforeWrite(signal);

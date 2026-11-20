@@ -98,7 +98,8 @@ test('a failed record from an earlier version is answered, never sent again, and
   fs.writeFileSync(setup.ledgerFile(), JSON.stringify(ledger));
   setup.writeRecord({ messagingSocketPath: live });
   const replayed = await rejection(setup.send({ message_id: 'legacy' }));
-  assert.match(replayed.message, /^No new send was made: .*list_deliveries.*new message_id/);
+  assert.match(replayed.message, /^No new send was made: .*may have arrived.*list_deliveries/i);
+  assert.doesNotMatch(replayed.message, /send it again|new message_id/i);
   assert.deepEqual(replayed.outcome, { delivered: 'unknown', retry: 'inspect', reason: 'prior_failed',
     record: { message_id: 'legacy', status: 'failed' } });
   assert.equal(setup.userFrames().length, 0);
@@ -400,5 +401,28 @@ test('SP02: expiry while the final proof is pending says the destination was not
   };
   await assert.rejects(s.send({ message_id: 'proof-expiry' }, { signal: call.signal }),
     error => error.outcome.reason === 'target_unverified' && error.outcome.retry === 'same_id' && error.outcome.delivered === false);
+  assert.equal(s.userFrames().length, 0);
+});
+
+test('R3S01: the final proof settles on the shared clock: late is unverified, a timely mismatch is a change, cancellation stays cancellation', nativeOnly, async t => {
+  const s = await codexToClaude(t); let tick = performance.now(), armed = null; t.mock.method(performance, 'now', () => tick);
+  // The process probe has answered in time; the clock crosses during the final synchronous key and registration reread.
+  const lstat = fs.lstatSync;
+  t.mock.method(fs, 'lstatSync', (file, ...rest) => { if (armed && String(file).endsWith('.key')) { const run = armed; armed = null; run(); } return lstat(file, ...rest); });
+  const restarted = process.platform === 'win32' ? '133700000000000099' : 'Thu Oct  8 02:03:09 2026';
+  const run = async (id, during) => {
+    const call = startCall(), before = s.probe.calls; t.after(() => call.dispose());
+    s.probe.answer = () => { if (s.probe.calls === before + 2) armed = () => during(call); return { start: START }; };
+    const error = await rejection(s.send({ message_id: id }, { signal: call.signal }));
+    assert.equal(s.probe.calls - before, 2, 'one resolve proof and one final proof');
+    s.writeRecord({ procStart: START });
+    return [error.outcome.reason, error.outcome.retry, error.outcome.delivered];
+  };
+  const late = () => { tick += 55_001; }, change = () => s.writeRecord({ procStart: restarted });
+  assert.deepEqual(await run('late-match', late), ['target_unverified', 'same_id', false]);
+  assert.deepEqual(await run('late-change', () => { late(); change(); }), ['target_unverified', 'same_id', false]);
+  assert.deepEqual(await run('timely-change', change), ['target_changed', 'after_fix', false]);
+  assert.deepEqual(await run('cancel', call => { call.cancel(); late(); }), ['cancelled', 'same_id', false]);
+  assert.deepEqual(await run('reserve', () => { tick += 51_000; }), ['deadline', 'same_id', false], 'a timely proof still meets the 5 s write gate');
   assert.equal(s.userFrames().length, 0);
 });

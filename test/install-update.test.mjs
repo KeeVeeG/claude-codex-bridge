@@ -295,6 +295,7 @@ for (const [label, args] of [['changed during the run', []], ['removed before a 
     const error = await main(args, f.options).then(() => assert.fail('the run must fail'), e => e);
     assert.match(error.message, /already matches the outbound bridge tool/); assert.doesNotMatch(error.message, /Rollback could not finish/);
     const changed = args.length ? ['Claude'] : ['Codex', 'Claude'];
+    if (/^1\.0\./.test(older)) assert.match(error.message, /copy stage backups aside.*removes them by name.*newer or edited/i);
     for (const app of ['Codex', 'Claude']) {
       const note = new RegExp(`Version rollback did not complete for ${app}: before this run it loaded ${literal(older)}, and it now loads ${literal(prepared)} at its next start\\. The installer kept no verified copy of ${literal(older)}; its recovery source is the \\d+\\.\\d+\\.\\d+ release package\\.`);
       if (changed.includes(app)) assert.match(error.message, note); else assert.doesNotMatch(error.message, new RegExp(`for ${app}:|${app}'s version`));

@@ -1093,7 +1093,7 @@ function rollbackVersions({ prior, restorePrior, prepared, homeDir, env, execute
     // The previous files may sit in another verified stage after an incomplete rollback, not only where they were found.
     const kept = before.files && stageHolding(before.files, stageFiles(homeDir))?.holder;
     const recovery = kept ? ` Its previous files remain in ${kept}.`
-      : before.version ? ` The installer kept no verified copy of ${before.version}; its recovery source is the ${before.version.split('+')[0]} release package.` : '';
+      : before.version ? ` The installer kept no verified copy of ${before.version}; its recovery source is the ${before.version.split('+')[0]} release package.${/^1\.0\./.test(before.version) ? ' Before running that older installer, copy stage backups aside: it removes them by name, including newer or edited backups.' : ''}` : '';
     const state = off ? `it is turned off with ${now} installed` : `it now loads ${now} at its next start`;
     if (before.version && now) return `Version rollback did not complete for ${name}: before this run it loaded ${before.version}, and ${state}.${recovery}`;
     return `${name}'s version after rollback is unverified: ${before.version ? `before this run it loaded ${before.version}` : 'its version before this run could not be identified'}, and ${now ? state : 'its current version could not be read'}.${recovery}`;

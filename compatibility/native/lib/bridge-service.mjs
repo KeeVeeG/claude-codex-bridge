@@ -7,23 +7,35 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { verifiedClaudeSessions, resolveClaudeSession, resolveClaudeCaller, sendToClaude } from './claude-sessions.mjs';
-import { ensureCall, inquire, INQUIRY_ATTEMPT_MS, isCancelledError, monotonicNow, remainingMs, startCall, throwIfStopped, waitForSettlement } from './call-time.mjs';
+import { beforeWrite, WRITE_RESERVE_MS, ensureCall, inquire, INQUIRY_ATTEMPT_MS, isCancelledError, monotonicNow, remainingMs, startCall, throwIfStopped, waitForSettlement } from './call-time.mjs';
 import { manualSend, retryManualNotice } from './manual-service.mjs';
 import { listClaudeConversations } from './claude-history.mjs';
-import { getBridgeConversation } from './bridge-history.mjs';
+import { getBridgeConversation, historyWarnings } from './bridge-history.mjs';
 import { REASONS, errorOutcome, failure, outcome, sendErrorText } from './outcome.mjs';
 import { desktopCompatible, MAX_CODEX_CHAT_LIMIT, listCodexTools, listCodexChats, sendToCodex } from './codex-desktop.mjs';
 import { publishCodexHost, getCodexHosts } from './codex-host.mjs';
 import { canonicalLocalSocket, localSocketPresence } from './local-socket.mjs';
 import { defaultStateDir, ledgerAt, ownerId } from './store.mjs';
 import { createSession, lookupMessage, recordMessage, finishMessage, listMessages, retainSettlement, checkSettlementCapacity, repairSettlement } from './call-store.mjs';
-import { openDaemon, listTerminalThreads, readDaemonVersions, readTerminalThread, sendToTerminalThread, normalizeCodexThreadId,
+import { openDaemon, listTerminalThreads, readDaemonVersions, readTerminalThread, readTerminalPlan, writeTerminalPlan, normalizeCodexThreadId,
   queueToTerminalThread, queueRefusal, queueTargetRefusal, TerminalNotLoadedError, DaemonUnavailableError, NOT_RUNNING_MESSAGE } from './codex-daemon.mjs';
 import { codexPeerContent, collaboratorNotice, quoted } from './codex-peer.mjs';
 import { validateSshHostAlias } from './codex-ssh.mjs';
 
 /** Result metadata key for the panel's full catalog; MCP hosts give `_meta` to the UI, not the model. */
 export const PANEL_CATALOG = 'bridge-claude-codex/catalog';
+// Only these fixed diagnostics can cross from private catalog metadata to the public v6 result.
+const publicCatalogWarnings = new Set([
+  'Some Claude custom title metadata was unreadable or unsafe; a fallback title is shown.',
+  'Some Claude conversation metadata was unreadable or unsafe and was skipped. Check read access, then retry.',
+  'Some Claude inboxes could not be verified.',
+  'Some live Claude session identifiers are unsupported.',
+  'The live Claude session registry could not be read.',
+  'The Claude project metadata directory changed during the read; native metadata was skipped. Refresh to retry.',
+  'The Claude project metadata directory could not be verified; native metadata was skipped. Check read access, then retry.',
+  'Some Claude project metadata directories changed during the read and were skipped. Refresh to retry.',
+  'Some Claude project metadata directories could not be verified. Check read access, then retry.',
+]);
 
 function codexThreadId(metadata = {}) {
   let turn = metadata['x-codex-turn-metadata'];
@@ -688,18 +700,20 @@ function transportReason(error, signal) {
   return 'internal_error';
 }
 
+const explicitRouteAdvice = 'Confirm with the user whether the session is open in Desktop or CLI. Send on that explicit transport with a new message_id, without the retry flag.';
+
 /** The answer for an exact earlier attempt with this message_id; only a submitted one is a result. */
 function replay(record) {
   if (record.status === 'submitted') return { delivery: publicDelivery(record), outcome: outcome('already_submitted', { record }) };
   if (record.status === 'failed' && REASONS[record.reason]?.delivered === false) {
-    const repair = record.reason === 'queued_message_too_long' ? 'Shorten the message and use a new ID.' : 'To retry after fixing the cause, use retry_failed: true with the original ID, route and text.';
+    const repair = record.retry === 'new_id' ? explicitRouteAdvice : record.reason === 'queued_message_too_long' ? 'Shorten the message and use a new ID.' : 'To retry after fixing the cause, use retry_failed: true with the original ID, route and text.';
     throw failure(`No new send was made. This ID has a recorded no-write failure. ${repair}`, record.reason, { outcome: outcome(record.reason, { record }) });
   }
   const [text, reason] = record.status === 'sending'
     ? ['No new send was made: the first attempt with this message_id is still in progress. Let it finish, then check list_deliveries.', 'in_flight']
     : record.status === 'uncertain'
     ? ['No new send was made: this message_id has uncertain delivery, so the first attempt may have arrived. Check the receiving conversation and list_deliveries before sending again.', 'prior_uncertain']
-    : ['No new send was made: this message_id has a failed attempt that an earlier bridge version recorded without its cause. Check the receiving conversation and list_deliveries; if the message did not arrive, send it again under a new message_id.', 'prior_failed'];
+    : ['No new send was made: this message_id has a failed attempt that an earlier bridge version recorded without its cause. It may have arrived even if it is not visible yet. Check the receiving conversation and list_deliveries.', 'prior_failed'];
   throw Object.assign(new Error(text), { reason, outcome: outcome(reason, { record }) });
 }
 
@@ -709,24 +723,38 @@ async function sendMessage(name, args, context, config, who) {
   try { return await deliver(name, args, context, config, who, held); } finally { held.connection?.close(); }
 }
 
-/** Send over the kept routing connection. A failure before the daemon answered anything falls back to a
- * fresh connection, which is the path every send took before the connection was kept (O02). */
-async function overHeld(held, send, fresh, signal) {
-  const connection = held.connection;
-  let answered = false;
-  let writing = false;
-  const tracked = { ...connection, request(method, params, options) {
-    if (options?.mutating) writing = true;
-    const pending = connection.request(method, params, options);
-    pending.then(() => { answered = true; }, error => { if (error.rpcMessage !== undefined) answered = true; });
-    return pending;
-  } };
-  try { return await send(tracked); } catch (error) {
-    if (error.reason === 'access_denied' || writing || error.deliveryUnknown || (answered && error.code !== 'DAEMON_TIMEOUT')) throw error;
+/** Repeat only the final read-only routing proof. Keep its connection for a single dispatch outside
+ * the inquiry, leaving the write reserve intact. A timeout never authorizes the queue. */
+async function terminalPlan(held, config, threadId, signal) {
+  beforeWrite(signal);
+  let timedOut = false;
+  try {
+    return await inquire(async attempt => {
+      const kept = attempt.attempt === 1 ? held.connection : null;
+      if (!kept) held.connection?.close(); // A late successful proof may briefly have retained its proxy.
+      held.connection = null;
+      const read = async connection => {
+        const plan = await readTerminalPlan(connection, { threadId, signal: attempt.signal, timeoutMs: attempt.timeoutMs });
+        throwIfStopped(attempt.signal);
+        return plan;
+      };
+      try {
+        if (!kept) return await withDaemon(config, attempt.signal, read, { timeoutMs: attempt.timeoutMs,
+          keep: (_plan, connection) => { held.connection = connection; return true; } });
+        const plan = await read(kept); held.connection = kept; return plan;
+      } catch (error) {
+        kept?.close();
+        if (error.code === 'DAEMON_TIMEOUT' || (kept && error instanceof DaemonUnavailableError)) error.transient = true;
+        throw error;
+      }
+    }, { signal, attemptMs: Math.min(INQUIRY_ATTEMPT_MS, config.daemon?.timeoutMs ?? Infinity), until: monotonicNow() + remainingMs(signal) - WRITE_RESERVE_MS,
+      onTransient: error => { timedOut ||= ['ATTEMPT_TIMEOUT', 'DAEMON_TIMEOUT'].includes(error.code); } });
+  } catch (error) {
     throwIfStopped(signal);
-    connection.close();
-    held.connection = null;
-    return fresh();
+    if (error.inconclusive || (timedOut && (error instanceof DaemonUnavailableError || error instanceof TerminalNotLoadedError))) {
+      throw failure('The Codex daemon did not verify the final route in time. Retry the same call.', 'route_unverified');
+    }
+    throw error;
   }
 }
 
@@ -806,16 +834,15 @@ async function deliver(name, args, context, config, who, held) {
       let sent;
       try {
         if (terminalTarget.queueOnly) throw new TerminalNotLoadedError('The daemon is unavailable for this explicit terminal route.');
-        const send = connection => sendToTerminalThread(connection, { threadId: route.to.id, text: peerText, messageId, signal });
-        const fresh = () => withDaemon(config, signal, send);
-        sent = held.connection ? await overHeld(held, send, fresh, signal) : await fresh();
+        const plan = await terminalPlan(held, config, route.to.id, signal);
+        sent = await writeTerminalPlan(held.connection, plan, { text: peerText, messageId, signal });
       } catch (error) {
         // Thrown before anything is written, so the queue fallback can never double-deliver. An explicit
         // terminal route also queues when the daemon went away before the input was written (Q03).
         const unwritten = error instanceof TerminalNotLoadedError ||
           (terminalTarget.allowQueue && error instanceof DaemonUnavailableError && !error.deliveryUnknown);
         if (!unwritten) throw error;
-        if (!terminalTarget.allowQueue) throw failure('The selected Codex session left the daemon before sending. No message was sent. Select desktop or terminal transport explicitly.', 'target_unavailable');
+        if (!terminalTarget.allowQueue) throw failure(`The selected Codex session left the daemon before sending. No message was sent. ${explicitRouteAdvice}`, 'target_unavailable', { retry: 'new_id' });
         sent = await queueToTerminalThread({ threadId: route.to.id, text: peerText, env: config.env, signal,
           ...(config.queue ?? {}) });
       }
@@ -842,13 +869,13 @@ async function deliver(name, args, context, config, who, held) {
     const reason = error.deliveryUnknown === true ? 'delivery_unconfirmed' : transportReason(error, signal);
     const status = REASONS[reason].delivered === false ? 'failed' : 'uncertain';
     let saved = true;
-    const terminal = { status, route, attemptId: reserved.message.attemptId, error: error.message, ...(status === 'failed' ? { reason } : {}) };
+    const terminal = { status, route, attemptId: reserved.message.attemptId, error: error.message, ...(status === 'failed' ? { reason, ...(error.retry === 'new_id' ? { retry: 'new_id' } : {}) } : {}) };
     try { await waitForSettlement(finishMessage(session, messageId, terminal), signal); }
     catch { saved = false; retainSettlement(session, reserved.message, terminal); }
     // The record is still reserved until a disk-only repair. Do not suggest bypassing that repair.
-    error.outcome = outcome(reason, { record: record(saved ? status : 'sending'), ...(saved || status !== 'failed' ? {} : { retry: 'inspect' }) });
+    error.outcome = outcome(reason, { record: record(saved ? status : 'sending'), retry: !saved && status === 'failed' ? 'inspect' : terminal.retry });
     if (reason === 'queued_message_too_long' && saved) error.message += ' This ID is already reserved for the original text; use a new ID for the shorter message.';
-    if (!saved) error.message += ' The outcome could not be saved in the delivery record.';
+    if (!saved) error.message = (terminal.retry === 'new_id' ? 'No message was sent. Inspect the original ID with list_deliveries before considering a route change.' : error.message) + ' The outcome could not be saved in the delivery record.';
     throw error;
   }
   try {
@@ -984,7 +1011,8 @@ async function runBridgeTool(name, args, context) {
     // shows it. Archived titles and project paths travel as UI-only result metadata (PR02).
     // config.toml is not the Enter action Codex applies (K03), so the 1.0 field names the safe mode.
     return { owner_thread_id: who.threadId, application: 'codex', sessions: catalog.conversations.filter(chat => chat.live),
-      warnings: [], composer_enter_behavior: 'cmdAlways',
+      warnings: [...catalog.warnings.filter(w => publicCatalogWarnings.has(w) || historyWarnings.includes(w)),
+        ...(catalog.next_cursor ? ['Some Claude metadata was omitted because the scan limit was reached.'] : [])], composer_enter_behavior: 'cmdAlways',
       [PANEL_CATALOG]: { history_order: 'commit', sessions: catalog.conversations, warnings: catalog.warnings, next_cursor: catalog.next_cursor } };
   }
   if (name === 'list_codex_threads') return listCodexThreads(args, context, config, who);

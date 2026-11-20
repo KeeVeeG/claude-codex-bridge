@@ -767,3 +767,68 @@ test('SP07: an exact replay verifies the shadow and returns both known handoffs 
   await assert.rejects(manualSend({...f.args,message:'Other body'},f.context),{reason:'id_conflict'});
   assert.equal(f.notices.length,1);assert.equal(userFrames(f.claude).length,1);
 });
+
+// Another live process holds the shadow lock; a 1.1 writer waits its bounded 5 s, then reports state_busy.
+const holdShadowLock = f => { const file = path.join(path.dirname(f.ledgerFile), 'state.lock');
+  fs.writeFileSync(file, JSON.stringify({ pid: process.ppid, token: randomUUID(), createdAt: Date.now() })); return () => fs.unlinkSync(file); };
+const copyAttempts = f => f.codex.messages.filter(e => e.message.method === 'tools/list').length;
+const primaryRow = (f, id) => Object.values(JSON.parse(fs.readFileSync(path.join(f.stateDir, hash(f.owner), 'state.json'))).messages).find(r => r.id === id);
+const unwritablePrimary = (t, f) => { const file = path.join(f.stateDir, hash(f.owner), 'state.json'), rename = fs.renameSync;
+  return t.mock.method(fs, 'renameSync', (a, b) => { if (b === file && Object.values(JSON.parse(fs.readFileSync(a)).messages).some(r => r.status === 'submitted')) throw fault('EROFS'); return rename(a, b); }); };
+
+test('R3S02: a replay blocked on the shadow lock keeps an unsaved primary receipt unsettled beside the known copy', windowsOnly, async t => {
+  const f = await setup(t), denied = unwritablePrimary(t, f);
+  const first = await manualSend(f.args, f.context);
+  assert.deepEqual([first.outcome.reason, first.notice_outcome.reason], ['settlement_failed', 'submitted']);
+  const release = holdShadowLock(f);
+  const blocked = await manualSend(f.args, f.context); release();
+  assert.deepEqual([blocked.delivery.status, blocked.outcome.reason, blocked.outcome.delivered, blocked.outcome.record.status], ['submitted', 'settlement_failed', true, 'sending']);
+  assert.deepEqual([blocked.notice_status, blocked.notice_outcome.reason, blocked.notice_retryable, blocked.notice_retry_action], ['submitted', 'submitted', false, undefined]);
+  assert.equal(primaryRow(f, f.args.message_id).status, 'sending');
+  assert.deepEqual([userFrames(f.claude).length, copyAttempts(f), f.notices.length], [1, 1, 1]);
+  denied.mock.restore();
+  const recovered = await manualSend(f.args, f.context);
+  assert.deepEqual([recovered.outcome.reason, recovered.outcome.record.status, recovered.notice_outcome.reason], ['already_submitted', 'submitted', 'submitted']);
+  assert.equal(primaryRow(f, f.args.message_id).status, 'submitted');
+  assert.deepEqual([userFrames(f.claude).length, copyAttempts(f), f.notices.length], [1, 1, 1]);
+});
+
+test('R3S03: a copy-only retry decides on the durable copy claim while the primary receipt stays unsaved', windowsOnly, async t => {
+  const f = await setup(t, { noticeFailure: 'schema' }), denied = unwritablePrimary(t, f);
+  const first = await manualSend(f.args, f.context);
+  assert.deepEqual([first.outcome.reason, first.notice_retryable, first.notice_retry_action, first.notice_outcome.delivered], ['settlement_failed', true, 'panel_retry_notice', false]);
+  f.failureMode.current = null;
+  const args = { session_id: f.args.session_id, message_id: f.args.message_id }, release = holdShadowLock(f);
+  const blocked = await retryManualNotice(args, f.context); release();
+  assert.deepEqual([blocked.outcome.reason, blocked.outcome.delivered, blocked.outcome.record.status], ['settlement_failed', true, 'sending']);
+  assert.deepEqual([blocked.notice_status, blocked.notice_outcome.reason, blocked.notice_outcome.delivered, blocked.notice_retryable, blocked.notice_retry_action],
+    ['failed', 'state_busy', false, true, 'panel_retry_notice']);
+  assert.deepEqual([copyAttempts(f), f.notices.length], [1, 0]);
+  const retried = await retryManualNotice(args, f.context);
+  assert.deepEqual([retried.outcome.reason, retried.outcome.record.status, retried.notice_status, retried.notice_outcome.reason, retried.notice_retryable, retried.notice_retry_action],
+    ['settlement_failed', 'sending', 'submitted', 'submitted', false, undefined]);
+  assert.equal(retried.delivery.message, f.args.message);
+  assert.equal(primaryRow(f, f.args.message_id).status, 'sending');
+  await assert.rejects(retryManualNotice(args, f.context), /not safely retryable/);
+  assert.deepEqual([userFrames(f.claude).length, copyAttempts(f), f.notices.length], [1, 2, 1]);
+  denied.mock.restore();
+  const recovered = await manualSend(f.args, f.context);
+  assert.deepEqual([recovered.outcome.reason, recovered.notice_outcome.reason, recovered.notice_retryable], ['already_submitted', 'submitted', false]);
+  assert.equal(primaryRow(f, f.args.message_id).status, 'submitted');
+  assert.deepEqual([userFrames(f.claude).length, copyAttempts(f), f.notices.length], [1, 2, 1]);
+});
+
+test('R3D04: a copy claimed by another live process stays pending although it carries this runtime\'s finished token', windowsOnly, async t => {
+  const f = await setup(t, { noticeFailure: 'schema' });
+  assert.equal((await manualSend(f.args, f.context)).notice_retryable, true);
+  const copies = f.notices.length, value = JSON.parse(fs.readFileSync(f.ledgerFile, 'utf8')), record = value.records[recordKey(f.args)];
+  assert.ok(record.writer_id && record.attempt_id);
+  // A released writer claims the copy by overwriting only the PID and its own claim fields.
+  Object.assign(record, { notice_status: 'pending', notice_attempted: true, notice_retryable: false, sender_pid: process.ppid });
+  const serialized = JSON.stringify(value); fs.writeFileSync(f.ledgerFile, serialized);
+  assert.equal(readManualRecords({ stateDir: f.stateDir, threadId: f.owner })[0].notice_status, 'pending');
+  const replay = await manualSend(f.args, f.context);
+  assert.deepEqual([replay.delivery.status, replay.notice_status, replay.notice_retryable], ['submitted', 'pending', false]);
+  assert.equal(fs.readFileSync(f.ledgerFile, 'utf8'), serialized);
+  assert.deepEqual([userFrames(f.claude).length, f.notices.length], [1, copies]);
+});

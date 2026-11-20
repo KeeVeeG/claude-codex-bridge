@@ -632,13 +632,19 @@ claudeTest('auto routing never switches to queue when a loaded session unloads b
   const desktop = await desktopApp(t, setup, [{ id: threadId, title: 'Desktop candidate' }]);
   const queue = await fakeQueue(t);
   await assert.rejects(() => executeBridgeTool('send_to_codex', { thread_id: threadId, message: 'hello', message_id: 'unloaded-race' },
-    { ...setup.context, queue: queue.queue }), /left the daemon/);
+    { ...setup.context, queue: queue.queue }), error => /left the daemon/.test(error.message) && error.outcome.retry === 'new_id' && /new message_id/.test(error.message));
   assert.equal(setup.requests().filter(entry => entry.method === 'thread/read').length, 2);
   assert.equal(setup.requests().some(entry => entry.method === 'turn/start' || entry.method === 'turn/steer'), false);
   assert.deepEqual(queue.queueCalls(), []);
   assert.deepEqual(desktop.sent(), []);
   const status = await executeBridgeTool('list_deliveries', {}, setup.context);
   assert.equal(status.deliveries.find(message => message.message_id === 'unloaded-race').status, 'failed');
+  const explicit = { thread_id: threadId, message: 'hello', transport: 'desktop' };
+  await assert.rejects(executeBridgeTool('send_to_codex', { ...explicit, message_id: 'unloaded-race', retry_failed: true }, setup.context),
+    error => error.outcome.retry === 'new_id' && /confirm|ask/i.test(error.message));
+  assert.equal(desktop.sent().length, 0);
+  const sent = await executeBridgeTool('send_to_codex', { ...explicit, message_id: 'confirmed-desktop' }, setup.context);
+  assert.equal(sent.outcome.delivered, true); assert.equal(desktop.sent().length, 1);
 });
 
 claudeTest('explicit terminal delivery still queues when the daemon stops between routing and the write (Q03)', async t => {
@@ -803,6 +809,36 @@ for (const closeFrame of [undefined, [0x88, 0]]) claudeTest(`SP04: a clean pre-w
   const result = await executeBridgeTool('send_to_codex', { thread_id: target, transport: 'terminal', message: 'fixture' }, context);
   assert.equal(result.outcome.reason, 'submitted'); assert.equal(queue.queueCalls().length, 1);
   assert.ok(s.requests().every(row => !['turn/start','turn/steer'].includes(row.method)));
+});
+
+claudeTest('R3S04: three repeatable final routing reads, zero writes or queue fallback after timeout', async t => {
+  const target = randomUUID(), s = await claudeCallerSetup(t, { threads: [{ id: target, status: { type: 'active' } }], silent: 'thread/turns/list' });
+  const queue = await fakeQueue(t), context = { ...s.context, queue: queue.queue };
+  // Advance a 15 s inquiry timer in fixture time, not the call deadline or a transport write.
+  const timer = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => timer(fn, ms === 15000 ? 1200 : ms, ...args));
+  await assert.rejects(executeBridgeTool('send_to_codex', { thread_id: target, transport: 'terminal', message: 'fixture' }, context),
+    e => e.outcome?.reason === 'route_unverified' && e.outcome.delivered === false);
+  assert.equal(s.requests().filter(row => row.method === 'thread/turns/list').length, 3);
+  assert.equal(s.requests().filter(row => ['turn/start','turn/steer'].includes(row.method)).length, 0);
+  assert.equal(queue.queueCalls().length, 0);
+});
+
+claudeTest('R3S04: a late final read followed by notLoaded never queues the message', async t => {
+  const { FrameDecoder } = await import('../lib/ws-jsonrpc.mjs');
+  const target = randomUUID(), active = { type: 'active' };
+  const s = await claudeCallerSetup(t, { threads: [{ id: target, statusByRead: [active, active, { type: 'notLoaded' }], turns: [{ id: 'fixture-turn', status: 'inProgress' }] }] });
+  const queue = await fakeQueue(t); let tick = performance.now(); t.mock.method(performance, 'now', () => tick);
+  const push = FrameDecoder.prototype.push;
+  t.mock.method(FrameDecoder.prototype, 'push', function (chunk) {
+    const events = push.call(this, chunk);
+    if (events.some(e => e.type === 'text' && JSON.parse(e.text).result?.data?.[0]?.id === 'fixture-turn')) tick += 15001;
+    return events;
+  });
+  await assert.rejects(executeBridgeTool('send_to_codex', { thread_id: target, transport: 'terminal', message: 'fixture' }, { ...s.context, queue: queue.queue }),
+    e => e.outcome?.reason === 'route_unverified' && e.outcome.delivered === false);
+  assert.equal(s.requests().filter(e => e.method === 'thread/read').length, 3);
+  assert.ok(!s.requests().some(e => e.method === 'turn/start' || e.method === 'turn/steer')); assert.equal(queue.queueCalls().length, 0);
 });
 
 claudeTest('SP05: size refusal after reservation requires a new ID for shortened text', async t => {

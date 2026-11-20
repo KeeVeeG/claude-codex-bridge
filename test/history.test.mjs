@@ -370,6 +370,35 @@ test('ST02/EC07: an invalid matching row retains the paging interval until repai
   assert.deepEqual((await page({cursor:first.next_cursor})).messages.map(r=>r.id),['b']);await assert.rejects(page({cursor:'a'}),e=>e.reason==='invalid_argument' && /Restart without cursor/i.test(e.message));
 });
 
+test('R3D01: a continuation that finds the state root missing keeps its exact cursor; fresh state stays empty',async t=>{
+  const f=await nativeFixture(t),id=randomUUID(),own=ledger(f,'reader'),from={kind:'codex',id:'reader'},to={kind:'claude',id};
+  for(const key of ['a','b'])message(own,from,to,key,key);
+  const page=opts=>getBridgeConversation({stateDir:f.stateDir,ownerThreadId:'reader',sessionId:id,limit:1,...opts});
+  const first=await page({}),aside=path.join(path.dirname(f.stateDir),'state-aside');fs.renameSync(f.stateDir,aside);
+  const missing=await page({cursor:first.next_cursor});
+  assert.equal(missing.incomplete,true);assert.equal(missing.next_cursor,first.next_cursor);assert.equal(missing.has_more,true);assert.deepEqual(missing.messages,[]);
+  assert.match(missing.warnings.join(' '),/state directory is missing/);
+  const fresh=await page({});assert.deepEqual([fresh.messages,fresh.next_cursor,fresh.has_more,fresh.incomplete,fresh.warnings],[[],null,false,undefined,[]]);
+  fs.renameSync(aside,f.stateDir);
+  assert.deepEqual((await page({cursor:first.next_cursor})).messages.map(r=>r.id),['a']);
+});
+
+test('R3D02: a damaged key whose intact local route body names the selected pair keeps the interval; unassignable damage only warns',async t=>{
+  const f=await nativeFixture(t),id=randomUUID(),own=ledger(f,'reader'),from={kind:'codex',id:'reader'},to={kind:'claude',id};
+  for(const key of ['a','b','c','d'])message(own,from,to,key,key);
+  message(own,from,{kind:'claude',id:randomUUID()},'elsewhere','elsewhere');
+  const page=opts=>getBridgeConversation({stateDir:f.stateDir,ownerThreadId:'reader',sessionId:id,limit:2,...opts});
+  const first=await page({});assert.deepEqual(first.messages.map(r=>r.id),['c','d']);
+  const state=JSON.parse(fs.readFileSync(own.stateFile)),rekey=(id,edit)=>{const key=Object.keys(state.messages).find(k=>state.messages[k].id===id);const row=state.messages[key];delete state.messages[key];state.messages[edit(key)]=row;return key;};
+  const original=rekey('b',key=>key.replace(/^route:./,'route:'));rekey('elsewhere',key=>key.replace(/^route:./,'route:'));
+  state.messages.legacy={id:'legacy',direction:'to_claude',message:'legacy',createdAt:1,status:'submitted'};fs.writeFileSync(own.stateFile,JSON.stringify(state));
+  const bad=await page({cursor:first.next_cursor});
+  assert.equal(bad.incomplete,true);assert.equal(bad.next_cursor,first.next_cursor);assert.deepEqual(bad.messages,[]);assert.match(bad.warnings.join(' '),/invalid or duplicate/);
+  rekey('b',()=>original);fs.writeFileSync(own.stateFile,JSON.stringify(state));
+  const repaired=await page({cursor:first.next_cursor});assert.deepEqual(repaired.messages.map(r=>r.id),['a','b']);assert.equal(repaired.incomplete,undefined);
+  assert.match(repaired.warnings.join(' '),/invalid or duplicate/);assert.doesNotMatch(JSON.stringify(repaired),/elsewhere|legacy/);
+});
+
 test('CA03: the unchanged first page and v1 continuation use civil order, independently of the opt-in v2 order',async t=>{
   const f=await nativeFixture(t),id=randomUUID(),own=ledger(f,'reader'),from={kind:'codex',id:'reader'},to={kind:'claude',id};
   for(const key of ['a','b','c','d'])message(own,from,to,key,key);

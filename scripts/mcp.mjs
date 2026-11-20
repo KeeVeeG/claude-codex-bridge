@@ -27,7 +27,7 @@ const textProperty = (description, maxLength = 256) => ({ type: 'string', minLen
 const idField = description => ({ ...textProperty(description, 100),
   pattern: '^[a-zA-Z0-9_-]{1,100}$', not: { enum: ['prototype', ...Object.getOwnPropertyNames(Object.prototype)] } });
 const messageId = idField('Omit for a new send or reply. For tracking, choose a UUID before the first send; reuse that ID for lookup or retry.');
-const retryFailed = { type: 'boolean', default: false, description: 'Retry a recorded no-write failure with its explicit ID, route and text; otherwise repeat calls only report the record.' };
+const retryFailed = { type: 'boolean', default: false, description: 'For an eligible recorded no-write failure, use true with the original ID, route and text.' };
 const includeMessage = { type: 'boolean', default: true, description: 'Use false to omit your text from this receipt only.' };
 const messageText = textProperty('Text to send; at most 65,536 UTF-8 bytes.', 65536);
 const schema = (properties = {}, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
@@ -44,7 +44,7 @@ const claudeSession = schema({ session_id: outputText, title: outputText, cwd: o
 }, ['session_id', 'title', 'cwd', 'entrypoint', 'status']);
 const codexChat = schema({ thread_id: outputText, title: outputText, status: outputText,
   cwd: outputText, host_id: outputText, source: { type: 'string', enum: ['desktop', 'terminal', 'ssh'], description: 'Discovery transport only: Desktop app, local daemon store, or configured SSH host. Local discovery does not establish the current client or prove a session is open.' } }, ['thread_id', 'title', 'status', 'cwd', 'host_id', 'source']);
-const outcomeProperty = { ...OUTCOME_SCHEMA, description: 'retry: same_id = repeat with the original ID and text (retry_failed: true for a recorded failure); after_fix = fix the cause first; new_id = only a new message_id can send it; inspect = check the recipient and list_deliveries before any further send; no = done.' };
+const outcomeProperty = { ...OUTCOME_SCHEMA, description: 'retry: same_id = repeat unchanged; after_fix = fix the cause first; new_id = use a fresh ID; inspect = check the recipient and list_deliveries; no = done.' };
 const issues = (key, keyProperty) => ({ type: 'array', items: schema({ [key]: keyProperty, ...(key === 'check' ? { status: { type: 'string', enum: ['fail', 'warning'] } } : {}), reason: { type: 'string', enum: Object.keys(REASONS) } }, key === 'check' ? [key, 'status', 'reason'] : [key, 'reason']) });
 // Only the public send echo is optional. A ledger row and a panel receipt still require the text.
 const sendDelivery = { ...delivery, required: delivery.required.filter(key => key !== 'message') };
@@ -74,7 +74,7 @@ const conversation = schema({ session_id: outputText, title: outputText, cwd: ou
 const uiMessage = schema({ id: outputText, direction: { type: 'string', enum: ['to_claude', 'to_codex'] },
   message: outputText, created_at: { type: 'integer' },
   status: { type: 'string', enum: ['sending', 'submitted', 'failed', 'uncertain'] },
-  manual: { type: 'boolean' }, notice_status: outputText, notice_retryable: { type: 'boolean' },
+  manual: { type: 'boolean' }, notice_status: outputText, notice_retryable: { type: 'boolean' }, notice_claimed: { type: 'boolean' },
   notice_reason: { type: 'string', enum: Object.keys(REASONS) }, notice_omitted: noticeOmitted }, ['id', 'direction', 'message', 'created_at', 'status']);
 const registryOf = env => env.CLAUDE_CODEX_BRIDGE_REGISTRY_DIR ||
   path.join(env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'sessions');

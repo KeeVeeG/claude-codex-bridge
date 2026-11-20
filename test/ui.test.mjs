@@ -691,6 +691,41 @@ test('PN03/SP06: exact history can authorize only the owner copy and the next fa
   assert.match(h.node('timeline').textContent, /Copy not posted.*target-host support/); assert.ok(timelineButton(h, 'Post the copy again')); assert.equal(h.requests('panel_send').length, 1);
 });
 
+test('R3P02: a later copy attempt replaces the previous refusal without offering another post', async () => {
+  const h = await live(); await h.choose('a'); type(h, 'Original'); h.node('composer').dispatch('submit'); await flush();
+  const send = h.requests('panel_send').at(-1), id = send.message.params.arguments.message_id;
+  h.reply(send, { delivery: delivery(id, 'Original'), manual: true, notice_status: 'failed', notice_retryable: true,
+    notice_outcome: { delivered: false, reason: 'request_rejected', retry: 'after_fix' } }); await flush();
+  const history = status => ({ session_id: 'a', messages: [record(id, 'Original', { manual: true, notice_status: status, notice_retryable: false })] });
+  h.reply(h.requests('panel_history').at(-1), history('pending')); await flush();
+  assert.match(h.node('timeline').textContent, /Posting a copy/); assert.doesNotMatch(h.node('timeline').textContent, /Copy not posted/);
+  h.node('refresh').dispatch('click'); await flush(); h.result(h.requests('bridge_panel').at(-1), launcher()); await flush();
+  h.reply(h.requests('panel_history').at(-1), history('uncertain')); await flush();
+  assert.match(h.node('timeline').textContent, /may not have been posted.*Check this chat/);
+  assert.equal(timelineButton(h,'Post the copy again'), undefined); assert.equal(h.requests('panel_retry_notice').length, 0);
+});
+
+test('R3P02: a busy copy-only retry does not hide a newer durable claim on the pending slot', async () => {
+  const h = await live(), row = record('copy', 'Original', { manual:true, notice_status:'pending', notice_retryable:true });
+  await h.choose('a', [row]); timelineButton(h,'Post the copy now').dispatch('click'); await flush();
+  h.result(h.requests('panel_retry_notice').at(-1), errorResult('Busy.', { delivered:false, reason:'server_busy', retry:'same_id' })); await flush();
+  h.reply(h.requests('panel_history').at(-1), { session_id:'a', messages:[{ ...row, notice_retryable:false, notice_claimed:true }] }); await flush();
+  assert.match(h.node('timeline').textContent, /Posting a copy/); assert.doesNotMatch(h.node('timeline').textContent, /could not be posted/);
+  assert.equal(timelineButton(h,'Post the copy now'), undefined); assert.equal(h.requests('panel_send').length, 0);
+});
+
+test('R3P03: an offline catalog notification disables the refused row and replaces send-again guidance', async () => {
+  const h = await live(); await h.choose('a'); type(h,'Original'); h.node('composer').dispatch('submit'); await flush();
+  h.result(h.requests('panel_send').at(-1), errorResult('Busy.', { delivered:false, retry:'same_id', reason:'target_busy' })); await flush();
+  assert.equal(Boolean(timelineButton(h,'Retry this text').disabled), false);
+  const notify = sessions => h.emit({ jsonrpc:'2.0', method:'ui/notifications/tool-result', params:launcher(sessions) });
+  notify(panel.sessions.map(chat => ({...chat, live:false}))); await flush();
+  assert.equal(timelineButton(h,'Retry this text').disabled, true);
+  assert.match(h.node('alert-text').textContent, /open this conversation/i); assert.doesNotMatch(h.node('timeline').textContent, /Send again/i);
+  timelineButton(h,'Retry this text').dispatch('click'); await flush(); assert.equal(h.requests('panel_send').length, 1);
+  notify(panel.sessions); await flush(); assert.equal(Boolean(timelineButton(h,'Retry this text').disabled), false);
+});
+
 test('PN03: an initial protocol refusal names the copy repair, not an unconditional retry or a raw diagnostic', async () => {
   const h = await live(); await h.choose('a'); type(h, 'Exact'); h.node('composer').dispatch('submit'); await flush();
   const send = h.requests('panel_send').at(-1), id = send.message.params.arguments.message_id;

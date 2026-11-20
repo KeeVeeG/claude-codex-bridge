@@ -203,7 +203,7 @@
   const count = value => value.toLocaleString('en-US');
   const bytesOf = value => new TextEncoder().encode(value).length;
   const keyOf = row => `${row.direction}:${row.id}`;
-  const signatureOf = row => [row.status, row.notice_status, row.notice_retryable, row.notice_reason, row.notice_omitted, row.notice_note, row.notice_retry, row.primary_note, row.notice_delivered, row.refusal?.reason].join('|');
+  const signatureOf = row => [row.status, row.notice_status, row.notice_retryable, row.notice_claimed, row.notice_reason, row.notice_omitted, row.notice_note, row.notice_retry, row.primary_note, row.notice_delivered, row.refusal?.reason].join('|');
   const modifier = mac ? '⌘' : 'Ctrl';
   function element(tag, className, text) { const node = document.createElement(tag); if (className) node.className = className; if (text !== undefined) node.textContent = text; return node; }
   function button(className, text, control, run) {
@@ -405,6 +405,7 @@
       // A row seen only on later pages is not live, or page one would hold it.
       if (!complete || keepChat(id)) next.set(id, chat.live ? { ...chat, live: false } : chat);
     }
+    const liveChanged = next.get(state.selected)?.live !== state.chats.get(state.selected)?.live;
     state.chats = next;
     if (mode !== 'poll') state.catalogCursor = cursor;
     if (mode !== 'append') state.catalogWarnings = [...warnings];
@@ -415,6 +416,7 @@
     if (signature === state.catalogSignature) return;
     state.catalogSignature = signature;
     renderChats(); renderConversation({ timeline: false });
+    if (liveChanged) renderTimeline({ preserve: true });
   }
   async function catalogPages(cursor) {
     const pages = [];
@@ -512,7 +514,7 @@
   function normalizeRow(row) {
     if (!object(row) || typeof row.id !== 'string' || typeof row.message !== 'string' || !['to_claude', 'to_codex'].includes(row.direction)) return null;
     return { id: row.id, direction: row.direction, message: row.message, created_at: row.created_at, status: ['submitted', 'failed', 'sending'].includes(row.status) ? row.status : 'uncertain',
-      manual: row.manual === true, notice_status: string(row.notice_status) || undefined, notice_retryable: row.notice_retryable === true,
+      manual: row.manual === true, notice_status: string(row.notice_status) || undefined, notice_claimed: row.notice_claimed === true, notice_retryable: row.notice_retryable === true,
       notice_reason: string(row.notice_reason) || undefined, notice_omitted: row.notice_omitted === true };
   }
   function rowsOf(data) {
@@ -543,6 +545,11 @@
         Object.assign(row, { notice_delivered: true, notice_status: 'submitted', notice_retryable: false });
         if (row.notice_note !== 'settlement_failed') row.notice_note = undefined;
       } else if (row.notice_delivered !== true && row.notice_status !== 'submitted' && saved.notice_status) {
+        // A refusal describes only its attempt. Don't carry it over a later claim or unknown result.
+        if (row.notice_delivered === false && (saved.notice_status === 'uncertain' ||
+            (saved.notice_status === 'pending' && !saved.notice_retryable && (saved.notice_claimed || row.notice_status === 'failed' || row.notice_retryable)))) {
+          Object.assign(row, { notice_delivered: undefined, notice_note: undefined, notice_reason: undefined, notice_retry: undefined });
+        }
         row.notice_retryable = saved.notice_retryable;
         row.notice_status = saved.notice_status;
         row.notice_omitted ||= saved.notice_omitted;
@@ -780,8 +787,9 @@
       access_denied: 'Check authorization for this Codex chat.', request_rejected: 'Check why Codex refused the copy before posting it again.' };
     return fixes[row.notice_reason] || (row.notice_retry === 'after_fix' ? 'Resolve the reported bridge problem before posting the copy.' : '');
   }
-  function failureText(pending) {
+  function failureText(pending, sessionId) {
     const [what, step, extra] = SEND_REASONS[pending.reason] ?? ['The bridge did not send it.', 'Send again.', 'detail'];
+    if (!state.chats.get(sessionId)?.live && ['same_id','after_fix'].includes(pending.retry)) return [what, 'Open this conversation in Claude Code, then refresh the list.', 'refresh'];
     return [extra === 'detail' && pending.detail ? `${what} ${pending.detail.slice(0, 300)}` : what, step, extra];
   }
   function statusText(row) {
@@ -880,7 +888,7 @@
   }
   function rowNode(sessionId, cache, row, used) {
     const key = keyOf(row); const retrying = state.noticeRetries.has(`${sessionId}:${row.id}`);
-    const signature = `${signatureOf(row)}|${retrying}|${state.ready}|${row.refusal && canSend(state.chats.get(sessionId),row.message)}`;
+    const signature = `${signatureOf(row)}|${retrying}|${state.ready}|${row.refusal && state.chats.get(sessionId)?.live}|${row.refusal && canSend(state.chats.get(sessionId),row.message)}`;
     used.add(key);
     const saved = cache.nodes.get(key); if (saved?.signature === signature && saved.message === row.message) return saved.node;
     const outgoing = row.direction === 'to_claude'; const node = element('article', `message-row${outgoing ? ' outgoing' : ''}`);
@@ -892,7 +900,7 @@
     if (outgoing && row.status === 'submitted' && !demo) meta.title = 'The bridge wrote this message to the Claude Code conversation. Claude Code may still hold or refuse it; this is not a read receipt.';
     node.append(label, element('div', 'bubble', string(row.message)), meta);
     if (row.refusal) {
-      const [why,fix] = failureText(row.refusal); node.append(element('span','refusal-detail',why+' '+fix));
+      const [why,fix] = failureText(row.refusal, sessionId); node.append(element('span','refusal-detail',why+' '+fix));
       if (['same_id','after_fix'].includes(row.refusal.retry)) {
         const action = button('small-button','Retry this text', 'retry:'+row.id, () => sendMessage(row.refusal));
         action.disabled = !canSend(state.chats.get(sessionId),row.message); node.append(action);
@@ -969,7 +977,7 @@
         actions: state.ready && !state.stopped ? [['Check again', () => loadHistory(sessionId)]] : [] };
     }
     if (pending?.phase === 'failed' && pending.message === state.drafts.get(sessionId)) {
-      const [what, step, extra] = failureText(pending);
+      const [what, step, extra] = failureText(pending, sessionId);
       return { text: `Not sent. ${what} ${step} The draft is kept.`, tone: 'error', actions: extra === 'refresh' ? [['Refresh list', () => refresh()]] : [] };
     }
     if (!cache) return null;

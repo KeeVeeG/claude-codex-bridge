@@ -5,16 +5,22 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
-import { REASONS } from '../lib/outcome.mjs';
+import { REASONS, outcome, sendErrorText } from '../lib/outcome.mjs';
 import { inquire, startCall, waitForSettlement } from '../lib/call-time.mjs';
 import { inspectStateLocks } from '../lib/state-lock.mjs';
-import { interruptedSend, createSession, recordMessage, finishMessage, getMessages, readSession, messageIndex } from '../lib/store.mjs';
+import { interruptedSend, createSession, recordMessage, finishMessage, getMessages, readSession, messageIndex, lookupMessage, updateSession } from '../lib/store.mjs';
 import * as ledger from '../lib/call-store.mjs';
 import { openDaemon } from '../lib/codex-daemon.mjs';
 import { fakeDaemon } from './codex-daemon-helpers.mjs';
 import { nativeFixture } from './native-helpers.mjs';
 
 const draft = { id: 'original', direction: 'to_claude', message: 'fixture', route: { from: { id: 'sender', kind: 'codex' }, to: { id: 'recipient', kind: 'claude' } } };
+
+test('R3P04: recorded after_fix names the exact retry flag; an unrecorded refusal does not', () => {
+  const reason = 'protocol_incompatible', message = 'Update the destination client.';
+  assert.match(sendErrorText(message, outcome(reason, { record: { id: 'example', status: 'failed' } })), /retry_failed: true.*original ID, route and text/);
+  assert.doesNotMatch(sendErrorText(message, outcome(reason)), /retry_failed/);
+});
 
 test('EC09: README documents each outcome code once, with a cause and a repair', () => {
   const section = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8').split('### Outcome reasons\n')[1]?.split('\n### ')[0] ?? '';
@@ -67,6 +73,28 @@ test('LF03: a legacy reservation with only a reused PID is not in flight forever
   const now = Date.now(), row = { status: 'sending', senderPid: process.pid, createdAt: now };
   assert.equal(interruptedSend(row), false);
   assert.equal(interruptedSend({ ...row, createdAt: now - 3 * 3600_000 }), true);
+});
+
+test('R3D03: a live legacy reservation dated in the future stays in flight until it ages on this process clock', async t => {
+  const f = await nativeFixture(t), session = createSession({ stateDir: f.stateDir, threadId: 'sender', cwd: f.cwd });
+  recordMessage(session, { ...draft, id: 'rollback' });
+  const legacy = state => { const row = Object.values(state.messages).find(r => r.id === 'rollback');
+    delete row.startedTick; delete row.attemptId; delete row.orderAt; row.createdAt = Date.now() + 120_000; return row; };
+  updateSession(session, legacy);
+  const base = performance.now(); let elapsed = 0; t.mock.method(performance, 'now', () => base + elapsed);
+  const saved = () => Object.values(readSession(session).messages).find(r => r.id === 'rollback');
+  assert.equal(interruptedSend(saved()), false);
+  assert.equal(lookupMessage({ stateDir: f.stateDir, threadId: 'sender' }, { ...draft, id: 'rollback' }).prior.status, 'sending');
+  assert.equal(recordMessage(session, { ...draft, id: 'rollback', reconcileOnly: true }).message.status, 'sending');
+  assert.equal(getMessages(session, 5)[0].status, 'sending');
+  assert.equal(saved().status, 'sending', 'no reconcile persists a downgrade');
+  assert.equal(interruptedSend({ ...saved(), senderPid: 0x7ffffffe }), true, 'a dead sender still ends the reservation');
+  assert.equal(interruptedSend({ ...saved(), senderPid: undefined }), true, 'without a live PID future civil time stays unproven');
+  assert.equal(interruptedSend({ ...saved(), startedTick: Number(process.hrtime.bigint() / 1000000n) + 5000 }), true, 'a future boot tick is still a restart');
+  elapsed = 60_001;
+  assert.equal(interruptedSend(saved()), true);
+  assert.equal(recordMessage(session, { ...draft, id: 'rollback', reconcileOnly: true }).message.status, 'uncertain');
+  assert.equal(saved().status, 'uncertain');
 });
 
 test('ST06: the lock inspector reports a reused guard PID, distinguishes an inconclusive check, and never unlinks', { skip: process.platform !== 'win32' }, async t => {
