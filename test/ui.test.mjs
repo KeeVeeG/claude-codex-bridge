@@ -433,15 +433,78 @@ test('A08 and V06: a definite refusal keeps the draft, names the reason and one 
   assert.equal(descendants(h.node('timeline')).filter(node => node.className.startsWith('notice-detail')).length, 0);
   h.node('composer').dispatch('submit'); await flush();
   const second = h.requests('panel_send').at(-1); assert.equal(second.message.params.arguments.message_id, id);
-  // A 1.0 server reports only the failed status and its error text.
-  h.reply(second, { delivery: delivery(id, 'Hello', { status: 'failed', error: 'Claude Code refused the frame.' }), manual: true, notice_status: 'pending' }); await flush();
-  assert.equal(h.node('alert-text').textContent, 'Not sent. The send failed before Claude Code took it. Claude Code refused the frame. Send again. The draft is kept.');
+  h.result(second, errorResult('Message not sent. Claude Code was busy.', { delivered: false, retry: 'same_id', reason: 'target_busy' })); await flush();
+  assert.equal(h.node('alert-text').textContent, 'Not sent. Claude Code was busy. Send again. The draft is kept.');
   assert.equal(h.node('send').disabled, false);
   type(h, 'Hello again'); h.node('composer').dispatch('submit'); await flush();
   const third = h.requests('panel_send').at(-1); assert.notEqual(third.message.params.arguments.message_id, id, 'Changed text gets a new ID.');
   h.result(third, { isError: true, content: [{ type: 'text', text: 'Message not sent. message has an unsupported control.' }],
     _meta: { 'bridge-claude-codex/outcome': { outcome: { delivered: false, retry: 'after_fix', reason: 'invalid_argument' } } } }); await flush();
   assert.equal(h.node('alert-text').textContent, 'Not sent. The bridge refused the message. message has an unsupported control. Correct it, then send again. The draft is kept.');
+});
+
+test('R5G03: a 1.0 server\'s untyped failed send is inspect-only; Check again reads, and no key, button or teardown resends it', async () => {
+  const h = await live(); await h.choose('a'); type(h, 'Hello');
+  h.node('composer').dispatch('submit'); await flush();
+  const send = h.requests('panel_send').at(-1), id = send.message.params.arguments.message_id;
+  // The released server reports only the failed status and its error text, and answers the same ID with the same row.
+  h.reply(send, { delivery: delivery(id, 'Hello', { status: 'failed', error: 'Claude Code refused the frame.' }), manual: true, notice_status: 'pending' }); await flush();
+  const head = 'An older bridge server reported a failure without proof that nothing was written.';
+  const tail = 'Before sending again, fully quit and reopen Codex so it starts the installed server.';
+  assert.equal(h.node('alert-text').textContent, `${head} Check the receiving chat and its history. ${tail}`);
+  const shadow = record(id, 'Hello', { manual: true, status: 'failed', notice_status: 'pending' });
+  h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [shadow], has_more: false, next_cursor: null }); await flush();
+  const unresolved = () => {
+    assert.equal(h.node('message').value, 'Hello'); assert.equal(h.node('send').disabled, true);
+    assert.equal(h.node('composer-hint').textContent, 'Sending is paused while the handoff is unconfirmed.');
+    const rows = descendants(h.node('timeline')).filter(node => node.className === 'message-row outgoing');
+    assert.equal(rows.length, 1); assert.match(rows[0].textContent, /Hello.*Handoff not confirmed/); assert.doesNotMatch(h.node('timeline').textContent, /Not sent/);
+    assert.equal(timelineButton(h, 'Retry this text'), undefined);
+  };
+  assert.equal(h.node('alert-text').textContent, `${head} No matching handoff in the history checked; inspect the receiving chat. ${tail}`);
+  unresolved();
+  await checkHistoryOnly(h, [shadow]); unresolved();
+  for (const keys of [{ ctrlKey: true }, { metaKey: true }, {}]) h.node('message').dispatch('keydown', { key: 'Enter', ...keys });
+  h.node('composer').dispatch('submit'); await flush(); unresolved();
+  type(h, 'Different text'); h.node('message').dispatch('keydown', { key: 'Enter', ctrlKey: true }); h.node('composer').dispatch('submit'); await flush();
+  assert.equal(h.requests('panel_send').length, 1, 'no resend, retry flag or fresh ID probes the unresolved message');
+  // Teardown cancels the panel: neither a read nor a send remains available.
+  h.emit({ jsonrpc: '2.0', id: 'teardown', method: 'ui/resource-teardown', params: {} }); await flush();
+  assert.equal(h.node('alert-actions').children.length, 0);
+  h.node('message').dispatch('keydown', { key: 'Enter', ctrlKey: true }); h.node('composer').dispatch('submit'); await flush();
+  assert.equal(h.requests('panel_send').length, 1);
+
+  // A modern recorded no-write failure keeps its explicit retry, by button or keyboard, under the same ID.
+  const modern = await live(); await modern.choose('a'); type(modern, 'Again');
+  modern.node('composer').dispatch('submit'); await flush();
+  const first = modern.requests('panel_send').at(-1), sent = first.message.params.arguments.message_id;
+  modern.result(first, errorResult('Message not sent. The send was cancelled before anything was written.', { delivered: false, retry: 'same_id', reason: 'cancelled', record: { id: sent, status: 'failed' } })); await flush();
+  assert.equal(modern.node('alert-text').textContent, 'Not sent. The send was cancelled before anything was written. Send again. The draft is kept.');
+  assert.ok(timelineButton(modern, 'Retry this text'));
+  modern.node('message').dispatch('keydown', { key: 'Enter', ctrlKey: true }); await flush();
+  assert.deepEqual(modern.requests('panel_send').at(-1).message.params.arguments, { session_id: 'a', message: 'Again', message_id: sent, retry_failed: true });
+});
+
+test('R5G03: a send frozen by an owner change before its 1.0 failed reply reopens unconfirmed, never as "Not sent"', async () => {
+  const values = new Map(), storage = { getItem: k => values.get(k) ?? null, setItem: (k, v) => values.set(k, v), removeItem: k => values.delete(k) };
+  const h = await live(harness('', { storage })); await h.choose('a'); type(h, 'Hello');
+  h.node('composer').dispatch('submit'); await flush();
+  const send = h.requests('panel_send').at(-1), id = send.message.params.arguments.message_id;
+  h.emit({ jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: launcher(panel.sessions, { owner: 'different-owner' }) }); await flush();
+  h.reply(send, { delivery: delivery(id, 'Hello', { status: 'failed', error: 'Claude Code refused the frame.' }), manual: true, notice_status: 'pending' }); await flush();
+  // Reopened under the original owner: the snapshot predates the reply, and history holds the old server's failed row.
+  const back = await live(harness('', { storage })), shadow = record(id, 'Hello', { manual: true, status: 'failed', notice_status: 'pending' });
+  await back.choose('a', [shadow]);
+  for (let check = 0; check < 2; check++) {
+    assert.equal(back.node('message').value, 'Hello'); assert.equal(back.node('send').disabled, true);
+    const rows = descendants(back.node('timeline')).filter(node => node.className === 'message-row outgoing');
+    assert.equal(rows.length, 1); assert.match(rows[0].textContent, /Hello.*Handoff not confirmed/); assert.doesNotMatch(back.node('timeline').textContent, /Not sent/);
+    assert.equal(timelineButton(back, 'Retry this text'), undefined);
+    assert.match(back.node('alert-text').textContent, /not confirmed\. No matching handoff in the history checked; inspect the receiving chat\./);
+    if (!check) await checkHistoryOnly(back, [shadow]);
+  }
+  back.node('message').dispatch('keydown', { key: 'Enter', ctrlKey: true }); back.node('composer').dispatch('submit'); await flush();
+  assert.equal(back.requests('panel_send').length, 0);
 });
 
 test('P05: an unchanged or growing history reuses the shown rows, and only a few conversations keep their pages', async () => {

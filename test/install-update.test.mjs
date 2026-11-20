@@ -216,9 +216,9 @@ test('IU06: update steps stop 1.0.0-1.0.2 and unknown-source servers before the 
 // Clients that load the stage as the native ones do: Codex keeps one cached copy named by its version and replaces it
 // on add. Claude copies each version it installs and lists the version and the copy; with inPlace it loads the stage
 // folder itself and also lists that folder and the version it finds there, as Claude Code does for a local-path marketplace.
-function clientFixture(t) {
+function clientFixture(t, codexMarket = 'personal') {
   const f = fixture(t), market = 'claude-codex-local', selector = `${PLUGIN_NAME}@${market}`;
-  const codexCache = path.join(f.homeDir, '.codex', 'plugins', 'cache', 'personal', PLUGIN_NAME);
+  const codexCache = path.join(f.homeDir, '.codex', 'plugins', 'cache', codexMarket, PLUGIN_NAME);
   const claudeCache = path.join(f.homeDir, '.claude', 'plugins', 'cache', market, PLUGIN_NAME);
   const c = { claude: null, refuse: false, onRefuse: null, inPlace: false };
   const staged = () => JSON.parse(read(path.join(f.stage, 'package.json'))).version;
@@ -228,7 +228,7 @@ function clientFixture(t) {
     const [, action, verb] = args;
     if (app === 'codex') {
       fs.rmSync(codexCache, { recursive: true, force: true });
-      if (action === 'add') { copyTree(f.stage, path.join(codexCache, staged())); write(f.config, `[plugins."${id}"]\nenabled = true\n`); }
+      if (action === 'add') { copyTree(f.stage, path.join(codexCache, staged())); write(f.config, `[plugins."${PLUGIN_NAME}@${codexMarket}"]\nenabled = true\n`); }
       else write(f.config, '');
       return '{}';
     }
@@ -286,6 +286,93 @@ test('R3I01: after a Claude-only update, a late refusal returns each client to i
   f.c.refuse = true;
   await assert.rejects(main([], f.options), plainFailure);
   assert.deepEqual(f.codexRuns(), [older]); assert.equal(f.c.claude.version, claudeBuild); assert.equal(f.staged(), claudeBuild);
+});
+
+// R5G02: stages of one release differ only by their stamp, but Codex's cache fence needs the exact stage it runs.
+const turnCodex = (f, on) => write(f.config, read(f.config).replace(`enabled = ${!on}`, `enabled = ${on}`));
+for (const repeat of [['--claude'], ['--prepare-only']]) {
+  test(`R5G02: repeated ${repeat[0]} runs keep the exact stage a turned-off Codex still runs; re-enabled, a normal update succeeds`, async t => {
+    const f = clientFixture(t);
+    await main([], f.options); const a = f.staged();
+    assert.deepEqual(f.codexRuns(), [a]);
+    turnCodex(f, false);
+    const builds = [];
+    for (let run = 0; run < 3; run++) { await main(repeat, f.options); builds.push(f.staged()); }
+    assert.equal(new Set([a, ...builds]).size, 4, 'each run stamps a new build of the same release');
+    assert.deepEqual(f.codexRuns(), [a]); assert.match(read(f.config), /enabled = false/);
+    assert.ok(f.retained(a), 'the build in the untouched Codex cache is kept');
+    assert.ok(f.retained(builds[1]), 'the newest backup is kept'); assert.equal(f.retained(builds[0]), undefined, 'retention stays bounded');
+    turnCodex(f, true);
+    await main([], f.options); const updated = f.staged();
+    assert.deepEqual(f.codexRuns(), [updated]); assert.equal(f.c.claude.version, updated);
+    assert.equal(f.retained(a), undefined, 'once Codex runs the new build, its old stage is no longer needed');
+  });
+}
+
+test('R5G02: after Claude-only updates, a late refusal on the re-enabled update still returns Codex to its exact build', async t => {
+  const f = clientFixture(t);
+  await main([], f.options); const a = f.staged();
+  turnCodex(f, false);
+  await main(['--claude'], f.options); await main(['--claude'], f.options);
+  const claudeBuild = f.staged(), backup = f.retained(a);
+  turnCodex(f, true);
+  f.c.refuse = true;
+  await assert.rejects(main([], f.options), plainFailure);
+  assert.deepEqual(f.codexRuns(), [a]); assert.equal(f.c.claude.version, claudeBuild); assert.equal(f.staged(), claudeBuild);
+  assert.equal(f.retained(a), backup, 'the exact build is back in its own backup folder');
+  fs.unlinkSync(path.join(f.homeDir, '.claude', 'settings.json'));
+  await main([], f.options); assert.deepEqual(f.codexRuns(), [f.staged()]);
+});
+
+// Retention looks for the cached copy under every marketplace name, so a catalog that is away or renamed cannot hide it.
+for (const repeat of [['--claude'], ['--prepare-only']]) {
+  test(`R5G02: with the catalog away, repeated ${repeat[0]} runs keep the stage Codex runs under another marketplace name`, async t => {
+    const f = clientFixture(t, 'mine');
+    write(f.catalog, JSON.stringify({ name: 'mine', plugins: [] }));
+    await main([], f.options); const a = f.staged(), catalog = read(f.catalog);
+    assert.deepEqual(f.codexRuns(), [a]);
+    turnCodex(f, false); fs.rmSync(f.catalog);
+    for (let run = 0; run < 3; run++) await main(repeat, f.options);
+    assert.ok(f.retained(a), 'the build in the untouched Codex cache is kept'); assert.deepEqual(f.codexRuns(), [a]);
+    write(f.catalog, catalog); turnCodex(f, true);
+    await main([], f.options); assert.deepEqual(f.codexRuns(), [f.staged()]);
+  });
+}
+
+test('R5G02: when the Codex cache or a backup cannot be read in full, preparation keeps every backup', async t => {
+  for (const unknown of ['unreadable cache', 'linked copy', 'dangling cache link', 'unreadable backup']) {
+    await t.test(unknown, async sub => {
+      const f = clientFixture(sub);
+      await main([], f.options); const a = f.staged();
+      turnCodex(f, false);
+      await main(['--claude'], f.options); const b = f.staged();
+      await main(['--claude'], f.options); const c = f.staged();
+      if (unknown === 'unreadable cache') hook(sub, 'readdirSync', original => (dir, ...rest) => {
+        if (path.resolve(String(dir)) === path.resolve(f.codexCache)) throw Object.assign(new Error('EACCES fixture'), { code: 'EACCES' });
+        return original(dir, ...rest);
+      });
+      else if (unknown === 'linked copy') {
+        const elsewhere = path.join(f.homeDir, 'elsewhere'); fs.renameSync(path.join(f.codexCache, a), elsewhere);
+        fs.symlinkSync(elsewhere, path.join(f.codexCache, a), process.platform === 'win32' ? 'junction' : 'dir');
+      } else if (unknown === 'dangling cache link') {
+        // The cache's marketplace folder links to a drive that is not attached now.
+        const marketFolder = path.dirname(f.codexCache); fs.renameSync(marketFolder, path.join(f.homeDir, 'detached'));
+        fs.symlinkSync(path.join(f.homeDir, 'not-attached'), marketFolder, process.platform === 'win32' ? 'junction' : 'dir');
+      } else {
+        // The backup Codex runs passes the unchanged-stage check, then a transient denial hits the second byte read.
+        const file = path.resolve(f.retained(a), 'scripts', 'mcp.mjs'); let reads = 0;
+        hook(sub, 'readFileSync', original => (name, ...rest) => {
+          if (typeof name === 'string' && path.resolve(name) === file && ++reads === 2) throw Object.assign(new Error('EACCES fixture'), { code: 'EACCES' });
+          return original(name, ...rest);
+        });
+      }
+      const before = f.calls.length;
+      await main(['--claude'], f.options);
+      assert.ok(f.retained(a) && f.retained(b) && f.retained(c), 'no backup is pruned while a dependency is unknown');
+      assert.ok(f.logs.some(line => /backups were kept/.test(line)), f.logs.join('\n'));
+      assert.match(read(f.config), /enabled = false/); assert.equal(f.calls.slice(before).some(([app]) => app === 'codex'), false, 'a turned-off Codex is not touched');
+    });
+  }
 });
 
 for (const [label, args] of [['changed during the run', []], ['removed before a Claude-only run', ['--claude']]]) {

@@ -363,8 +363,11 @@ function callerDirectory(registryDir) {
 export async function resolveClaudeCaller({ registryDir, parentPid = process.ppid,
   socketPath = process.env.CLAUDE_CODE_MESSAGING_SOCKET, signal, probe } = {}) {
   const directory = callerDirectory(registryDir);
-  const ownSocket = socketPath === undefined ? null : canonicalLocalSocket(socketPath);
-  if (socketPath !== undefined && !ownSocket) throw failure('Claude caller exported an invalid messaging socket. Reload the bridge in that Code session.', 'caller_invalid');
+  // The Claude launcher passes an unset optional socket as `${CLAUDE_CODE_MESSAGING_SOCKET:-}`:
+  // exactly "" is absence. Any other value is an assertion that must name the parent's own socket.
+  const declared = socketPath === '' ? undefined : socketPath;
+  const ownSocket = declared === undefined ? null : canonicalLocalSocket(declared);
+  if (declared !== undefined && !ownSocket) throw failure('Claude caller exported an invalid messaging socket. Reload the bridge in that Code session.', 'caller_invalid');
   if (!Number.isSafeInteger(parentPid) || parentPid <= 0) {
     throw failure('Claude caller has no valid direct parent process. Reload the bridge from the intended Code session.', 'caller_invalid');
   }

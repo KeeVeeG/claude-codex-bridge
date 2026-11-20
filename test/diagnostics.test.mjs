@@ -66,6 +66,38 @@ test('R4O02: a pipe and startup task without per-call metadata or a verified Cla
   await assert.rejects(executeBridgeTool('bridge_panel', {}, { ...context, parentPid: process.pid }), { reason: 'wrong_tool' }); // The inherited pipe does not override a verified Claude parent.
 });
 
+// The generated Claude launcher passes each optional setting as `${NAME:-}`, so an unset socket arrives as exactly "".
+const claudeLauncher = JSON.parse(fs.readFileSync(new URL('../.claude-plugin/plugin.json', import.meta.url), 'utf8')).mcpServers['bridge-claude-codex'];
+const launchedEnv = inherited => ({ ...inherited, ...Object.fromEntries(Object.entries(claudeLauncher.env)
+  .map(([name, value]) => [name, value.replace(/\$\{(\w+):-([^}]*)\}/g, (_, key, fallback) => inherited[key] || fallback)])) });
+
+test('R5G01: the generated launcher\'s empty optional socket is absence, with or without an inherited Codex pipe', windowsOnly, async t => {
+  const f = await claudeFixture(t);
+  assert.equal(claudeLauncher.env.CLAUDE_CODE_MESSAGING_SOCKET, '${CLAUDE_CODE_MESSAGING_SOCKET:-}');
+  for (const inherited of [{}, { CODEX_APP_TOOLS_PIPE_PATH: `\\\\.\\pipe\\fixture-${randomUUID()}`, CODEX_THREAD_ID: 'startup-only' }]) {
+    const env = launchedEnv({ ...inherited, CLAUDE_CODEX_BRIDGE_DAEMON: 'off' });
+    assert.equal(env.CLAUDE_CODE_MESSAGING_SOCKET, '');
+    const context = { stateDir: f.stateDir, registryDir: f.registryDir, processProbe: f.processProbe, parentPid: f.record.pid, env };
+    assert.equal((await resolveClaudeCaller({ registryDir: f.registryDir, parentPid: f.record.pid, socketPath: '', probe: f.processProbe })).sessionId, f.record.sessionId);
+    const report = await executeBridgeTool('bridge_doctor', {}, context);
+    assert.equal(report.application, 'claude'); assert.equal(report.checks.find(c => c.name === 'caller').status, 'pass');
+    assert.equal((await executeBridgeTool('list_deliveries', {}, context)).sender_id, f.record.sessionId);
+    await assert.rejects(executeBridgeTool('bridge_panel', {}, context), { reason: 'wrong_tool' });
+    // Only the exact empty fallback is absence: every other socket, parent, proof and stop stays fail-closed.
+    const refused = async (change, reason, pattern) => assert.rejects(executeBridgeTool('list_deliveries', {}, { ...context, ...change }),
+      e => e.reason === reason && (!pattern || pattern.test(e.message)));
+    for (const socket of [' ', '\t', 'not-a-pipe', `${f.inbox.pipePath} `]) await refused({ env: { ...env, CLAUDE_CODE_MESSAGING_SOCKET: socket } }, 'caller_invalid', /invalid messaging socket/);
+    await refused({ env: { ...env, CLAUDE_CODE_MESSAGING_SOCKET: `\\\\.\\pipe\\other-${randomUUID()}` } }, 'caller_invalid', /does not match/);
+    await refused({ parentPid: 2147483647 }, 'caller_invalid');
+    await refused({ processProbe: async () => ({ start: staleStart }) }, 'caller_invalid');
+    await refused({ processProbe: async () => { throw Object.assign(new Error('fixture timeout'), { transient: true }); } }, 'caller_unverified');
+    await refused({ processProbe: async () => { throw Object.assign(new Error('Access is denied.'), { code: 'EACCES' }); } }, 'identity_check_unavailable');
+    await assert.rejects(executeBridgeTool('list_deliveries', {}, { ...context, signal: AbortSignal.abort() }), { name: 'AbortError' });
+  }
+  assert.equal(f.inbox.messages.length, 0);
+  assert.deepEqual(getCodexHosts({ stateDir: f.stateDir }), []);
+});
+
 test('R4O03: an unsaved missing current pipe is not described as a saved earlier launch', windowsOnly, async t => {
   const f = await nativeFixture(t), env = { CODEX_APP_TOOLS_PIPE_PATH: `\\\\.\\pipe\\fixture-${randomUUID()}`, CLAUDE_CODEX_BRIDGE_DAEMON: 'off' };
   const report = await executeBridgeTool('bridge_doctor', {}, { env, stateDir: f.stateDir, registryDir: path.join(f.root, 'absent'), parentPid: 2147483647 });

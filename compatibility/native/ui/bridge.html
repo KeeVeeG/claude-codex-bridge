@@ -652,10 +652,10 @@
     }
     const outcome = knownOutcome(data.outcome); const status = data.delivery.status;
     if (outcome) return { delivered: outcome.delivered, reason: outcome.reason, retry: outcome.retry, detail: string(data.delivery.error) };
-    // 1.0 servers report only the delivery status.
+    // 1.0 servers report only the delivery status. Their failed status does not prove that nothing was written, and they
+    // answer the same ID with the same row without sending again: inspect it, never offer a retry (R5G03).
     return status === 'submitted' ? { delivered: true, reason: 'submitted' }
-      : status === 'failed' ? { delivered: false, reason: 'prior_failed', retry: 'after_fix', detail: string(data.delivery.error) }
-      : { delivered: 'unknown', reason: 'delivery_unconfirmed', detail: string(data.delivery.error) };
+      : { delivered: 'unknown', reason: status === 'failed' ? 'legacy_failed' : 'delivery_unconfirmed', detail: string(data.delivery.error) };
   }
   function canSend(chat, value) {
     const pending = chat && state.sends.get(chat.session_id);
@@ -774,7 +774,6 @@
     ssh_executable_missing: ['The remote shell could not find Codex.', 'Check its login PATH.'],
     queued_message_too_long: ['The message exceeds the queue limit.', 'Shorten the text before sending.'],
     internal_error: ['The bridge failed before sending.', 'Send again; if it repeats, ask Codex to run bridge_doctor.'],
-    prior_failed: ['The send failed before Claude Code took it.', 'Send again.', 'detail'],
   };
   const NOTICE_REASONS = { state_unavailable: 'the bridge could not write its local state', target_busy: 'Codex was busy', request_rejected: 'Codex refused it',
     route_unavailable: 'this Codex chat could not be reached', protocol_incompatible: 'this Codex version does not accept it', deadline: 'it ran out of time',
@@ -880,6 +879,12 @@
       if (i < 0) extra.push(row); else rows[i] = row;
     }
     const pending = state.sends.get(sessionId); const key = pending && `to_claude:${pending.id}`;
+    // While a send is unresolved, a failed row with its ID and text is no proof either (an older server's, or one read after
+    // an owner change restored the send from a snapshot taken before its reply): show it unconfirmed, as the alert does.
+    if (pending?.phase === 'unknown') {
+      const i = rows.findIndex(row => keyOf(row) === key && row.message === pending.message && row.status === 'failed');
+      if (i >= 0) rows[i] = { ...rows[i], status: 'uncertain' };
+    }
     if (pending && ['sending', 'unknown'].includes(pending.phase) && !cache.index.has(key) && !state.outbox.get(sessionId)?.has(key)) {
       extra.push({ id: pending.id, direction: 'to_claude', message: pending.message, created_at: pending.createdAt,
         status: pending.phase === 'sending' ? 'sending' : 'uncertain', manual: true });
@@ -970,10 +975,13 @@
     if (state.ownerChanged && state.drafts.get(sessionId)) return { text: 'Sending is locked to the original chat. Select and copy this draft before reopening there.', tone: 'warning',
       actions: [['Select draft', () => { $('message').focus(); $('message').select(); }]] };
     if (pending?.phase === 'unknown') {
+      const legacy = pending.reason === 'legacy_failed';
       const text = pending.reason === 'in_flight' ? 'Another attempt with this message is still running.'
         : pending.reason === 'id_conflict' ? 'This message ID is already in use.' : pending.reason === 'no_answer' ? 'Codex did not confirm the handoff.'
-        : 'The handoff to Claude Code is not confirmed.';
-      return { text: `${text} ${cache?.incomplete || cache?.error ? 'History is incomplete; check the receiving chat.' : pending.inspected ? 'No matching handoff in the history checked; inspect the receiving chat.' : 'Check the receiving chat before sending again.'}`, tone: 'warning',
+        : legacy ? 'An older bridge server reported a failure without proof that nothing was written.' : 'The handoff to Claude Code is not confirmed.';
+      const check = cache?.incomplete || cache?.error ? 'History is incomplete; check the receiving chat.' : pending.inspected ? 'No matching handoff in the history checked; inspect the receiving chat.'
+        : legacy ? 'Check the receiving chat and its history.' : 'Check the receiving chat before sending again.';
+      return { text: `${text} ${check}${legacy ? ' Before sending again, fully quit and reopen Codex so it starts the installed server.' : ''}`, tone: 'warning',
         actions: state.ready && !state.stopped ? [['Check again', () => loadHistory(sessionId)]] : [] };
     }
     if (pending?.phase === 'failed' && pending.message === state.drafts.get(sessionId)) {

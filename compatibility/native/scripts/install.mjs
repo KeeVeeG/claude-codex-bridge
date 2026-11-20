@@ -127,17 +127,42 @@ function stageComparator(directory, version) {
     } catch { return false; }
   };
 }
-function pruneInstallationBackups(prepared, homeDir) {
+/** Returns false when it kept every backup because it could not compare them with a client cache that may still need one. */
+function pruneInstallationBackups(prepared, homeDir, env) {
   const directory = path.resolve(homeDir, 'plugins');
   refuseLink(directory);
   const backups = fs.readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isDirectory() && !entry.isSymbolicLink() &&
     namedBackup(entry.name)).map(entry => path.join(directory, entry.name)).sort().reverse();
   const owned = backups.filter(prepared.unchangedStage);
   const keep = owned.includes(prepared.backupDirectory) ? prepared.backupDirectory : owned[0];
-  for (const file of owned) {
-    if (file === keep) continue;
-    fs.rmSync(file, { recursive: true });
-  }
+  const removable = owned.filter(file => file !== keep);
+  if (!removable.length) return true;
+  // Stages of one release differ only in their stamp, but the Codex cache fence needs the exact stage Codex runs, also
+  // while the bridge is turned off there or this run did not select Codex (R5G02). Keep each stage its cache holds,
+  // and every stage when a cached copy or a backup cannot be read in full.
+  const cached = codexCacheTrees(homeDir, env);
+  const candidates = cached && removable.map(file => [file, treeFiles(file)]);
+  if (!candidates || candidates.some(([, files]) => !files)) return false;
+  for (const [file, files] of candidates) if (!cached.some(copy => sameFiles(files, copy))) fs.rmSync(file, { recursive: true });
+  return true;
+}
+/** Every copy of this plugin in the Codex cache, under any marketplace name, as an exact tree; null when a place that may hold one cannot be read. */
+function codexCacheTrees(homeDir, env) {
+  // Only a path where nothing stands holds no copy; a link that does not resolve, or a folder that cannot be listed, may.
+  const entries = dir => {
+    try { return fs.readdirSync(dir, { withFileTypes: true }); }
+    catch (error) { if (error.code === 'ENOENT' && !fs.lstatSync(dir, { throwIfNoEntry: false })) return []; throw error; }
+  };
+  try {
+    const home = codexHome({ env, homeDir }), cache = path.join(home, 'plugins', 'cache');
+    entries(home); entries(path.dirname(cache));
+    const trees = entries(cache).filter(market => !market.isFile()).flatMap(market => {
+      const plugin = path.join(cache, market.name, PLUGIN_NAME);
+      entries(path.dirname(plugin));
+      return entries(plugin).map(copy => treeFiles(path.join(plugin, copy.name)));
+    });
+    return trees.every(Boolean) ? trees : null;
+  } catch { return null; }
 }
 
 function refuseLink(filename) {
@@ -1084,8 +1109,10 @@ export async function main(args = process.argv.slice(2), { homeDir = os.homedir(
   return prepared;
 }
 
-function finishCleanup(prepared, homeDir, log) {
-  try { pruneInstallationBackups(prepared, homeDir); } catch { prepared.cleanupPending = true; log('Bridge installed; an older installer backup could not be pruned. Leave it until the file is no longer in use.'); }
+function finishCleanup(prepared, homeDir, env, log) {
+  try {
+    if (!pruneInstallationBackups(prepared, homeDir, env)) log('Older installer backups were kept: the installer could not compare them with the Codex plugin cache to tell which one Codex still runs.');
+  } catch { prepared.cleanupPending = true; log('Bridge installed; an older installer backup could not be pruned. Leave it until the file is no longer in use.'); }
 }
 
 /** After a rollback, name each client whose version is not, or cannot be shown to be, the one it loaded before this run, and its recovery source. */
@@ -1134,7 +1161,7 @@ function installSelected(args, { homeDir, env, execute, log, selection }) {
   if (prepared.backupDirectory) log(`Previous staged files: ${prepared.backupDirectory}`);
   if (prepared.marketplaceBackup) log(`Personal marketplace backup: ${prepared.marketplaceBackup}`);
   if (args.includes('--prepare-only')) {
-    finishCleanup(prepared, homeDir, log);
+    finishCleanup(prepared, homeDir, env, log);
     log('Preparation complete. No application plugin commands were run.');
     return prepared;
   }
@@ -1187,7 +1214,7 @@ function installSelected(args, { homeDir, env, execute, log, selection }) {
   if (prepared.claude) log('In Claude CLI, run /reload-plugins and check /mcp. If it warns that the conversation would be re-read, the reload is held: run /reload-plugins --force. In Claude Desktop, fully quit and reopen the app when convenient so its MCP process loads this version.');
   if (prepared.codex) log('Fully quit Codex Desktop, not only its window, and reopen it: until then new tasks still start the old version. Restart terminal Codex sessions when convenient to load updated tools.');
   log(`Apps were not restarted.${prepared.claude ? ' Only the exact Claude send_to_codex tool received a user-level allow rule.' : ' Claude tool permissions were not changed.'}`);
-  finishCleanup(prepared, homeDir, log);
+  finishCleanup(prepared, homeDir, env, log);
   return prepared;
 }
 
