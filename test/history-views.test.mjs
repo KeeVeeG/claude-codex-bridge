@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import test from 'node:test';
 import { getBridgeConversation } from '../lib/bridge-history.mjs';
 import { listClaudeConversations } from '../lib/claude-history.mjs';
@@ -39,6 +40,34 @@ function writeLedger(fixture, owner, records, { diskBytes } = {}) {
   fs.renameSync(temp, file);
   return file;
 }
+// Same layout as the schema-1 writer, with real message content, no oversized padding.
+function writeLargeLedger(fixture, { newest = 'latest', incomingLedger = false } = {}) {
+  const owner = incomingLedger ? `claude:${sessionId}` : ownerThreadId;
+  const key = hash(owner);
+  const directory = path.join(fixture.stateDir, key);
+  fs.mkdirSync(directory, { recursive: true });
+  const file = path.join(directory, 'state.json');
+  const fd = fs.openSync(file + '.fixture.tmp', 'w');
+  const message = 'ASCII with delimiters [}], and \\". '.repeat(2100).slice(0, 62990) + ' — 東京 😀';
+  const body = JSON.stringify(message);
+  try {
+    // Put the headers after messages in one direction to exercise format independence.
+    const header = JSON.stringify({ schemaVersion: 1, key, threadId: owner, cwd: fixture.cwd }).slice(1, -1);
+    fs.writeSync(fd, incomingLedger ? '{\n  "messages": {' : `{${header},\n  "messages": {`);
+    for (let i = 0; i < 1590; i++) {
+      const record = { ...(incomingLedger ? incoming(`reply-${i}`, 2 * i + 1) : outgoing(`sent-${i}`, 2 * i)),
+        message: undefined, orderAt: 2 * i + Number(incomingLedger), fingerprint: 'a'.repeat(64) };
+      if (!incomingLedger && i === 1589) record.id = newest;
+      const rowKey = `route:${hash(JSON.stringify(record.route))}:${record.id}`;
+      fs.writeSync(fd, `${i ? ',' : ''}\n    ${JSON.stringify(rowKey)}: ${JSON.stringify(record).slice(0, -1)},"message":${body}}`);
+    }
+    fs.writeSync(fd, incomingLedger ? `\n  },${header}\n}\n` : '\n  }\n}\n');
+  } finally { fs.closeSync(fd); }
+  fs.renameSync(file + '.fixture.tmp', file);
+  assert.ok(fs.statSync(file).size > 96 * MiB);
+  return { file, message };
+}
+
 const args = fixture => ({ stateDir: fixture.stateDir, ownerThreadId, sessionId, projectsDir: path.join(fixture.root, 'projects'),
   registryDir: path.join(fixture.root, 'absent-registry') });
 const ids = result => result.messages.map(record => record.id);
@@ -95,20 +124,118 @@ test('read history over the former 32 MiB cutoff without changing the ledger', a
   assert.equal(after.size, before.size);
 });
 
-test('oversized ledgers are not opened and cannot advance an exact history cursor', async t => {
+test('real schema-1 bodies over 96 MiB page repeatedly with bounded reads', async t => {
+  const fixture = await nativeFixture(t);
+  const { file, message } = writeLargeLedger(fixture);
+  const stat = fs.statSync(file, { bigint: true });
+  const open = fsp.open;
+  let opens = 0, reads = 0, maxRead = 0;
+  t.mock.method(fsp, 'open', async (...call) => {
+    const handle = await open(...call);
+    if (call[0] === file) {
+      opens++;
+      const read = handle.read.bind(handle);
+      t.mock.method(handle, 'read', async (buffer, offset, length, position) => {
+        reads++;
+        maxRead = Math.max(maxRead, length);
+        return read(buffer, offset, length, position);
+      });
+    }
+    return handle;
+  });
+  const delay = monitorEventLoopDelay({ resolution: 2 });
+  const start = performance.now();
+  delay.enable();
+  let first;
+  try { first = await getBridgeConversation({ ...args(fixture), limit: 1 }); }
+  finally { delay.disable(); }
+  const coldMs = performance.now() - start;
+  assert.deepEqual(ids(first), ['latest']);
+  assert.equal(first.messages[0].message, message);
+  assert.deepEqual(first.warnings, []);
+  const warmStart = performance.now();
+  const second = await getBridgeConversation({ ...args(fixture), limit: 1, cursor: first.next_cursor });
+  const third = await getBridgeConversation({ ...args(fixture), limit: 1, cursor: second.next_cursor });
+  const warmMs = (performance.now() - warmStart) / 2;
+  assert.deepEqual(ids(second), ['sent-1588']);
+  assert.deepEqual(ids(third), ['sent-1587']);
+  assert.equal(third.has_more, true);
+  assert.equal((await listClaudeConversations(args(fixture))).conversations[0].last_contact_at, 3178);
+  assert.equal(opens, 1);
+  assert.ok(maxRead <= MiB);
+  assert.ok(reads < 1590, 'reads are by window, not by row');
+  assert.equal(fs.statSync(file, { bigint: true }).ctimeNs, stat.ctimeNs);
+  t.diagnostic(`${stat.size} bytes, ${reads} reads (max ${maxRead} B): cold ${coldMs.toFixed(1)} ms, ` +
+    `warm mean ${warmMs.toFixed(1)} ms, cold event-loop delay max ${(delay.max / 1e6).toFixed(1)} ms`);
+});
+
+test('unsafe single values cannot advance an exact history cursor', async t => {
   const fixture = await nativeFixture(t);
   const file = writeLedger(fixture, ownerThreadId, [outgoing('old', 1), outgoing('new', 2)]);
   const first = await getBridgeConversation({ ...args(fixture), limit: 1 });
-  fs.truncateSync(file, 97 * MiB);
-  const open = fsp.open;
-  let opens = 0;
-  t.mock.method(fsp, 'open', async (...call) => { if (file === call[0]) opens++; return open(...call); });
+  writeLedger(fixture, ownerThreadId, [outgoing('old', 1), outgoing('new', 2, { metadata: 'x'.repeat(3 * MiB) })]);
   const blocked = await getBridgeConversation({ ...args(fixture), cursor: first.next_cursor });
   assert.deepEqual(blocked.messages, []);
   assert.equal(blocked.next_cursor, first.next_cursor);
   assert.equal(blocked.has_more, true);
-  assert.match(blocked.warnings.join(), /exceed the safe read size/);
-  assert.equal(opens, 0);
+  assert.match(blocked.warnings.join(), /exceed safe history read limits/);
+  assert.ok(fs.statSync(file).size > 3 * MiB);
+});
+
+test('an abort during a large read closes the handle and never admits the partial generation', async t => {
+  const fixture = await nativeFixture(t);
+  const { file } = writeLargeLedger(fixture);
+  const controller = new AbortController();
+  const open = fsp.open;
+  let opens = 0, reads = 0, closes = 0;
+  t.mock.method(fsp, 'open', async (...call) => {
+    const handle = await open(...call);
+    if (call[0] === file && ++opens === 1) {
+      const read = handle.read.bind(handle);
+      const close = handle.close.bind(handle);
+      t.mock.method(handle, 'read', async (...readArgs) => {
+        const result = await read(...readArgs);
+        if (++reads === 3) controller.abort();
+        return result;
+      });
+      t.mock.method(handle, 'close', async () => { closes++; await close(); });
+    }
+    return handle;
+  });
+  await assert.rejects(getBridgeConversation({ ...args(fixture), signal: controller.signal }), { name: 'AbortError' });
+  assert.equal(reads, 3);
+  assert.equal(closes, 1);
+  assert.deepEqual(ids(await getBridgeConversation({ ...args(fixture), limit: 1 })), ['latest']);
+  assert.equal(opens, 2);
+});
+
+test('both large directions stay warm and a same-size replacement before publication is retried', async t => {
+  const fixture = await nativeFixture(t);
+  const primary = writeLargeLedger(fixture);
+  const secondary = writeLargeLedger(fixture, { incomingLedger: true });
+  const open = fsp.open;
+  let opens = 0;
+  t.mock.method(fsp, 'open', async (...call) => {
+    const handle = await open(...call);
+    if (++opens === 1 && call[0] === primary.file) {
+      const close = handle.close.bind(handle);
+      t.mock.method(handle, 'close', async () => {
+        await close(); // Windows may prevent an atomic rename over an open handle.
+        const before = fs.statSync(primary.file);
+        writeLargeLedger(fixture, { newest: 'swapin' });
+        fs.utimesSync(primary.file, before.atime, before.mtime);
+        assert.equal(fs.statSync(primary.file).size, before.size);
+      });
+    }
+    return handle;
+  });
+  const first = await getBridgeConversation({ ...args(fixture), limit: 1 });
+  assert.deepEqual(ids(first), ['reply-1589'], first.warnings.join());
+  assert.equal(first.messages[0].message, secondary.message);
+  assert.deepEqual(first.warnings, []);
+  const second = await getBridgeConversation({ ...args(fixture), limit: 1, cursor: first.next_cursor });
+  assert.deepEqual(ids(second), ['swapin']);
+  assert.equal(opens, 3);
 });
 
 test('catalog can discover an unknown Claude peer after cold unrelated ledgers fill the scan budget', async t => {
@@ -117,13 +244,41 @@ test('catalog can discover an unknown Claude peer after cold unrelated ledgers f
   const unrelated = Array.from({ length: 32 }, (_, i) => `unrelated-codex-${i}`).filter(id => hash(id) < peerKey).slice(0, 3);
   assert.equal(unrelated.length, 3);
   for (const id of unrelated) writeLedger(fixture, id, [], { diskBytes: 30 * MiB });
-  writeLedger(fixture, `claude:${sessionId}`, [incoming('offline-reply', 23)], { diskBytes: 30 * MiB });
+  writeLargeLedger(fixture, { incomingLedger: true });
   const first = await listClaudeConversations(args(fixture));
   assert.deepEqual(first.conversations, []);
   assert.ok(first.warnings.some(warning => /scan limit.*Refresh/.test(warning)));
   const next = await listClaudeConversations(args(fixture));
-  assert.deepEqual(next.conversations.map(peer => [peer.session_id, peer.last_contact_at]), [[sessionId, 23]]);
+  assert.deepEqual(next.conversations.map(peer => [peer.session_id, peer.last_contact_at]), [[sessionId, 3179]]);
   assert.deepEqual(next.warnings, []);
+});
+
+test('requests-only and compact ledgers survive fragmented JSON; an invalid suffix suppresses partial rows', async t => {
+  const fixture = await nativeFixture(t);
+  const file = writeLedger(fixture, ownerThreadId, []);
+  const key = hash(ownerThreadId);
+  const header = { schemaVersion: 1, key, threadId: ownerThreadId, cwd: fixture.cwd };
+  fs.writeFileSync(file, JSON.stringify({ requests: { legacy: ['old', { text: '\\"}[],\n東京😀' }] }, ...header }, null, 2));
+  const open = fsp.open;
+  t.mock.method(fsp, 'open', async (...call) => {
+    const handle = await open(...call);
+    if (call[0] === file) {
+      const read = handle.read.bind(handle);
+      t.mock.method(handle, 'read', (buffer, offset, length, position) => read(buffer, offset, Math.min(length, 7), position));
+    }
+    return handle;
+  });
+  const legacy = await getBridgeConversation(args(fixture));
+  assert.deepEqual(legacy.messages, []);
+  assert.deepEqual(legacy.warnings, []);
+  const message = '\\"}[],\n\u0000東京😀';
+  writeLedger(fixture, ownerThreadId, [outgoing('compact', 1, { message })]);
+  const compact = await getBridgeConversation(args(fixture));
+  assert.equal(compact.messages[0].message, message);
+  fs.appendFileSync(file, ' [false]');
+  const invalid = await getBridgeConversation(args(fixture));
+  assert.deepEqual(invalid.messages, []);
+  assert.match(invalid.warnings.join(), /unsafe, damaged, or use an unsupported format/);
 });
 
 test('a replacement between lstat and open retries before advancing past either direction', async t => {
