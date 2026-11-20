@@ -6,18 +6,18 @@ import { legacyEnvironmentWarnings } from './legacy-environment.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { discoverClaudeSessions, resolveClaudeSession, resolveClaudeCaller, sendToClaude, probeClaudeInbox } from './claude-sessions.mjs';
+import { verifiedClaudeSessions, resolveClaudeSession, resolveClaudeCaller, sendToClaude } from './claude-sessions.mjs';
 import { ensureCall, inquire, INQUIRY_ATTEMPT_MS, monotonicNow, remainingMs, startCall, throwIfStopped } from './call-time.mjs';
 import { REASONS, errorOutcome, failure, outcome, sendErrorText } from './outcome.mjs';
-import { listCodexTools, listCodexChats, sendToCodex } from './codex-desktop.mjs';
+import { desktopCompatible, listCodexTools, listCodexChats, sendToCodex } from './codex-desktop.mjs';
 import { publishCodexHost, getCodexHosts } from './codex-host.mjs';
 import { canonicalLocalSocket, localSocketPresence } from './local-socket.mjs';
 import { defaultStateDir, ledgerAt, ownerId } from './store.mjs';
 import { createSession, lookupMessage, recordMessage, finishMessage, listMessages, retainSettlement, checkSettlementCapacity, repairSettlement } from './call-store.mjs';
 import { readComposerEnterBehavior } from './codex-settings.mjs';
 import { openDaemon, listTerminalThreads, readDaemonVersions, readTerminalThread, sendToTerminalThread, normalizeCodexThreadId,
-  queueToTerminalThread, queueRefusal, queueTargetRefusal, TerminalNotLoadedError, DaemonUnavailableError, NOT_RUNNING_MESSAGE, scrubPaths } from './codex-daemon.mjs';
-import { codexPeerContent } from './codex-peer.mjs';
+  queueToTerminalThread, queueRefusal, queueTargetRefusal, TerminalNotLoadedError, DaemonUnavailableError, NOT_RUNNING_MESSAGE } from './codex-daemon.mjs';
+import { codexPeerContent, collaboratorNotice, quoted } from './codex-peer.mjs';
 import { validateSshHostAlias } from './codex-ssh.mjs';
 
 export function codexThreadId(metadata = {}) {
@@ -59,7 +59,8 @@ function settings(context) {
 }
 
 function sshHost(config) {
-  if (config.platform !== 'darwin' || config.env.CLAUDE_CODEX_BRIDGE_SSH_HOST === undefined) return null;
+  if (config.platform !== 'darwin') return null;
+  if (!config.env.CLAUDE_CODEX_BRIDGE_SSH_HOST) throw failure('No SSH route is configured on macOS. Set CLAUDE_CODEX_BRIDGE_SSH_HOST to the intended SSH alias.', 'setup_incomplete');
   return { sshHostAlias: validateSshHostAlias(config.env.CLAUDE_CODEX_BRIDGE_SSH_HOST),
     ...(config.sshSpawn ? { spawnImpl: config.sshSpawn } : {}) };
 }
@@ -121,7 +122,7 @@ async function resolveTerminalTarget(threadId, transport, config, signal, held) 
       return false;
     }
     const queueRoute = thread.status?.type === 'notLoaded';
-    if (queueRoute && transport === 'auto') throw failure('The selected Codex session is not loaded in the daemon, so its current client cannot be determined. Set transport to desktop for Codex Desktop or terminal for Codex CLI. No message was sent.', 'target_unavailable');
+    if (queueRoute && transport === 'auto') throw failure('The selected Codex session is not loaded in the daemon, so the bridge cannot tell where it is open. Ask the user whether it is open in Codex Desktop (transport desktop) or Codex CLI (transport terminal); a listing’s source does not show this.', 'invalid_argument');
     return { queueRoute, allowQueue: transport === 'terminal' };
   } catch (error) {
     checkCancellation(signal);
@@ -185,7 +186,7 @@ function sender(who) {
 function senderLabel(id) {
   // Claude's native `from` field is a short, single-line display label. The
   // message notice below carries the complete, escaped reply address.
-  return `Codex task ${id.replace(/[\r\n\0]/g, ' ').slice(0, 180)}`;
+  return `Codex task ${quoted(id).slice(1, -1).slice(0, 180)}`;
 }
 
 function senderLedgerId(who) {
@@ -213,7 +214,7 @@ const acceptedContexts = new Map();
  * longer exist are skipped without a connection, and a pipe that stalls is not retried with its
  * other contexts. Returns { host, catalog, chats } on success and always a report of the rest.
  */
-async function selectDesktopHost(hosts, config, signal, { limit = 1, reuse = false, compatible } = {}) {
+async function selectDesktopHost(hosts, config, signal, { limit = 1, reuse = false, compatible = desktopCompatible } = {}) {
   const timeouts = { ...DESKTOP_TIMEOUTS, ...(config.desktop ?? {}) };
   const deadline = monotonicNow() + Math.min(timeouts.budgetMs, remainingMs(signal));
   // A wait the budget cut short proves nothing about the app: its timeout counts as unchecked, not stalled.
@@ -223,9 +224,10 @@ async function selectDesktopHost(hosts, config, signal, { limit = 1, reuse = fal
       throw error;
     }
   }, { signal, until: deadline, attemptMs: cap });
-  const report = { budgetMs: timeouts.budgetMs, gone: 0, stalled: 0, rejected: 0, incompatible: 0, compatible: 0,
-    unchecked: 0, errors: [], tools: undefined };
+  const report = { budgetMs: timeouts.budgetMs, gone: 0, stalled: 0, incompatible: 0, compatible: 0,
+    unchecked: 0, errors: [] };
   const pipes = new Map();
+  let empty;
   for (const host of hosts) {
     const pipePath = host && canonicalLocalSocket(host.pipePath);
     if (!pipePath) continue;
@@ -234,13 +236,14 @@ async function selectDesktopHost(hosts, config, signal, { limit = 1, reuse = fal
       pipes.get(pipePath).push(host.threadId);
     }
   }
+  for (const key of acceptedContexts.keys()) if (!pipes.has(key)) acceptedContexts.delete(key);
   const present = localSocketPresence();
   const failed = error => {
     checkCancellation(signal);
     if (error.code === 'ENDPOINT_GONE') report.gone++;
     else if (error.inconclusive || error.code === 'DESKTOP_TIMEOUT') report[monotonicNow() >= deadline - 1 ? 'unchecked' : 'stalled']++;
-    else if (error.code === 'CONTEXT_REJECTED') report.rejected++;
-    else report.errors.push(scrubPaths(String(error.message)).slice(0, 200));
+    else if (error.reason === 'protocol_incompatible') report.incompatible++;
+    else report.errors.push(error.reason ?? 'route_unavailable');
   };
   for (const [pipePath, contexts] of pipes) {
     if (monotonicNow() >= deadline) { report.unchecked += Math.max(1, contexts.length); continue; }
@@ -248,7 +251,6 @@ async function selectDesktopHost(hosts, config, signal, { limit = 1, reuse = fal
     let catalog;
     try { catalog = await read(timeouts.catalogMs, attempt => listCodexTools(pipePath, { signal: attempt.signal, timeoutMs: attempt.timeoutMs })); }
     catch (error) { failed(error); continue; }
-    report.tools = catalog.map(tool => String(tool?.name ?? ''));
     if (compatible && !compatible(catalog)) { report.incompatible++; continue; }
     report.compatible++;
     const accepted = contexts.includes(acceptedContexts.get(pipePath)) ? acceptedContexts.get(pipePath) : undefined;
@@ -257,43 +259,61 @@ async function selectDesktopHost(hosts, config, signal, { limit = 1, reuse = fal
       if (monotonicNow() >= deadline) { report.unchecked++; continue; }
       try {
         const chats = await read(timeouts.listMs, attempt => listCodexChats({ pipePath, contextThreadId: threadId, limit, signal: attempt.signal, catalog, timeoutMs: attempt.timeoutMs }));
+        // An empty listing proves this context but says nothing about another running app, so the
+        // search goes on and settles for it only when no other app lists a chat (F02).
+        if (!chats.length) { empty ??= { host: { pipePath, threadId }, catalog, chats, report }; break; }
         acceptedContexts.set(pipePath, threadId);
         return { host: { pipePath, threadId }, catalog, chats, report };
       } catch (error) {
-        // Only a rejection disproves the context. A stalled or cut-short listing says nothing about
-        // it, and dropping it there would let a doctor or discovery call block the next send.
-        if (error.code === 'CONTEXT_REJECTED' && acceptedContexts.get(pipePath) === threadId) acceptedContexts.delete(pipePath);
+        // Desktop has no explicit context-rejection reply, so a definite failure only makes the next
+        // send prove the context again. A stalled or cut-short listing says nothing about it, and
+        // dropping it there would let a doctor or discovery call block the next send.
+        const waited = error.inconclusive || error.code === 'DESKTOP_TIMEOUT';
+        if (!waited && acceptedContexts.get(pipePath) === threadId) acceptedContexts.delete(pipePath);
         failed(error);
         // Every context on a stalled app waits for the same stuck tool execution, so trying the
         // pipe's other contexts only multiplies the wait. A cut wait means the budget is spent.
-        if (error.inconclusive || error.code === 'DESKTOP_TIMEOUT') break;
+        if (waited) break;
       }
     }
   }
-  return { report };
+  if (empty) acceptedContexts.set(empty.host.pipePath, empty.host.threadId);
+  return empty ?? { report };
 }
 
-/** One sentence per cause, most actionable first, so a stale record never hides a stalled app. */
+/** The most actionable observed cause with its one repair, then the other observations as plain
+ * facts, so a stale record never hides a stalled app and no reader gets two competing steps (V08). */
 function desktopFailure(report) {
   const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
-  const causes = [];
-  if (report.stalled) causes.push('Codex Desktop is running but did not answer in time. Retry the same call; restart Codex Desktop only if it keeps not answering.');
-  if (report.rejected) causes.push(`Codex Desktop rejected ${plural(report.rejected, 'saved task context')}, probably of removed tasks; call bridge_doctor once from an open Codex Desktop task to register it.`);
-  if (report.incompatible) causes.push('A running Codex Desktop does not expose compatible discovery and message tools; update Codex Desktop.');
-  if (report.errors.length) causes.push(`Endpoint errors: ${[...new Set(report.errors)].join(' ')}`);
-  if (report.unchecked) causes.push(`${plural(report.unchecked, 'saved endpoint record')} could not be checked within ${report.budgetMs / 1000} s.`);
-  if (report.gone) causes.push(`${plural(report.gone, 'saved endpoint')} belong${report.gone === 1 ? 's' : ''} to earlier Codex Desktop launches.${causes.length ? ''
-    : ' Open a Codex Desktop task with the bridge enabled; its bridge server registers the current endpoint when it starts.'}`);
-  return causes.length ? causes.join(' ') : 'No saved Codex Desktop endpoint has a usable task context.';
+  // Only an unsuccessful listing for a context says the context was refused; any other failure is the app's (E06).
+  const rejected = (report.errors ?? []).filter(reason => reason === 'route_unavailable').length;
+  const failedRequests = (report.errors ?? []).length - rejected;
+  const causes = [
+    [report.stalled, 'Codex Desktop is running but did not answer in time. Retry the same call.',
+      `${plural(report.stalled, 'saved endpoint')} did not answer in time`],
+    [report.unchecked, `${plural(report.unchecked, 'saved endpoint record')} could not be checked within ${report.budgetMs / 1000} s. Retry the same call.`,
+      `${plural(report.unchecked, 'saved endpoint record')} could not be checked in time`],
+    [report.incompatible, 'Codex Desktop does not offer local discovery and message tools this bridge can use. Check that its app tools are enabled.',
+      `${plural(report.incompatible, 'endpoint')} lacked compatible local tools`],
+    [failedRequests, 'Codex Desktop failed the discovery request. Restart Codex Desktop, then retry the same call.',
+      `${plural(failedRequests, 'discovery request')} failed`],
+    [rejected, 'Codex Desktop did not accept the saved task context for discovery. Call bridge_doctor once from an open Codex Desktop task to register it.',
+      `${plural(rejected, 'saved task context')} ${rejected === 1 ? 'was' : 'were'} not accepted`],
+    [report.gone, `${plural(report.gone, 'saved Codex Desktop endpoint')} belong${report.gone === 1 ? 's' : ''} to earlier launches. Open a Codex Desktop task with the bridge enabled; its bridge server registers the current endpoint when it starts.`,
+      `${plural(report.gone, 'saved endpoint')} belong${report.gone === 1 ? 's' : ''} to earlier Codex Desktop launches`],
+  ].filter(([count]) => count);
+  if (!causes.length) return 'No saved Codex Desktop endpoint has a usable task context. Open a Codex Desktop task with the bridge enabled.';
+  const others = causes.slice(1).map(cause => cause[2]);
+  return `${causes[0][1]}${others.length ? ` Also observed: ${others.join('; ')}.` : ''}`;
 }
 
 async function desktopRoute(who, config, signal, options) {
   checkCancellation(signal);
   if (who.kind === 'codex' && who.transport === 'desktop') return { host: { pipePath: who.pipePath, threadId: who.threadId } };
   const hosts = await getCodexHosts({ stateDir: config.stateDir, signal });
-  if (hosts.length === 0) throw failure('Codex Desktop has not registered its bridge endpoint yet. Open Codex with the plugin enabled, or run the installer from an open Codex task.', 'route_unavailable');
+  if (hosts.length === 0) throw failure('No Codex Desktop registration is in this bridge’s state directory. Open a Codex Desktop task with the bridge enabled, then retry.', 'route_unavailable');
   const selected = await selectDesktopHost(hosts, config, signal, options);
-  if (!selected.host) throw failure(`No registered Codex Desktop endpoint accepted a task context. ${desktopFailure(selected.report)}`, desktopReason(selected.report));
+  if (!selected.host) throw failure(desktopFailure(selected.report), desktopReason(selected.report));
   return selected;
 }
 
@@ -326,7 +346,7 @@ function inspectStateDirectory(stateDir) {
       const stat = fs.lstatSync(ancestor);
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Invalid state parent');
       fs.accessSync(ancestor, fs.constants.R_OK | fs.constants.W_OK);
-      return { status: 'warning', detail: 'The state directory does not exist yet. Its parent is accessible; an authorized send or host registration will create it.' };
+      return { status: 'warning', detail: 'The state directory does not exist yet. An ancestor is accessible; directory creation and writer locks have not been tested.' };
     } catch (error) {
       if (error.code !== 'ENOENT' || path.dirname(ancestor) === ancestor) {
         return { status: 'fail', detail: 'The shared state directory cannot be created under its configured parent. Check the location and permissions.' };
@@ -344,9 +364,9 @@ const issuesOf = checks => checks.filter(check => check.status !== 'pass')
 
 /** Why no Desktop endpoint worked: an app that did not answer in time is unverified, not gone (F07). */
 function desktopReason(report) {
-  if (!report.compatible && report.incompatible) return 'protocol_incompatible';
   if (report.stalled || report.unchecked) return 'route_unverified';
-  return 'route_unavailable';
+  if (report.incompatible) return 'protocol_incompatible';
+  return (report.errors ?? []).find(reason => reason !== 'route_unavailable') ?? 'route_unavailable';
 }
 
 // Diagnostic sub-budgets: each group of checks ends inconclusive, never false, when its budget runs out.
@@ -357,10 +377,16 @@ async function doctorCodexChecks(context, config, who, signal) {
   const checks = [];
   const add = (name, status, detail, reason) => checks.push({ name, status, detail, ...(status === 'pass' ? {} : { reason }) });
   const found = { acceptedContext: false, daemonReachable: false, terminalSessions: 0 };
-  if (config.platform === 'darwin' && config.env.CLAUDE_CODEX_BRIDGE_SSH_HOST !== undefined) {
+  if (config.platform === 'darwin') {
+    let ssh;
+    try { ssh = sshHost(config); } catch (error) {
+      // macOS reaches Codex only through the configured alias; no local transport is a fallback (S01).
+      add('codex_registry', 'fail', error.message, error.reason ?? 'setup_incomplete');
+      return { checks, ...found };
+    }
     add('codex_registry', 'pass', 'The configured SSH route does not use the local Desktop registry or daemon.');
     try {
-      const chats = await listCodexChats({ ...sshHost(config), limit: 50, signal, timeoutMs: 6000 });
+      const chats = await listCodexChats({ ...ssh, limit: 50, signal, timeoutMs: 6000 });
       add('codex_tools', 'pass', 'The configured SSH host accepts public app-server discovery.');
       found.acceptedContext = chats.some(chat => chat.status === 'idle');
       add('codex_context', found.acceptedContext ? 'pass' : 'warning', found.acceptedContext
@@ -369,8 +395,8 @@ async function doctorCodexChecks(context, config, who, signal) {
     } catch (error) {
       throwIfStopped(signal);
       const slow = error.reason === 'route_unverified';
-      add('codex_tools', slow ? 'warning' : 'fail', String(error.message).slice(0, 300), slow ? 'route_unverified' : 'route_unavailable');
-      add('codex_context', slow ? 'warning' : 'fail', 'SSH discovery did not complete. No local Codex transport was attempted.', slow ? 'route_unverified' : 'route_unavailable');
+      add('codex_tools', slow ? 'warning' : 'fail', String(error.message).slice(0, 300), error.reason ?? (slow ? 'route_unverified' : 'route_unavailable'));
+      add('codex_context', slow ? 'warning' : 'fail', 'SSH discovery did not complete. No local Codex transport was attempted.', error.reason ?? (slow ? 'route_unverified' : 'route_unavailable'));
     }
     return { checks, ...found };
   }
@@ -378,45 +404,40 @@ async function doctorCodexChecks(context, config, who, signal) {
   try {
     hosts = await getCodexHosts({ stateDir: config.stateDir, signal });
     const present = localSocketPresence();
-    const existing = hosts.filter(host => present(host.pipePath) !== false).length;
+    const states = hosts.map(host => present(host.pipePath));
+    const existing = states.filter(value => value === true).length;
+    const missing = states.filter(value => value === false).length;
+    // Present, missing and unverified are separate observations: a name the directory lookup cannot
+    // check is not evidence of a live endpoint, and a missing one does not prove an earlier launch (E05).
     add('codex_registry', existing ? 'pass' : 'warning', !hosts.length
-      ? 'No saved Codex endpoint is registered. Call bridge_doctor once from an open Codex Desktop task before discovery from Claude.'
-      : existing ? `Saved Codex endpoint records are valid; ${existing} of ${hosts.length} point to an existing endpoint.`
-      : `None of the ${hosts.length} saved Codex endpoint records points to an existing endpoint; they belong to earlier Codex Desktop launches. Open a Codex Desktop task with the bridge enabled.`,
-    'route_unavailable');
+      ? 'No Codex Desktop registration is in this bridge’s state directory. Open a Codex Desktop task with the bridge enabled.'
+      : `Saved Codex Desktop registrations: ${existing} present, ${missing} missing, ${hosts.length - existing - missing} unverified by directory lookup.${existing ? ''
+        : ' Open a Codex Desktop task with the bridge enabled; its bridge server registers the current endpoint when it starts.'}`,
+      existing === 0 && states.includes(undefined) ? 'route_unverified' : 'route_unavailable');
   } catch {
     add('codex_registry', 'fail', 'Saved Codex endpoint records are malformed or unreadable. Check the shared state configuration.', 'state_unavailable');
   }
   const current = who?.kind === 'codex' && who.transport === 'desktop' ? { pipePath: who.pipePath, threadId: who.threadId }
     : config.env.CODEX_APP_TOOLS_PIPE_PATH ? { pipePath: config.env.CODEX_APP_TOOLS_PIPE_PATH,
       threadId: config.env.CODEX_THREAD_ID } : null;
-  const compatible = tools => {
-    const messageTool = tools.find(tool => tool?.name === 'send_message_to_thread');
-    const listTool = tools.find(tool => tool?.name === 'list_threads');
-    return typeof messageTool?.namespace === 'string' && Boolean(messageTool.namespace) &&
-      messageTool.inputSchema?.properties?.threadId?.type === 'string' &&
-      messageTool.inputSchema?.properties?.prompt?.type === 'string' &&
-      typeof listTool?.namespace === 'string' && Boolean(listTool.namespace) &&
-      ['integer', 'number'].includes(listTool.inputSchema?.properties?.limit?.type);
-  };
   // The daemon listing, the version read and the Desktop probe are independent; run them together
   // and report them in the usual order (O03).
   const [daemon, versions, desktop] = await Promise.all([
     daemonInquiry(config, signal, (connection, attempt) =>
-      listTerminalThreads(connection, { limit: 1, signal: attempt.signal, timeoutMs: attempt.timeoutMs }), { budgetMs: DOCTOR_DAEMON_BUDGET_MS })
+      listTerminalThreads(connection, { limit: 50, signal: attempt.signal, timeoutMs: attempt.timeoutMs }), { budgetMs: DOCTOR_DAEMON_BUDGET_MS })
       .then(threads => ({ threads }), error => ({ error })),
     readDaemonVersions({ env: config.env, timeoutMs: 2000, ...(config.daemonVersion ?? {}) }),
     // A slower Desktop build needs seconds for one discovery; a shorter wait would report a healthy app as stalled.
     selectDesktopHost([current, ...hosts],
-      { ...config, desktop: { catalogMs: 1500, listMs: 5000, budgetMs: 8000, ...config.desktop } }, signal, { compatible }),
+      { ...config, desktop: { catalogMs: 1500, listMs: 5000, budgetMs: 8000, ...config.desktop } }, signal),
   ]);
   throwIfStopped(signal);
   if (daemon.threads) {
-    found.terminalSessions = daemon.threads.length;
+    found.terminalSessions = daemon.threads.filter(thread => ['idle', 'active'].includes(thread.status)).length;
     found.daemonReachable = true;
     add('codex_daemon', 'pass', found.terminalSessions
       ? 'The Codex daemon is reachable and lists stored Codex sessions. Their current client is not implied by discovery.'
-      : 'The Codex daemon is reachable, but no stored Codex session is available yet. Start a Codex conversation.');
+      : 'The Codex daemon is reachable, but no eligible loaded session was found in its bounded catalog. Open the intended Codex conversation.');
   } else {
     add('codex_daemon', 'warning', `Terminal Codex sessions are unavailable: ${daemon.error.message}`,
       daemon.error.inconclusive ? 'route_unverified' : 'route_unavailable');
@@ -431,66 +452,33 @@ async function doctorCodexChecks(context, config, who, signal) {
   found.acceptedContext = Boolean(host);
   const codexStatus = passed => passed ? 'pass' : report.stalled || report.unchecked || found.daemonReachable ? 'warning' : 'fail';
   add('codex_tools', codexStatus(report.compatible > 0), report.compatible
-    ? 'Codex exposes compatible discovery and message tool schemas.'
-    : report.incompatible ? `No checked Codex endpoint exposes compatible tools. Enable the bridge in Codex and check the application version. Catalog tools: ${report.tools.join(', ').slice(0, 600)}`
-    : `No Codex Desktop tool catalog answered. ${desktopFailure(report)}`, desktopReason(report));
+    ? 'Codex exposes compatible discovery and message tool schemas.' : desktopFailure(report), desktopReason(report));
   add('codex_context', codexStatus(found.acceptedContext), found.acceptedContext
     ? 'Codex accepted a registered context for read-only chat discovery.'
-    : `No checked Codex context accepted chat discovery. ${desktopFailure(report)}`, desktopReason(report));
+    : desktopFailure(report), desktopReason(report));
   return { checks, ...found };
 }
 
 async function doctorClaudeChecks(context, config, who, callerProbeError, signal) {
   const checks = [];
   const add = (name, status, detail, reason) => checks.push({ name, status, detail, ...(status === 'pass' ? {} : { reason }) });
-  let sessions = [];
-  try {
-    const issues = [];
-    sessions = discoverClaudeSessions({ registryDir: config.registryDir, issues });
-    if (issues.length) add('claude_registry', 'warning', 'Some Claude registrations were unreadable; this list is incomplete.', 'state_unavailable');
-    else add('claude_registry', sessions.length ? 'pass' : 'fail', sessions.length
-      ? 'Live Claude Code sessions are registered.'
-      : 'No live Claude Code session with an inbox is registered. Open the intended session and check its Peer address in /status.',
-    'target_unavailable');
-  } catch {
-    add('claude_registry', 'fail', 'The Claude session registry is unreadable or invalid. Check Claude configuration and reopen its Code session.', 'target_unavailable');
-  }
-  let inboxAvailable = false;
-  let inboxProbeError;
-  let incomplete = false;
-  // The inbox budget caps the identity checks themselves, so one slow window cannot use up the report (FB04).
-  const budget = startCall({ cancelSignal: signal, deadlineMs: Math.min(DOCTOR_BUDGETS.claudeInboxMs, remainingMs(signal)) });
-  try {
-    for (const session of sessions) {
-      if (remainingMs(budget.signal) <= 0) { incomplete = true; break; }
-      // The caller probe already used its retries; don't repeat them as an inbox check.
-      if (callerProbeError && session.pid === (context.parentPid ?? process.ppid)) {
-        inboxProbeError = callerProbeError;
-        continue;
-      }
-      try {
-        const endpoint = who?.kind === 'claude' && who.endpoint.sessionId === session.sessionId ? who.endpoint
-          : await resolveClaudeSession(session.sessionId, { registryDir: config.registryDir, signal: budget.signal, probe: context.processProbe });
-        await probeClaudeInbox({ socketPath: endpoint.socketPath, signal: budget.signal,
-          timeoutMs: Math.max(1, Math.min(1500, remainingMs(budget.signal))) });
-        inboxAvailable = true;
-        break;
-      } catch (error) {
-        throwIfStopped(signal);
-        if (error.code === 'BRIDGE_DEADLINE') { incomplete = true; break; }
-        // A slow check proves nothing about the window, so it leaves the result inconclusive, not failed.
-        if (error.reason === 'target_unverified' || error.reason === 'target_busy') inboxProbeError ??= error;
-      }
-    }
-  } finally {
-    budget.dispose();
-  }
-  add('claude_inbox', inboxAvailable ? 'pass' : inboxProbeError || incomplete ? 'warning' : 'fail', inboxAvailable
-    ? 'A verified Claude inbox accepts local connections. This check sent no message.'
-    : inboxProbeError ? inboxProbeError.message
-    : incomplete ? 'Some Claude inboxes were not checked within the diagnostic time budget. Availability is inconclusive.'
-    : 'No checked Claude inbox is available with a valid session key. Reopen the intended Claude Code session.',
-  inboxProbeError || incomplete ? 'target_unverified' : 'target_unavailable');
+  const result = await verifiedClaudeSessions({ registryDir: config.registryDir, signal, probe: context.processProbe,
+    skipPid: callerProbeError ? context.parentPid ?? process.ppid : undefined, known: who?.endpoint,
+    firstOnly: true, budgetMs: DOCTOR_BUDGETS.claudeInboxMs });
+  const registryIssue = result.issues.find(item => item.reason === 'state_unavailable');
+  add('claude_registry', registryIssue ? (result.candidates ? 'warning' : 'fail') : result.candidates ? 'pass' : 'fail',
+    registryIssue ? 'Some Claude registrations could not be read. Check access to the session registry.'
+    : result.candidates ? 'Claude registrations were found; inbox connectivity is checked separately.'
+    : result.details.target_unavailable ?? 'No eligible Claude session is registered. Check the intended session’s Peer address in /status.',
+    registryIssue?.reason ?? 'target_unavailable');
+  const inboxAvailable = result.sessions.length > 0;
+  // A slow or busy inbox proves nothing about the window: the check is inconclusive, not failed.
+  const slow = ['target_unverified', 'target_busy'].find(reason => result.details[reason]);
+  const failed = result.issues.find(item => item.reason !== 'state_unavailable')?.reason;
+  const reason = callerProbeError || slow ? 'target_unverified' : failed ?? 'target_unavailable';
+  add('claude_inbox', inboxAvailable ? 'pass' : reason === 'target_unverified' ? 'warning' : 'fail',
+    inboxAvailable ? 'A verified Claude inbox accepts local connections. No message was sent; inbound policy was not tested.'
+    : callerProbeError?.message ?? result.details[slow ?? failed] ?? 'No eligible Claude inbox was found. Check the intended session’s Peer address in /status.', reason);
   return { checks, inboxAvailable };
 }
 
@@ -509,8 +497,12 @@ async function bridgeDoctor(context, config) {
   const state = inspectStateDirectory(config.stateDir);
   checks.push({ name: 'state_directory', ...state, ...(state.status === 'pass' ? {}
     : { reason: state.status === 'fail' ? 'state_unavailable' : 'setup_incomplete' }) });
-  const privacy = state.status !== 'fail' && await stateDirectoryPrivacyWarning(config.stateDir, { signal });
-  if (privacy) add('state_permissions', 'warning', privacy, 'setup_incomplete');
+  // The ACL probe picks its directory now but waits for a PowerShell child, so it runs beside the
+  // other checks and keeps its place in the report.
+  const privacyAt = checks.length;
+  const privacy = state.status === 'fail' ? Promise.resolve()
+    : stateDirectoryPrivacyWarning(config.stateDir, { signal }).catch(error => { throwIfStopped(signal); throw error; });
+  privacy.catch(() => {});
   const migrationWarning = stateDirectoryWarning(config.stateDir);
   if (migrationWarning) add('state_migration', 'warning', migrationWarning, 'setup_incomplete');
   for (const warning of legacyEnvironmentWarnings(config.env)) add('legacy_environment', 'warning', warning, 'setup_incomplete');
@@ -560,8 +552,9 @@ async function bridgeDoctor(context, config) {
     try { await publishCodexHost({ signal: context.signal, stateDir: config.stateDir, pipePath: who.pipePath, threadId: who.threadId }); }
     catch { add('codex_registration', 'fail', 'The verified Codex Desktop task could not be registered. Check the shared state directory and saved endpoint records.', 'state_unavailable'); }
   }
-  const [codex, claude] = await Promise.all([doctorCodexChecks(context, config, who, signal),
+  const [permissions, codex, claude] = await Promise.all([privacy, doctorCodexChecks(context, config, who, signal),
     doctorClaudeChecks(context, config, who, callerProbeError, signal)]);
+  if (permissions) checks.splice(privacyAt, 0, { name: 'state_permissions', status: 'warning', detail: permissions, reason: 'setup_incomplete' });
   checks.push(...codex.checks, ...claude.checks);
   const ready = Boolean(who) && (codex.acceptedContext || (codex.daemonReachable && codex.terminalSessions > 0)) &&
     claude.inboxAvailable && checks.every(check => check.status !== 'fail');
@@ -680,7 +673,8 @@ async function deliver(name, args, context, config, who, held) {
     if (direction === 'to_claude') {
       const source = context.manual === true ? 'User sent from Codex Desktop task'
         : who.transport === 'terminal' ? 'From Codex terminal session' : 'From Codex Desktop task';
-      const notice = `[${source} ${JSON.stringify(route.from.id)}; bridge message ${JSON.stringify(messageId)}]\n\n${args.message}`;
+      const notice = collaboratorNotice(`[${source} ${quoted(route.from.id)}; bridge message ${quoted(messageId)}]`, args.message,
+        context.manual === true ? 'human' : 'peer');
       receipt = await sendToClaude({ ...endpoint, message: notice, senderName: senderLabel(route.from.id), signal, probe: context.processProbe });
     } else if (terminalTarget) {
       let sent;
@@ -707,7 +701,7 @@ async function deliver(name, args, context, config, who, held) {
     } else {
       const entrypoint = who.endpoint.entrypoint;
       const client = entrypoint === 'claude-desktop' ? 'Claude Desktop' : entrypoint === 'claude-vscode' ? 'Claude Code VS Code' : 'Claude Code CLI';
-      const notice = `[From ${client} session ${JSON.stringify(route.from.id)}; bridge message ${JSON.stringify(messageId)}]\n\n${args.message}`;
+      const notice = collaboratorNotice(`[From ${client} session ${quoted(route.from.id)}; bridge message ${quoted(messageId)}]`, args.message);
       try {
         await sendToCodex({ pipePath: host.pipePath, contextThreadId: host.threadId, catalog: desktop.catalog,
           threadId: route.to.id, message: notice, signal });
@@ -757,7 +751,10 @@ async function listCodexThreads(args, context, config, who) {
     (async () => {
       // The listing itself proves the context; a separate one-chat probe would double the wait.
       const found = await desktopRoute(who, config, signal, { limit });
-      return found.chats ?? await listCodexChats({ pipePath: found.host.pipePath, contextThreadId: found.host.threadId, limit, signal });
+      if (found.chats) return found;
+      const catalog = await listCodexTools(found.host.pipePath, { signal });
+      if (!desktopCompatible(catalog)) throw failure(desktopFailure({ incompatible: 1 }), 'protocol_incompatible');
+      return { chats: await listCodexChats({ pipePath: found.host.pipePath, contextThreadId: found.host.threadId, limit, signal, catalog }) };
     })(),
     daemonInquiry(config, signal, (connection, attempt) =>
       listTerminalThreads(connection, { limit, signal: attempt.signal, timeoutMs: attempt.timeoutMs })),
@@ -766,8 +763,14 @@ async function listCodexThreads(args, context, config, who) {
   const warnings = [];
   const issues = [];
   let chats = [];
-  if (desktop.status === 'fulfilled') chats = desktop.value.map(chat => ({ ...chat, source: 'desktop' }));
-  else {
+  if (desktop.status === 'fulfilled') {
+    chats = desktop.value.chats.map(chat => ({ ...chat, source: 'desktop' }));
+    // A saved endpoint that could not be checked may be a running app with more chats.
+    if (desktop.value.report?.stalled || desktop.value.report?.unchecked) {
+      warnings.push('Some saved Codex Desktop endpoints did not answer in time, so Desktop chats may be missing. Retry the same call.');
+      issues.push({ source: 'desktop', reason: 'route_unverified' });
+    }
+  } else {
     warnings.push(`Codex Desktop unavailable: ${desktop.reason.message}`);
     issues.push({ source: 'desktop', reason: transportReason(desktop.reason) });
   }
@@ -776,8 +779,12 @@ async function listCodexThreads(args, context, config, who) {
     // Retain the Desktop title and metadata when both transports list the same ID.
     const desktopIds = new Set(chats.map(chat => chat.thread_id));
     chats = [...chats, ...terminal.value.filter(chat => !desktopIds.has(chat.thread_id))];
-  } else if (shouldReportTerminalUnavailable(terminal.reason, desktop.status === 'fulfilled')) {
-    warnings.push(`Codex terminal sessions unavailable: ${terminal.reason.message}`);
+    if (terminal.value.damaged) {
+      warnings.push('Some Codex terminal sessions were omitted because the daemon returned entries without a usable ID or with an unsupported status.');
+      issues.push({ source: 'terminal', reason: 'protocol_incompatible' });
+    }
+  } else {
+    if (shouldReportTerminalUnavailable(terminal.reason, desktop.status === 'fulfilled')) warnings.push(`Codex terminal sessions unavailable: ${terminal.reason.message}`);
     issues.push({ source: 'terminal', reason: terminal.reason.inconclusive ? 'route_unverified' : transportReason(terminal.reason) });
   }
   if (desktop.status === 'rejected' && terminal.status === 'rejected') {
@@ -820,9 +827,10 @@ async function runBridgeTool(name, args, context) {
   }
   if (name === 'bridge_doctor') return bridgeDoctor(context, config);
   if (name === 'list_claude_sessions') {
-    const issues = [];
-    const sessions = discoverClaudeSessions({ registryDir: config.registryDir, issues })
-      .map(({ sessionId, name: title, cwd, entrypoint, status }) => ({ session_id: sessionId, title, cwd, entrypoint, status }));
+    const list = await verifiedClaudeSessions({ registryDir: config.registryDir, signal: context.signal, probe: context.processProbe });
+    // Rows are verified inboxes only. A registration replaced by a restart is routine, not incompleteness.
+    const issues = list.issues.filter(item => item.reason !== 'target_changed');
+    const sessions = list.sessions.map(({ sessionId, name: title, cwd, entrypoint, status }) => ({ session_id: sessionId, title, cwd, entrypoint, status }));
     return { sessions, ...(issues.length ? { issues } : {}) };
   }
   const publishesHost = name === 'panel_retry_notice';

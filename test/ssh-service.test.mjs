@@ -136,6 +136,21 @@ test('explicit SSH delivery without a configured alias refuses before using any 
   local.assertUntouched();
 });
 
+test('macOS without an SSH alias refuses discovery, a default send and diagnosis instead of using local Codex (S01)', mac, async t => {
+  const setup = await actor(t, { alias: '' }), fixture = sshFixture({ loaded: [targetId] });
+  const local = await localCandidates(t, setup);
+  const context = { ...local.context, sshSpawn: fixture.spawnImpl };
+  const unset = error => error.outcome?.reason === 'setup_incomplete' || error.reason === 'setup_incomplete';
+  await assert.rejects(executeBridgeTool('list_codex_threads', {}, context), error => unset(error) && /CLAUDE_CODEX_BRIDGE_SSH_HOST/.test(error.message));
+  await assert.rejects(executeBridgeTool('send_to_codex', { thread_id: targetId, message: 'hello', message_id: 'no-alias-auto' }, context), unset);
+  const report = await executeBridgeTool('bridge_doctor', {}, context);
+  assert.deepEqual(report.issues.find(item => item.check === 'codex_registry'), { check: 'codex_registry', status: 'fail', reason: 'setup_incomplete' });
+  assert.equal(report.checks.some(check => ['codex_daemon', 'codex_tools', 'codex_context'].includes(check.name)), false);
+  assert.deepEqual(fixture.launches, []);
+  assert.deepEqual((await executeBridgeTool('list_deliveries', {}, context)).deliveries, []);
+  local.assertUntouched();
+});
+
 test('the same thread UUID and message ID on two SSH aliases have separate delivery histories', mac, async t => {
   const setup = await actor(t), first = sshFixture({ loaded: [targetId] }), second = sshFixture({ loaded: [targetId] });
   const args = { thread_id: targetId, message: 'same content', message_id: 'per-host-idempotency' };

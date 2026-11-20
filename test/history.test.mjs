@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { listClaudeConversations } from '../lib/claude-history.mjs';
+import { canonicalClaudeSocket } from '../lib/claude-sessions.mjs';
 import { getBridgeConversation, listBridgeContacts } from '../lib/bridge-history.mjs';
 import { createSession, recordMessage, finishMessage, updateSession } from '../lib/store.mjs';
 import { nativeFixture } from './native-helpers.mjs';
@@ -114,10 +115,13 @@ for (const entrypoint of ['claude-desktop', 'cli', 'sdk-cli']) test(`catalog ind
   writeHistory(path.join(project, 'subagents'), randomUUID(), [{ type: 'custom-title', customTitle: 'Do not index subagent' }]);
   const registryDir = path.join(fixture.root, 'sessions');
   fs.mkdirSync(registryDir);
+  const socketPath = process.platform === 'win32' ? '\\\\.\\pipe\\fixture-history-session' : '/tmp/fixture-history-session.sock';
   fs.writeFileSync(path.join(registryDir, `${process.pid}.json`), JSON.stringify({ pid: process.pid,
-    sessionId, entrypoint, procStart: '1', pidDomain: 'fixture',
-    messagingSocketPath: process.platform === 'win32' ? '\\\\.\\pipe\\fixture-history-session' : '/tmp/fixture-history-session.sock',
+    sessionId, entrypoint, procStart: '1', pidDomain: 'fixture', messagingSocketPath: socketPath,
     cwd: fixture.cwd, name: 'Live reference conversation' }));
+  // A live row is a registration with a usable inbox key (E08).
+  fs.writeFileSync(path.join(registryDir, `${process.pid}.${createHash('sha256').update(canonicalClaudeSocket(socketPath)).digest('hex')}.key`),
+    JSON.stringify({ peerToken: '3'.repeat(32), procStart: '1', pidDomain: 'fixture' }));
   const ownLedger = ledger(fixture, 'catalog-owner');
   message(ownLedger, { kind: 'codex', id: 'catalog-owner' }, { kind: 'claude', id: oldSession }, 'contact', 'Sent through bridge');
   const result = await listClaudeConversations({ projectsDir, registryDir, stateDir: fixture.stateDir, ownerThreadId: 'catalog-owner' });

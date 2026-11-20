@@ -602,10 +602,12 @@ export async function runMcpServer({ input = process.stdin, output = process.std
           partialBytes = bytes;
         }
         if (newline >= 0) {
-          const line = partialBytes ? partial.toString('utf8', 0, bytes) : part.toString('utf8');
+          let line;
+          try { line = new TextDecoder('utf-8', { fatal: true }).decode(partialBytes ? partial.subarray(0, bytes) : part); }
+          catch { send(jsonLine(rpcError(null, -32700, 'MCP input is not valid UTF-8.'))); }
           partial = undefined;
           partialBytes = 0;
-          enqueue(line, bytes);
+          if (line !== undefined) enqueue(line, bytes);
         }
       }
       // Reading exactly the buffered length does not emit end by itself.
@@ -630,7 +632,13 @@ export async function runMcpServer({ input = process.stdin, output = process.std
 
 // Node resolves the entry module through links (macOS /tmp is /private/tmp), so compare real paths.
 if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  // Pin this worker's modules before an in-place plugin update can replace them.
-  await warmLedgerWorker();
-  await runMcpServer();
+  // Node logs child argv and environments in the parent before any child-side redaction (PR01).
+  if ((await import('node:util')).debuglog('child_process').enabled) {
+    process.stderr.write('Claude–Codex Bridge did not start: disable NODE_DEBUG child_process tracing, which logs message text and environments.\n');
+    process.exitCode = 1;
+  } else {
+    // Pin this worker's modules before an in-place plugin update can replace them.
+    await warmLedgerWorker();
+    await runMcpServer();
+  }
 }

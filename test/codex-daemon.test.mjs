@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
-import { DaemonUnavailableError, TerminalNotLoadedError, openDaemon, queueTargetRefusal, queueToTerminalThread, readDaemonVersions, scrubPaths } from '../lib/codex-daemon.mjs';
+import { DaemonUnavailableError, TerminalNotLoadedError, openDaemon, queueTargetRefusal, queueToTerminalThread, readDaemonVersions } from '../lib/codex-daemon.mjs';
 import { fakeDaemon, fakeQueue } from './codex-daemon-helpers.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -52,28 +52,12 @@ test('the kill switch accepts the usual spellings of off, and nothing else disab
   }
 });
 
-test('local paths are scrubbed in either slash style, through UNC, and through profile names with spaces', () => {
-  const cases = [
-    'cannot open C:\\Users\\Jane Doe\\.codex\\app.sock now',
-    'cannot open C:/Users/jane/.codex/app.sock now',
-    'cannot open D:\\work\\jane\\codex now',
-    'cannot open \\\\?\\C:\\Users\\Jane Doe\\.codex now',
-    'cannot open \\\\server\\share\\jane now',
-  ];
-  for (const text of cases) {
-    const scrubbed = scrubPaths(text);
-    assert.match(scrubbed, /^cannot open <path>/, text);
-    assert.equal(/jane|Doe|codex|work|server/i.test(scrubbed), false, `${text} -> ${scrubbed}`);
-  }
-  assert.equal(scrubPaths('thread not found: term-1'), 'thread not found: term-1');
-});
-
-test('a daemon error message is scrubbed for display but kept verbatim for classification', async t => {
+test('a daemon error is shown as bridge-owned text and kept verbatim only for classification', async t => {
   const setup = await fakeDaemon(t, { threads: [], errors: { 'thread/list': { code: -32603, message: 'failed to read C:\\Users\\Jane Doe\\.codex\\sessions' } } });
   const connection = await openDaemon({ ...setup.daemon });
   t.after(() => connection.close());
   await assert.rejects(() => connection.request('thread/list', {}), error =>
-    error.message === 'Codex daemon: failed to read <path>' && /Jane Doe/.test(error.rpcMessage));
+    error.message === 'Codex daemon: The request failed. Check the application for its diagnostic.' && /Jane Doe/.test(error.rpcMessage));
 });
 
 test('the supplied environment reaches the proxy, so an isolated CODEX_HOME selects its own daemon', async t => {
@@ -196,9 +180,9 @@ test('daemon sends normalize UUIDs for idle, active, and stale-steer fallback re
 
 test('discovery includes an old resumed Desktop-created thread before newer inactive threads', async () => {
   const stored = Array.from({ length: 60 }, (_, index) => ({
-    id: `new-${index}`, originator: 'codex-tui', createdAt: 100 + index, updatedAt: 100 + index,
+    id: `new-${index}`, originator: 'codex-tui', status: { type: 'notLoaded' }, createdAt: 100 + index, updatedAt: 100 + index,
   }));
-  stored.push({ id: 'old-resumed', originator: 'Codex Desktop', createdAt: 1, updatedAt: 1000 });
+  stored.push({ id: 'old-resumed', originator: 'Codex Desktop', status: { type: 'notLoaded' }, createdAt: 1, updatedAt: 1000 });
   const connection = { async request(method, params) {
     assert.equal(method, 'thread/list');
     const key = params.sortKey === 'updated_at' ? 'updatedAt' : 'createdAt';
@@ -214,7 +198,7 @@ test('discovery includes an old resumed Desktop-created thread before newer inac
 test('discovery stops after the bounded page count even if the daemon keeps returning a cursor', async () => {
   let pages = 0;
   const connection = { async request() { pages++; return { data: [], nextCursor: 'same-cursor' }; } };
-  assert.deepEqual(await listTerminalThreads(connection, { budgetMs: 60000 }), []);
+  assert.deepEqual([...await listTerminalThreads(connection, { budgetMs: 60000 })], []);
   assert.equal(pages, 40);
 });
 
@@ -403,7 +387,7 @@ test('a stale steer cannot start a turn when the reread returns a different or u
       assert.fail(`Unexpected mutation: ${method}`);
     } };
     await assert.rejects(() => sendToTerminalThread(connection, { threadId: 'selected', text: 'x', messageId: 'm' }),
-      error => /different thread|changed turns|unsupported thread read/.test(error.message) && !error.deliveryUnknown);
+      error => /different thread|no longer loaded|unsupported thread read/.test(error.message) && !error.deliveryUnknown);
     assert.equal(reads, 2);
     assert.equal(calls.filter(entry => entry.method === 'turn/steer').length, 1);
     assert.equal(calls.some(entry => entry.method === 'turn/start'), false);
@@ -416,7 +400,7 @@ test('a codex.cmd shim is refused with a clear message instead of throwing from 
   fs.writeFileSync(shim, '');
   const env = { CLAUDE_CODEX_BRIDGE_CODEX_BIN: shim, CLAUDE_CODEX_BRIDGE_DAEMON: '' };
   await assert.rejects(() => openDaemon({ env }),
-    error => error instanceof DaemonUnavailableError && /must point to codex\.exe/.test(error.message));
+    error => error instanceof DaemonUnavailableError && /must point to a native Codex \.exe/.test(error.message));
   assert.equal(await readDaemonVersions({ env }), null);
 });
 
@@ -427,7 +411,7 @@ test('an oversize running-turn read while steering is refused cleanly before any
   const connection = await openDaemon({ ...setup.daemon });
   t.after(() => connection.close());
   await assert.rejects(() => sendToTerminalThread(connection, { threadId: 'huge', text: 'x', messageId: 'm' }),
-    error => /session history is too large/.test(error.message) && !error.deliveryUnknown);
+    error => /exceeds the transport limit/.test(error.message) && error.reason === 'target_busy' && !error.deliveryUnknown);
   assert.equal(setup.requests().some(entry => /turn\/(start|steer)/.test(entry.method)), false);
 });
 
@@ -441,10 +425,10 @@ test('terminal titles are collapsed to one line and capped at 200 characters', a
   assert.equal(/[\r\n]/.test(entry.title), false);
 });
 
-test('Windows paths in the proxy stderr are stripped from the unreachable message', async t => {
+test('proxy stderr never reaches the unreachable message', async t => {
   const setup = await fakeDaemon(t, { unreachable: true, unreachableStderr: 'cannot connect to C:\\Users\\secret\\codex.sock now\n' });
   await assert.rejects(() => openDaemon({ ...setup.daemon }),
-    error => error instanceof DaemonUnavailableError && error.message.includes('<path>') && !/secret/.test(error.message));
+    error => error instanceof DaemonUnavailableError && /not reachable/.test(error.message) && !/secret|Users/.test(error.message));
 });
 
 test('a connection lost after turn/steer was written is delivery-unknown and never falls back to turn/start', async t => {
@@ -556,5 +540,5 @@ test('the queue route honors the kill switch and refuses a codex.cmd shim', asyn
   fs.writeFileSync(shim, '');
   await assert.rejects(() => queueToTerminalThread({ threadId: QUEUE_TARGET_ID, text: 'y',
     env: { CLAUDE_CODEX_BRIDGE_CODEX_BIN: shim, CLAUDE_CODEX_BRIDGE_DAEMON: '' } }),
-    error => error instanceof DaemonUnavailableError && /must point to codex\.exe/.test(error.message));
+    error => error instanceof DaemonUnavailableError && /must point to a native Codex \.exe/.test(error.message));
 });

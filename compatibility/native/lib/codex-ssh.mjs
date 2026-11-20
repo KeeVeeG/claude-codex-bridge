@@ -17,7 +17,7 @@ const object = value => value !== null && typeof value === 'object' && !Array.is
 
 export function validateSshHostAlias(value) {
   if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value)) {
-    throw new Error('SSH host alias must be a concrete ~/.ssh/config alias, without options, user names, or shell characters.');
+    throw failure('SSH host alias must be a concrete SSH configuration alias without options or shell characters.', 'setup_incomplete');
   }
   return value;
 }
@@ -72,15 +72,26 @@ class SshRpc {
     this.timer = setTimeout(() => this.fail(failure('Codex SSH request timeout; the route could not be verified in time.', 'route_unverified')), timeoutMs);
     try {
       this.child = spawnImpl('/usr/bin/ssh', ['-T', '-oBatchMode=yes', '-oStrictHostKeyChecking=yes',
-        '-oConnectTimeout=5', '--', alias, 'exec "$SHELL" -lc \'exec codex app-server proxy\''],
+        '-oControlMaster=no', '-oControlPath=none', '-oConnectTimeout=5', '--', alias, 'exec "$SHELL" -lc \'exec codex app-server proxy\''],
       { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
       if (!this.child.stdin || !this.child.stdout || !this.child.stderr) throw new Error('SSH proxy streams are unavailable.');
       this.child.on('error', () => this.fail(new Error('Could not start the configured SSH proxy.')));
-      this.child.on('close', () => this.fail(new Error('The configured SSH proxy closed before replying.')));
+      let diagnostic = '';
+      this.child.stderr.setEncoding('utf8');
+      this.child.stderr.on('data', chunk => { diagnostic = (diagnostic + chunk).slice(-4096); });
+      this.child.on('close', code => {
+        const detail = !this.upgraded && /host key verification failed|remote host identification has changed/i.test(diagnostic)
+          ? 'SSH host-key verification failed. Verify the configured host key with its operator.'
+          : !this.upgraded && code === 127 && /codex.*(?:not found|command not found)|command not found.*codex/i.test(diagnostic)
+          ? 'The remote login shell could not find Codex. Configure its login PATH to include Codex.'
+          : !this.upgraded && /permission denied/i.test(diagnostic) ? 'SSH authentication was denied. Configure noninteractive authentication for the selected alias.'
+          : 'The configured SSH proxy closed before replying. Check connectivity to the configured host.';
+        this.fail(failure(detail, 'route_unavailable'));
+      });
       this.child.stdin.on('error', () => this.fail(new Error('Could not write to the configured SSH proxy.')));
       this.child.stdout.on('error', () => this.fail(new Error('Could not read from the configured SSH proxy.')));
       this.child.stderr.on('error', () => this.fail(new Error('Could not read from the configured SSH proxy.')));
-      this.child.stdout.on('end', () => this.fail(new Error('The configured SSH proxy closed before replying.')));
+      this.child.stdout.on('end', () => { if (this.upgraded) this.fail(failure('The configured SSH proxy closed before replying.', 'route_unavailable')); });
       this.child.stdout.on('data', chunk => { try { this.receive(chunk); } catch (error) { this.fail(error); } });
       // Drain stderr without exposing login banners, diagnostics, or credentials.
       this.child.stderr.resume();
@@ -97,7 +108,10 @@ class SshRpc {
       const end = this.pending.indexOf('\r\n\r\n');
       if (end < 0) { if (this.pending.length > MAX_HEADER) throw new Error('Codex SSH handshake exceeds the transport limit.'); return; }
       if (end > MAX_HEADER) throw new Error('Codex SSH handshake exceeds the transport limit.');
-      const lines = this.pending.subarray(0, end).toString('ascii').split('\r\n');
+      const head = this.pending.subarray(0, end).toString('ascii');
+      // A login-shell banner ends its lines with LF or CRLF before the proxy's status line (W08).
+      if (!head.startsWith('HTTP/') && /\nHTTP\/1\.1 /.test(head)) throw failure('The remote shell printed output before the proxy handshake. Configure silent noninteractive shell startup.', 'protocol_incompatible');
+      const lines = head.split('\r\n');
       const headers = new Map();
       for (const line of lines.slice(1)) {
         const colon = line.indexOf(':');
@@ -223,7 +237,7 @@ function target(result, threadId) {
 function summary(thread, threadId, sshHostAlias) {
   if ((thread.name != null && typeof thread.name !== 'string') ||
       (thread.preview != null && typeof thread.preview !== 'string') ||
-      (thread.cwd != null && (typeof thread.cwd !== 'string' || Buffer.byteLength(thread.cwd) > 4096 || /[\r\n\0]/.test(thread.cwd)))) {
+      (thread.cwd != null && (typeof thread.cwd !== 'string' || Buffer.byteLength(thread.cwd) > 4096 || thread.cwd.includes('\0')))) {
     throw new Error('Codex SSH returned unsupported thread metadata.');
   }
   const title = [thread.name, thread.preview, threadId]
@@ -241,9 +255,10 @@ export async function listSshCodexChats(options = {}) {
     if (!Array.isArray(loaded.data)) throw failure('Unsupported Codex SSH loaded-thread catalog.', 'protocol_incompatible');
     const ids = [...new Set(loaded.data.map(selectedThreadId))];
     const chats = [];
-    for (const id of ids.slice(0, limit)) {
+    for (const id of ids.slice(0, 200)) {
+      if (chats.length >= limit) break;
       const thread = target(await rpc.request('thread/read', { threadId: id, includeTurns: false }), id);
-      if (thread.status.type === 'notLoaded') continue;
+      if (thread.status.type !== 'idle') continue;
       chats.push(summary(thread, id, options.sshHostAlias));
     }
     return chats;
@@ -259,8 +274,9 @@ export async function sendSshCodex(options = {}) {
   try {
     const read = await rpc.request('thread/read', { threadId, includeTurns: false });
     const status = target(read, threadId).status.type;
-    if (status !== 'idle') throw failure('Open the target on the configured SSH host in Codex Desktop; it must be loaded and idle before sending.',
-      status === 'active' ? 'target_busy' : 'target_unavailable');
+    if (status === 'active') throw failure('The selected SSH chat is active. Repeat the same call when it is idle.', 'target_busy');
+    if (status === 'systemError') throw failure('The selected SSH chat reports a system error. Resolve the error in that chat before sending.', 'target_unavailable');
+    if (status !== 'idle') throw failure('The selected SSH chat is not loaded. Open it on the configured host before sending.', 'target_unavailable');
     // Input to an already-loaded thread needs no subscription. Resuming here
     // could load a conversation closed after the read and hydrate its history.
     const turnId = startedTurnId(await rpc.request('turn/start', { threadId, input: [{ type: 'text', text: message }] }, true));

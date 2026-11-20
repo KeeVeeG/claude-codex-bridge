@@ -90,5 +90,5 @@ export async function mockPipe(t, { framed = false, onMessage, onConnection } = 
 
 export const messageTool = {
   name: 'send_message_to_thread', namespace: 'codex_app',
-  inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, prompt: { type: 'string' } } },
+  inputSchema: { type: 'object', properties: { hostId: { type: 'string' }, threadId: { type: 'string' }, prompt: { type: 'string' } } },
 };

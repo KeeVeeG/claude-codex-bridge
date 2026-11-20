@@ -123,7 +123,9 @@ function request(pipePath, method, params, { timeoutMs = 30000, mutating = false
           const reason = code === -32602 && message === 'Invalid app tool request' ? 'request_rejected'
             : code === -32601 ? 'protocol_incompatible' : 'internal_error';
           finish(mutating && submitted && reason === 'internal_error' ? unconfirmedReply('Codex Desktop')
-            : failure(`Codex Desktop: ${message}`, reason, { code }));
+            : failure(reason === 'request_rejected' ? 'Codex Desktop rejected the app tool request. Check its arguments.'
+              : reason === 'protocol_incompatible' ? 'Codex Desktop does not support this method. Check the app-tools configuration.'
+              : 'Codex Desktop could not complete the app tool request. Run bridge_doctor from an open Desktop task.', reason, { code }));
         } else if (kind === 'result') {
           finish(null, response.result);
         } else {
@@ -168,20 +170,9 @@ async function listNativeCodexChats({ pipePath, contextThreadId, limit = 30, sig
   const result = await request(pipePath, 'tools/call', {
     arguments: { limit }, callerSource: 'codex', namespace: tool.namespace, tool: tool.name,
     threadId: contextThreadId, callId: `bridge-list-${randomUUID()}`, turnId: `bridge-list-${randomUUID()}`,
-  }, { timeoutMs, signal }).catch(error => {
-    if (error.message === 'Codex Desktop: Codex app tool request failed') {
-      throw Object.assign(new Error('Codex Desktop rejected the registered task context. Ask an open Codex Desktop task to call bridge_doctor, then retry discovery.'),
-        { code: 'CONTEXT_REJECTED' });
-    }
-    throw error;
-  });
+  }, { timeoutMs, signal });
   if (!appToolResult(result)) throw failure('Codex Desktop returned an unsupported chat discovery result', 'protocol_incompatible');
-  if (!result.success) {
-    const detail = result.contentItems
-      .filter(item => item.type === 'inputText' && typeof item.text === 'string')
-      .map(item => item.text).join('\n').slice(0, 2000);
-    throw new Error(`Codex Desktop could not list chats${detail ? `: ${detail}` : '.'}`);
-  }
+  if (!result.success) throw failure('Codex Desktop could not list chats for the supplied task context. Run bridge_doctor from an open Desktop task.', 'route_unavailable');
   let listing;
   for (const item of result.contentItems) {
     if (item.type !== 'inputText' || typeof item.text !== 'string') continue;
@@ -190,17 +181,37 @@ async function listNativeCodexChats({ pipePath, contextThreadId, limit = 30, sig
       if (Array.isArray(parsed.threads)) { listing = parsed; break; }
     } catch { /* Other text items are not the structured listing. */ }
   }
-  if (!listing) throw new Error('Codex Desktop returned an unsupported chat listing');
-  const seen = new Set();
-  return [...(listing.pinnedThreads || []), ...listing.threads].filter(item => {
-    const id = item.id || item.threadId;
-    if (typeof id !== 'string' || !id || seen.has(id) || item.kind !== 'codex' ||
-        (item.hostId && item.hostId !== 'local')) return false;
-    seen.add(id);
-    return true;
-  }).map(item => ({ thread_id: item.id || item.threadId, title: item.title,
-    status: item.status, cwd: item.cwd, host_id: item.hostId || 'local' }));
+  if (!listing || (listing.pinnedThreads != null && !Array.isArray(listing.pinnedThreads))) throw failure('Codex Desktop returned an unsupported chat listing.', 'protocol_incompatible');
+  const seen = new Set(), rows = [];
+  for (const [items, cap] of [[listing.pinnedThreads ?? [], MAX_CODEX_CHAT_LIMIT], [listing.threads, limit]]) {
+    let count = 0;
+    for (const item of items) {
+      const id = item?.id || item?.threadId;
+      if (item?.kind !== 'codex' || (item.hostId != null && item.hostId !== 'local')) continue;
+      if (typeof id !== 'string' || !id.trim()) throw failure('Codex Desktop returned a chat without a usable ID.', 'protocol_incompatible');
+      if (seen.has(id)) continue;
+      seen.add(id);
+      rows.push({ thread_id: id, title: typeof item.title === 'string' ? item.title.slice(0, 512) : '',
+        status: typeof item.status === 'string' ? item.status : 'unknown', cwd: typeof item.cwd === 'string' ? item.cwd.slice(0, 4096) : '', host_id: 'local' });
+      if (++count >= cap) break;
+    }
+  }
+  return rows;
 }
+
+// The outer task context selects the caller; only the target-host tool argument constrains dispatch.
+function localMessageTool(catalog) {
+  return catalog.find(tool => {
+    const fields = tool?.inputSchema?.properties;
+    return tool?.name === 'send_message_to_thread' && typeof tool.namespace === 'string' && tool.namespace &&
+      ['threadId', 'prompt','hostId'].every(key => fields?.[key]?.type === 'string') &&
+      (fields.hostId.const === undefined || fields.hostId.const === 'local') &&
+      (!fields.hostId.enum || (Array.isArray(fields.hostId.enum) && fields.hostId.enum.includes('local')));
+  });
+}
+
+export const desktopCompatible = catalog => Boolean(localMessageTool(catalog) && catalog.some(tool =>
+  tool?.name === 'list_threads' && typeof tool.namespace === 'string' && tool.namespace));
 
 /**
  * Send a native visible prompt to the exact Codex task selected by the caller.
@@ -212,16 +223,10 @@ async function sendNativeToCodex({ pipePath, contextThreadId, threadId, message,
   requiredText(contextThreadId, 'Registered Codex context task id');
   requiredText(threadId, 'Selected Codex task id');
   requiredText(message, 'Message');
-  const tool = (catalog ?? await listCodexTools(pipePath, { signal })).find(item => item?.name === 'send_message_to_thread');
-  if (typeof tool?.namespace !== 'string' || !tool.namespace) {
-    throw failure('This Codex Desktop version does not expose send_message_to_thread.', 'protocol_incompatible');
-  }
-  const schema = tool.inputSchema;
-  if (schema?.properties?.threadId?.type !== 'string' || schema?.properties?.prompt?.type !== 'string') {
-    throw failure('The installed Codex Desktop message tool has an unsupported input schema.', 'protocol_incompatible');
-  }
+  const tool = localMessageTool(catalog ?? await listCodexTools(pipePath, { signal }));
+  if (!tool) throw failure('Codex Desktop message tool has an unsupported input schema: cannot pin the target host to local. Use a Desktop build with target-host support.', 'protocol_incompatible');
   const result = await request(pipePath, 'tools/call', {
-    arguments: { threadId, prompt: message },
+    arguments: { threadId, hostId: 'local', prompt: message },
     callerSource: 'codex',
     callId: callId ?? `bridge-call-${randomUUID()}`,
     namespace: tool.namespace,

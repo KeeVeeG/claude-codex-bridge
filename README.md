@@ -61,7 +61,7 @@ For a mixed run or rollback, point every process at the **same real private dire
 2. In Codex Desktop, connect through **Settings > Connections > SSH** and open the target chat on that connection. A chat under **This computer** belongs to a different server.
 3. Install with the alias, and use the same alias on later updates: `CLAUDE_CODEX_BRIDGE_SSH_HOST=my-codex-host node scripts/install.mjs`. Marketplace installs must configure this variable themselves.
 
-`list_codex_threads` then lists only that server's loaded chats (`source: "ssh"`), and `send_to_codex` accepts only `auto` or `ssh`. The target must be loaded and idle. The bridge never resumes or creates threads, never falls back to a local route, and never retries a submitted turn. Transport security is described in [SECURITY.md](SECURITY.md).
+`list_codex_threads` then lists only that server's loaded idle chats (`source: "ssh"`), and `send_to_codex` accepts only `auto` or `ssh`. Without an alias, macOS refuses Codex discovery and sends with `setup_incomplete`; it never falls back to a local route. The alias is visible to the models as `host_id: "ssh:<alias>"` in results and saved deliveries, so pick a neutral name. The target must be loaded and idle. The bridge never resumes or creates threads, never falls back to a local route, and never retries a submitted turn. Transport security is described in [SECURITY.md](SECURITY.md).
 
 ## Usage
 
@@ -91,8 +91,8 @@ Incoming messages name their verified source, so a reply is just another `send_*
 
 `list_codex_threads` merges Desktop discovery with the Codex daemon, which lists conversations from every client. `source` says where an entry was discovered, not where it is open now. `send_to_codex` routes by `transport`:
 
-- `auto` (default): a conversation loaded in the daemon goes through the daemon; one the daemon does not know, or any conversation when the daemon is unavailable, goes through Desktop. A stored but unloaded conversation is ambiguous, so the bridge refuses and asks for an explicit transport.
-- `desktop`: Desktop app-tools only.
+- `auto` (default): a conversation loaded in the daemon goes through the daemon; one the daemon does not know, or any conversation when the daemon is unavailable, goes through Desktop. A stored but unloaded conversation is ambiguous, so the bridge refuses and asks the model to ask you whether it is open in Codex Desktop (`desktop`) or Codex CLI (`terminal`); `source` does not tell.
+- `desktop`: Desktop app-tools only, on the local host: discovery skips rows of other hosts, and every send names `hostId: "local"`. A Desktop build whose message tool cannot take a host, or that offers no message tool, is not used.
 - `terminal`: the daemon for loaded conversations; `codex queue` for unloaded ones or when the daemon is unavailable. The queue delivers to an open session or holds the message until the session reopens. Queued text, including the bridge's peer notice, is limited to 16000 characters. IDs the daemon does not know are refused.
 
 Terminal messages arrive as a user turn wrapped in a peer notice; a session in mid-turn is steered without interruption. The bridge never starts the daemon. Set `CLAUDE_CODEX_BRIDGE_DAEMON=off` to disable the daemon and queue routes, and `CLAUDE_CODEX_BRIDGE_CODEX_BIN` to the path of `codex.exe` if it is not found on `PATH` or through an npm, pnpm, or Volta shim.
@@ -103,11 +103,15 @@ Run `bridge_doctor` first; it sends nothing. From a verified Codex Desktop task 
 
 - **Codex Desktop not found from Claude.** Codex Desktop's bridge server registers its endpoint when it starts, with the last registered task, and again whenever a task sends or calls `bridge_doctor`. The registry keeps recent endpoints and drops those whose pipe is gone. The error names the cause:
   - *running but did not answer in time*: Codex Desktop is stuck; restart it.
-  - *rejected saved task context*: the registered task was removed; call `bridge_doctor` once from an open Codex Desktop task.
-  - *belongs to earlier Codex Desktop launches* only: open a Codex Desktop task with the bridge enabled.
+  - *did not accept the saved task context*: the registered task was removed; call `bridge_doctor` once from an open Codex Desktop task.
+  - *belongs to earlier launches*: open a Codex Desktop task with the bridge enabled.
+  - *No Codex Desktop registration*: no Codex Desktop task has started the bridge with this state directory yet.
+
+  The first sentence names the cause to fix; any further observations follow after *Also observed*.
 - **Each app sees different state.** Both must resolve to one real directory, normally `~/.local/share/claude-codex-bridge`. The installer pins the local directory for both, avoiding Windows MSIX virtualization of `LOCALAPPDATA`. If old and new state both exist, follow the update steps above before retrying any delivery.
 - **Claude blocks `send_to_codex`.** Add the permission above, or switch the Code tab to **Manual** and approve the prompt. A `Bash` rule does not apply to MCP tools.
-- **Claude does not receive.** `/status` must show a `Peer address`; `--bare` sessions have no inbox. Claude's `crossSessionInbound` setting can hold or refuse messages after a successful write. The bridge marks its messages `from-mode="bypass"` so Bypass sessions do not hold them silently ([issue #1](https://github.com/KeeVeeG/claude-codex-bridge/issues/1)); it never changes your inbound settings.
+- **Claude does not receive.** `/status` must show a `Peer address`; `--bare` sessions have no inbox. Claude's `crossSessionInbound` setting can hold or refuse messages after a successful write. The bridge marks its messages `from-mode="bypass"` so Bypass sessions do not hold them silently ([issue #1](https://github.com/KeeVeeG/claude-codex-bridge/issues/1)); it never changes your inbound settings. Claude sends no hold or refusal signal back, so `submitted` confirms only the transport write: check the receiving session if a message seems lost.
+- **The bridge server does not start.** It refuses while `NODE_DEBUG` includes `child_process`, because Node would log message text and environments; remove that setting.
 
 ### Offline lock recovery
 

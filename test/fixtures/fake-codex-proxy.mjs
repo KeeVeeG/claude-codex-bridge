@@ -78,7 +78,7 @@ function answer(request) {
   send({ id, error: { code: -32601, message: `unsupported method ${method}` } });
 }
 
-const decoder = new FrameDecoder({ upgraded: true });
+const decoder = new FrameDecoder({ upgraded: true, clientFrames: true });
 let handshake = Buffer.alloc(0);
 let upgraded = false;
 let leaving = false;

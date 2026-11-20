@@ -57,6 +57,8 @@ test('Claude discovery includes CLI and SDK CLI alongside Desktop and exposes on
   const setup = await fixture(t);
   const desktop = { ...setup.record, pid: process.ppid, sessionId: randomUUID(), entrypoint: 'claude-desktop' };
   fs.writeFileSync(path.join(setup.registryDir, `${desktop.pid}.json`), JSON.stringify(desktop));
+  fs.writeFileSync(path.join(setup.registryDir,
+    `${desktop.pid}.${createHash('sha256').update(canonicalClaudeSocket(setup.socketPath)).digest('hex')}.key`), JSON.stringify(setup.key));
   for (const entrypoint of ['cli', 'sdk-cli', 'claude-vscode']) {
     setup.rewrite({ entrypoint });
     const sessions = discoverClaudeSessions({ registryDir: setup.registryDir });
@@ -110,20 +112,25 @@ test('CLI clear and resume follow the current exact session ID without retaining
 
 test('a conversation open in two windows takes messages in the one used last, and each window can call the bridge', nativeIdentityOnly, async t => {
   const pipe = await mockPipe(t);
+  const otherPipe = await mockPipe(t);
   const setup = await fixture(t, { socketPath: pipe.pipePath });
   const other = { ...setup.record, pid: process.ppid, entrypoint: 'claude-desktop', procStart: otherStart,
-    messagingSocketPath: socketName(), name: 'Older window' };
+    messagingSocketPath: otherPipe.pipePath, name: 'Older window' };
   setup.starts.set(other.pid, otherStart);
   const otherKey = `${other.pid}.${createHash('sha256').update(canonicalClaudeSocket(other.messagingSocketPath)).digest('hex')}.key`;
   fs.writeFileSync(path.join(setup.registryDir, otherKey), JSON.stringify({ ...setup.key, peerToken: '2'.repeat(32), [keyStartField]: other.procStart }));
   const writeOther = values => fs.writeFileSync(path.join(setup.registryDir, `${other.pid}.json`), JSON.stringify(Object.assign(other, values)));
-  writeOther({ updatedAt: 1000 });
-  setup.rewrite({ updatedAt: 2000 });
+  // Status activity decides; a metadata-only update in the other window does not redirect (L04).
+  writeOther({ statusUpdatedAt: 1000, updatedAt: 9000 });
+  setup.rewrite({ statusUpdatedAt: 2000, updatedAt: 2000 });
   const endpoint = await setup.resolve();
   assert.equal(endpoint.pid, process.pid);
   assert.deepEqual(discoverClaudeSessions({ registryDir: setup.registryDir }).map(session => session.pid), [process.pid]);
-  writeOther({ updatedAt: 3000 });
+  writeOther({ statusUpdatedAt: 3000 });
   assert.equal((await setup.resolve()).token, '2'.repeat(32));
+  // A newer window whose inbox does not accept connections never takes the send from a working one (A09a).
+  await otherPipe.close();
+  assert.equal((await setup.resolve()).pid, process.pid);
   for (const pid of [process.pid, process.ppid]) {
     assert.equal((await setup.caller({ parentPid: pid })).pid, pid);
   }
@@ -190,11 +197,20 @@ test('Claude caller and destination resolution require a 32-character lowercase 
     await t.test(name, async () => {
       writeToken(token);
       await Promise.all([
-        assert.rejects(setup.caller(), /inbox key does not match/),
-        assert.rejects(setup.resolve(), /inbox key does not match/),
+        assert.rejects(setup.caller(), /inbox key of the chosen Claude session has an unsupported format/),
+        assert.rejects(setup.resolve(), /inbox key of the chosen Claude session has an unsupported format/),
       ]);
     });
   }
+});
+
+test('a quoted bridge tag reaches Claude as written, except the envelope escape of its closing tag kept from 1.0 (M02)', nativeIdentityOnly, async t => {
+  const pipe = await mockPipe(t);
+  const setup = await fixture(t, { socketPath: pipe.pipePath });
+  const quotedTag = 'See <cross-session-message from-name="Earlier">quoted</cross-session-message> above.';
+  await sendToClaude({ ...await setup.resolve(), probe: setup.probe, message: quotedTag });
+  const lines = pipe.messages[1].message.message.content.split('\n');
+  assert.deepEqual([lines.length, lines[1]], [3, 'See <cross-session-message from-name="Earlier">quoted<\\/cross-session-message> above.']);
 });
 
 test('caller rejects an entrypoint replacement between matching the parent and resolving its inbox', nativeIdentityOnly, async t => {

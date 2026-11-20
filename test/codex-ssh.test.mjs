@@ -40,10 +40,11 @@ test('SSH discovery lists only loaded chats on the configured server', async () 
   assert.ok(!fixture.requests.some(r => r.method === 'turn/start' || r.method === 'thread/resume'));
 });
 
-for (const status of ['notLoaded', 'active', 'systemError']) {
-  test(`SSH refuses ${status} targets before submitting a turn`, async () => {
+for (const [status, text, reason] of [['notLoaded', /not loaded\. Open it on the configured host/, 'target_unavailable'],
+  ['active', /active\. Repeat the same call when it is idle/, 'target_busy'], ['systemError', /system error/, 'target_unavailable']]) {
+  test(`SSH refuses ${status} targets before submitting a turn, with the repair for that status (E09)`, async () => {
     const fixture = sshFixture({ status });
-    await assert.rejects(sendToCodex(options(fixture)), /loaded and idle/);
+    await assert.rejects(sendToCodex(options(fixture)), error => text.test(error.message) && error.reason === reason);
     assert.ok(!fixture.requests.some(r => r.method === 'turn/start'));
   });
 }
@@ -68,7 +69,7 @@ test('SSH sends to long conversations without reading history or resuming them',
 
 test('SSH never reloads a target that unloads between its metadata read and send', async () => {
   const fixture = sshFixture({ unloadAfterRead: true });
-  await assert.rejects(sendToCodex(options(fixture)), /thread not found/);
+  await assert.rejects(sendToCodex(options(fixture)), /thread was not found/);
   assert.equal(fixture.acceptedTurns.length, 0);
   assert.equal(fixture.requests.filter(r => r.method === 'turn/start').length, 1);
   assert.ok(fixture.requests.every(r => r.method !== 'thread/resume' && r.method !== 'thread/start'));

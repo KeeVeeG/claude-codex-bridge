@@ -28,17 +28,17 @@ test('upgrade request is a WebSocket upgrade with a fresh key and the matching a
 
 test('the decoder validates the accept key when one is expected', () => {
   const { accept } = upgradeRequest();
-  const good = `HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nsec-websocket-accept: ${accept}\r\n\r\n`;
+  const good = `HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: ${accept}\r\n\r\n`;
   assert.deepEqual(new FrameDecoder({ accept }).push(Buffer.from(good)), [{ type: 'open' }]);
   assert.throws(() => new FrameDecoder({ accept }).push(Buffer.from(UPGRADED)), /invalid WebSocket accept key/);
-  const wrong = `HTTP/1.1 101 Switching Protocols\r\nsec-websocket-accept: nope\r\n\r\n`;
+  const wrong = `HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: nope\r\n\r\n`;
   assert.throws(() => new FrameDecoder({ accept }).push(Buffer.from(wrong)), /invalid WebSocket accept key/);
 });
 
 test('masked client frames round-trip through the decoder at every length class', () => {
   for (const size of [5, 125, 126, 300, 70000]) {
     const text = 'x'.repeat(size);
-    const decoder = new FrameDecoder({ upgraded: true });
+    const decoder = new FrameDecoder({ upgraded: true, clientFrames: true });
     assert.deepEqual(decoder.push(encodeText(text)), [{ type: 'text', text }], `size ${size}`);
   }
 });
@@ -46,7 +46,7 @@ test('masked client frames round-trip through the decoder at every length class'
 test('decoder waits for the upgrade, reports open, and accepts bytes split across chunks', () => {
   const { accept } = upgradeRequest();
   const decoder = new FrameDecoder({ accept });
-  const head = `HTTP/1.1 101 Switching Protocols\r\nsec-websocket-accept: ${accept}\r\n\r\n`;
+  const head = `HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: ${accept}\r\n\r\n`;
   const wire = Buffer.concat([Buffer.from(head), serverFrame(1, '{"id":1}')]);
   const events = [];
   for (let offset = 0; offset < wire.length; offset += 7) events.push(...decoder.push(wire.subarray(offset, offset + 7)));

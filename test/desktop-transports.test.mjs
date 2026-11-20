@@ -79,7 +79,7 @@ test('Codex adapter discovers the app tool and addresses only the selected task'
   assert.deepEqual(pipe.messages[0].message.params, { threadStartKind: 'all' });
   assert.deepEqual(pipe.messages[1].message, {
     jsonrpc: '2.0', id: 1, method: 'tools/call',
-    params: { arguments: { threadId: 'paired-task', prompt: message }, callerSource: 'codex', callId: 'bridge-call', namespace: 'codex_app', threadId: 'bridge-context', tool: 'send_message_to_thread', turnId: 'bridge-turn' },
+    params: { arguments: { threadId: 'paired-task', hostId: 'local', prompt: message }, callerSource: 'codex', callId: 'bridge-call', namespace: 'codex_app', threadId: 'bridge-context', tool: 'send_message_to_thread', turnId: 'bridge-turn' },
   });
 });
 
@@ -150,7 +150,7 @@ test('Codex adapter rejects invalid response frames as bounded protocol errors',
   await assert.rejects(listCodexTools(pipe.pipePath), /invalid frame length/);
 });
 
-test('Codex chat listing rejects unsupported limits before transport and preserves native failure details', async t => {
+test('Codex chat listing rejects unsupported limits before transport and keeps native failure text internal', async t => {
   const nativeDetail = 'Native list_threads rejected this call: the registered task is unavailable.';
   const listTool = { name: 'list_threads', namespace: 'codex_app', inputSchema: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 50 } } } };
   const pipe = await mockPipe(t, {
@@ -169,30 +169,14 @@ test('Codex chat listing rejects unsupported limits before transport and preserv
   await assert.rejects(listCodexChats({ pipePath: pipe.pipePath, contextThreadId: 'registered-context', limit: 51 }), /50/);
   assert.equal(pipe.connections.length, 0);
   await assert.rejects(listCodexChats({ pipePath: pipe.pipePath, contextThreadId: 'registered-context', limit: 30 }), error => {
-    assert.ok(error.message.includes(nativeDetail));
+    assert.ok(!error.message.includes('Native list_threads'), 'peer text is classified, never shown (X05)');
+    assert.equal(error.reason, 'route_unavailable');
     assert.notEqual(error.deliveryUnknown, true, 'read-only listing failures are not uncertain message delivery');
     return true;
   });
 });
 
-test('Codex chat listing bounds native diagnostic text instead of returning an unbounded error', async t => {
-  const detail = `NATIVE_LIST_FAILURE: ${'x'.repeat(5000)} OMITTED_DIAGNOSTIC_TAIL`;
-  const pipe = await mockPipe(t, {
-    framed: true,
-    onMessage(message, socket) {
-      if (message.method === 'tools/list') answer(socket, message.id, { tools: [{ name: 'list_threads', namespace: 'codex_app' }] });
-      else answer(socket, message.id, { success: false, contentItems: [{ type: 'inputText', text: detail }] });
-    },
-  });
-  await assert.rejects(listCodexChats({ pipePath: pipe.pipePath, contextThreadId: 'registered-context' }), error => {
-    assert.match(error.message, /NATIVE_LIST_FAILURE/);
-    assert.doesNotMatch(error.message, /OMITTED_DIAGNOSTIC_TAIL/);
-    assert.ok(error.message.length <= 2100, 'native detail is bounded to 2000 characters plus a short error prefix');
-    return true;
-  });
-});
-
-test('Codex chat listing explains a rejected registered context without guessing another task', async t => {
+test('a generic app tool failure is not presented as a rejected task context (E06)', async t => {
   const listTool = { name: 'list_threads', namespace: 'codex_app' };
   const pipe = await mockPipe(t, {
     framed: true,
@@ -202,6 +186,7 @@ test('Codex chat listing explains a rejected registered context without guessing
         error: { code: -32603, message: 'Codex app tool request failed' } }));
     },
   });
-  await assert.rejects(listCodexChats({ pipePath: pipe.pipePath, contextThreadId: 'deleted-task' }),
-    /rejected the registered task context/);
+  await assert.rejects(listCodexChats({ pipePath: pipe.pipePath, contextThreadId: 'deleted-task' }), error =>
+    /could not complete the app tool request/.test(error.message) && !/rejected|removed|app tool request failed/.test(error.message) &&
+    error.reason === 'internal_error');
 });

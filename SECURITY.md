@@ -2,7 +2,7 @@
 
 ## macOS outbound SSH route
 
-The optional macOS route uses an operator-selected SSH config alias and Codex's app-server protocol. It retains strict host-key verification and batch authentication and never reads SSH credentials itself. The configured alias pins discovery and delivery to that server: `auto` and `ssh` use it, while `desktop` and `terminal` are rejected. Failure never falls back to a local endpoint, including a local conversation with the same ID. The bridge preserves verified Claude caller identity and its existing per-sender delivery ledger.
+The optional macOS route uses an operator-selected SSH config alias and Codex's app-server protocol. It retains strict host-key verification and batch authentication, turns SSH connection sharing off, and never reads SSH credentials itself. On macOS without a configured alias the bridge refuses Codex discovery, sends and the Codex doctor checks (`setup_incomplete`) rather than using a local route. The configured alias pins discovery and delivery to that server: `auto` and `ssh` use it, while `desktop` and `terminal` are rejected. Failure never falls back to a local endpoint, including a local conversation with the same ID. The bridge preserves verified Claude caller identity and its existing per-sender delivery ledger.
 
 Only already-loaded idle threads are eligible. The bridge does not call `thread/resume`, create threads, start servers, change permissions, or retry a submitted turn. A lost reply or cancellation after transmitting a turn is recorded as uncertain and must be reconciled before a new submission. The merged macOS implementation has not yet received a new live smoke test.
 

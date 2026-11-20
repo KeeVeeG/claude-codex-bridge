@@ -130,7 +130,7 @@ claudeTest('Claude sends to a terminal Codex session with the peer envelope, wit
 claudeTest('an exact ID the daemon does not claim still goes to the Desktop path as before', async t => {
   const setup = await claudeCallerSetup(t, { threads: [{ id: 'other', originator: 'codex-tui' }] });
   await assert.rejects(() => executeBridgeTool('send_to_codex', { thread_id: 'older-desktop-task', message: 'hi', message_id: 'm-2' }, setup.context),
-    /Codex Desktop has not registered its bridge endpoint/);
+    /No Codex Desktop registration is in this bridge’s state directory/);
   assert.equal(setup.requests().some(entry => entry.method === 'turn/start'), false);
   assert.ok(setup.requests().some(entry => entry.method === 'thread/read' && entry.params.threadId === 'older-desktop-task'),
     'the daemon was consulted for the ID before the Desktop path was taken');
@@ -139,7 +139,7 @@ claudeTest('an exact ID the daemon does not claim still goes to the Desktop path
 claudeTest('with the daemon down an ID takes the Desktop path and terminal support never starts anything', async t => {
   const setup = await claudeCallerSetup(t, { unreachable: true });
   await assert.rejects(() => executeBridgeTool('send_to_codex', { thread_id: 'any', message: 'hi', message_id: 'm-3' }, setup.context),
-    /Codex Desktop has not registered its bridge endpoint/);
+    /No Codex Desktop registration is in this bridge’s state directory/);
 });
 
 claudeTest('a dropped connection after turn/start is recorded uncertain and the same message_id is never sent twice', async t => {
@@ -345,7 +345,7 @@ claudeTest('bridge_doctor reports daemon reachability as optional and never fail
 claudeTest('bridge_doctor says so when the daemon is reachable but no terminal session is registered, and never reports it ready on that alone', async t => {
   const empty = await claudeCallerSetup(t, { threads: [] });
   const report = await executeBridgeTool('bridge_doctor', {}, empty.context);
-  assert.match(report.checks.find(check => check.name === 'codex_daemon').detail, /no stored Codex session is available/);
+  assert.match(report.checks.find(check => check.name === 'codex_daemon').detail, /no eligible loaded session was found/);
   assert.equal(report.ready, false);
 });
 
@@ -376,11 +376,17 @@ claudeTest('bridge_doctor is ready for a terminal-only setup: daemon reachable, 
 });
 
 claudeTest('bridge_doctor is not ready with a live inbox when the daemon has no terminal session or is unreachable', async t => {
+  // A catalog whose only conversation reports a system error has no eligible route either (S05).
+  const broken = await claudeCallerSetup(t, { threads: [{ id: randomUUID(), originator: 'codex-tui', status: { type: 'systemError' } }] });
+  await listenInbox(t, broken);
+  const brokenReport = await executeBridgeTool('bridge_doctor', {}, broken.context);
+  assert.match(brokenReport.checks.find(check => check.name === 'codex_daemon').detail, /no eligible loaded session was found/);
+  assert.equal(brokenReport.ready, false);
   const empty = await claudeCallerSetup(t, { threads: [] });
   await listenInbox(t, empty);
   const emptyReport = await executeBridgeTool('bridge_doctor', {}, empty.context);
   assert.equal(emptyReport.checks.find(check => check.name === 'claude_inbox').status, 'pass');
-  assert.match(emptyReport.checks.find(check => check.name === 'codex_daemon').detail, /no stored Codex session is available/);
+  assert.match(emptyReport.checks.find(check => check.name === 'codex_daemon').detail, /no eligible loaded session was found/);
   assert.equal(emptyReport.ready, false);
   const down = await claudeCallerSetup(t, { unreachable: true });
   await listenInbox(t, down);
@@ -407,7 +413,7 @@ claudeTest('bridge_doctor reports a codex.cmd shim as a warning instead of throw
     env: { ...setup.context.env, CLAUDE_CODEX_BRIDGE_CODEX_BIN: shim, CLAUDE_CODEX_BRIDGE_DAEMON: '' } });
   const check = report.checks.find(item => item.name === 'codex_daemon');
   assert.equal(check.status, 'warning');
-  assert.match(check.detail, /codex[.]exe/);
+  assert.match(check.detail, /native Codex [.]exe/);
 });
 
 claudeTest('bridge_doctor does not hang on a daemon that never answers the thread list', async t => {
@@ -517,7 +523,9 @@ claudeTest('auto routing refuses an unloaded conversation before reserving a mes
   const desktop = await desktopApp(t, setup, [{ id: setup.termId, title: 'Listed in Desktop too' }]);
   for (const transport of [undefined, 'auto']) {
     await assert.rejects(() => executeBridgeTool('send_to_codex', { thread_id: setup.termId, transport, message: 'hi', message_id: 'ambiguous' }, setup.context),
-      /desktop.*terminal|terminal.*desktop/i);
+      // The refusal asks the user instead of inviting a guess from the listing's source (V01).
+      error => error.outcome.reason === 'invalid_argument' &&
+        /Ask the user whether it is open in Codex Desktop \(transport desktop\) or Codex CLI \(transport terminal\); a listing’s source does not show this\./.test(error.message));
   }
   assert.deepEqual(desktop.sent(), []);
   assert.deepEqual(setup.queueCalls(), []);
@@ -678,7 +686,7 @@ claudeTest('a systemError terminal session is refused and never queued', async t
   const setup = await claudeCallerSetup(t, { threads: [{ id: termId, originator: 'codex-tui', status: { type: 'systemError' } }] });
   const queue = await fakeQueue(t, { mode: 'ok' });
   await assert.rejects(() => executeBridgeTool('send_to_codex', { thread_id: termId, message: 'x', message_id: 'q-6' },
-    { ...setup.context, queue: queue.queue }), /not loaded/);
+    { ...setup.context, queue: queue.queue }), error => /system error/.test(error.message) && !/not loaded/.test(error.message));
   assert.equal(queue.queueCalls().length, 0);
   const status = await executeBridgeTool('list_deliveries', {}, setup.context);
   assert.equal(status.deliveries.find(message => message.message_id === 'q-6').status, 'failed');

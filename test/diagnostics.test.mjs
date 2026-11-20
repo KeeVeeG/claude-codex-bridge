@@ -325,9 +325,8 @@ test('a stalled Desktop is reported as stalled, not hidden behind endpoints of e
   await earlier.close();
   const context = claudeCaller(fixture);
   await assert.rejects(executeBridgeTool('list_codex_threads', { limit: 5 }, context), error => {
-    assert.match(error.message, /running but did not answer in time. Retry the same call; restart Codex Desktop only if/);
-    assert.match(error.message, /1 saved endpoint belongs to earlier Codex Desktop launches\./);
-    assert.doesNotMatch(error.message, /ENOENT|Last error|Open a Codex Desktop task/);
+    assert.match(error.message, /running but did not answer in time\. Retry the same call\. Also observed: [^.]*1 saved endpoint belongs to earlier Codex Desktop launches\./);
+    assert.doesNotMatch(error.message, /ENOENT|Last error|Open a Codex Desktop task|restart/);
     return true;
   });
   // Retry the repeatable read three times on the same pipe, not three times for each stale context.
@@ -336,7 +335,7 @@ test('a stalled Desktop is reported as stalled, not hidden behind endpoints of e
   const doctor = await executeBridgeTool('bridge_doctor', {}, context);
   const check = name => doctor.checks.find(entry => entry.name === name);
   assert.equal(check('codex_registry').status, 'pass');
-  assert.match(check('codex_registry').detail, /2 of 3 point to an existing endpoint/);
+  assert.match(check('codex_registry').detail, /2 present, 1 missing, 0 unverified/);
   assert.equal(check('codex_tools').status, 'pass');
   assert.equal(check('codex_context').status, 'warning');
   assert.match(check('codex_context').detail, /did not answer in time. Retry the same call/);
@@ -359,7 +358,7 @@ test('only endpoints of earlier launches point to opening Codex Desktop', window
   publishCodexHost({ stateDir: fixture.stateDir, pipePath: earlier.pipePath, threadId: 'earlier-launch' });
   await earlier.close();
   await assert.rejects(executeBridgeTool('list_codex_threads', {}, claudeCaller(fixture)),
-    /1 saved endpoint belongs to earlier Codex Desktop launches\. Open a Codex Desktop task with the bridge enabled/);
+    /1 saved Codex Desktop endpoint belongs to earlier launches\. Open a Codex Desktop task with the bridge enabled/);
 });
 
 test('a send reuses the context Desktop accepted earlier even while chat discovery stalls', windowsOnly, async t => {
@@ -390,23 +389,38 @@ test('a send reuses the context Desktop accepted earlier even while chat discove
     'each call reads the catalog once and hands it to the tool call');
 });
 
+test('a Desktop that fails discovery without naming a cause is not reported as a refused saved context (E06)', windowsOnly, async t => {
+  const fixture = await claudeFixture(t);
+  const codex = await mockPipe(t, { framed: true, onMessage(message, socket) {
+    if (message.method === 'tools/list') return answer(socket, message.id, { tools: [messageTool, listTool] });
+    socket.write(encodeFrame({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: 'Codex app tool request failed' } }));
+  } });
+  publishCodexHost({ stateDir: fixture.stateDir, pipePath: codex.pipePath, threadId: 'saved-context' });
+  await assert.rejects(executeBridgeTool('list_codex_threads', {}, claudeCaller(fixture)), error => {
+    assert.match(error.message, /^Codex Desktop unavailable: Codex Desktop failed the discovery request\. Restart Codex Desktop, then retry the same call\./);
+    assert.doesNotMatch(error.message, /did not accept the saved task context|app tool request failed/);
+    assert.equal(error.reason, 'internal_error');
+    return true;
+  });
+});
+
 test('a wait the budget cut short is reported as unchecked, not as a stalled Desktop', windowsOnly, async t => {
   const fixture = await claudeFixture(t);
   const codex = await mockPipe(t, { framed: true, onMessage(message, socket) {
     if (message.method === 'tools/list') return answer(socket, message.id, { tools: [messageTool, listTool] });
-    // A slow Desktop build: the removed context is rejected late and the valid one answers late too.
-    if (message.params.threadId === 'removed-context') setTimeout(() => socket.write(encodeFrame({ jsonrpc: '2.0',
-      id: message.id, error: { code: -32603, message: 'Codex app tool request failed' } })), 700);
+    // A slow Desktop build refuses the removed context, then answers the valid one only after the
+    // budget is spent. Its 1.4 s answer starts after the 200 ms refusal, so the cut never races it.
+    if (message.params.threadId === 'removed-context') setTimeout(() => answer(socket, message.id, { success: false, contentItems: [] }), 200);
     else setTimeout(() => answer(socket, message.id, { success: true,
-      contentItems: [{ type: 'inputText', text: '{"threads":[]}' }] }), 950);
+      contentItems: [{ type: 'inputText', text: '{"threads":[]}' }] }), 1400);
   } });
   for (const threadId of ['valid-context', 'removed-context']) {
     publishCodexHost({ stateDir: fixture.stateDir, pipePath: codex.pipePath, threadId });
   }
   const doctor = await executeBridgeTool('bridge_doctor', {}, { ...claudeCaller(fixture),
-    desktop: { catalogMs: 500, listMs: 1000, budgetMs: 1500 } });
+    desktop: { catalogMs: 1000, listMs: 1450, budgetMs: 1500 } });
   const check = doctor.checks.find(entry => entry.name === 'codex_context');
   assert.equal(check.status, 'warning');
-  assert.match(check.detail, /rejected 1 saved task context.*1 saved endpoint record could not be checked within 1\.5 s/);
+  assert.match(check.detail, /^1 saved endpoint record could not be checked within 1\.5 s\. Retry the same call\. Also observed: 1 saved task context was not accepted\.$/);
   assert.doesNotMatch(check.detail, /restart/);
 });
