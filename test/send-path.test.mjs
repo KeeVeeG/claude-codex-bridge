@@ -172,7 +172,9 @@ test('a manual send whose primary record cannot be saved stays submitted and pos
   } finally { fs.chmodSync(file, 0o644); }
   assert.equal(result.delivery.status, 'submitted');
   assert.equal(result.notice_status, 'submitted');
-  assert.deepEqual(result.outcome, { delivered: true, retry: 'no', reason: 'submitted', record: { message_id: 'q02', status: 'submitted' } });
+  const primary = Object.values(JSON.parse(fs.readFileSync(file)).messages).find(row => row.id === 'q02');
+  assert.equal(primary.status, 'sending', 'The handoff succeeded but the primary ledger could not record it.');
+  assert.deepEqual(result.outcome, { delivered: true, retry: 'no', reason: 'settlement_failed', record: { message_id: 'q02', status: 'sending' } });
   assert.deepEqual(result.notice_outcome, { delivered: true, retry: 'no', reason: 'submitted' });
   assert.equal(setup.notices.length, 1);
   assert.equal(setup.userFrames().length, 2);
