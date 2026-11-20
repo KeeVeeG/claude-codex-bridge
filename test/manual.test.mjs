@@ -5,6 +5,9 @@ import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
+import { setImmediate as turn } from 'node:timers/promises';
+import { startCall } from '../lib/call-time.mjs';
 import { manualSend, retryManualNotice, readManualRecords } from '../lib/manual-service.mjs';
 import { executeBridgeTool } from '../lib/bridge-service.mjs';
 import { nativeFixture, mockPipe, encodeFrame, messageTool } from './native-helpers.mjs';
@@ -71,8 +74,9 @@ test('human manual send preserves full text and provenance and posts one context
   assert.equal(setup.notices[0].arguments.threadId, setup.owner);
   assert.equal(setup.notices[0].arguments.prompt,
     `[User sent to Claude session "${setup.args.session_id}"; bridge message "${setup.args.message_id}"; context only]\n\n${setup.args.message}`);
-  assert.equal(readManualRecords({ stateDir: setup.stateDir, threadId: setup.owner })[0].notice_status, 'submitted');
-  assert.equal(fs.readFileSync(setup.ledgerFile, 'utf8').includes(setup.args.message), false, 'supplementary ledger must not duplicate message bodies');
+  const [record] = readManualRecords({ stateDir: setup.stateDir, threadId: setup.owner });
+  assert.equal(record.notice_status, 'submitted');
+  assert.equal(record.message, setup.args.message, 'history can recover original text without the primary ledger');
   const again = await manualSend(setup.args, setup.context);
   assert.equal(again.notice_status, 'submitted');
   assert.equal(userFrames(setup.claude).length, 1);
@@ -151,7 +155,7 @@ test('definite and uncertain Codex notice failures never resend the Claude messa
   }
 });
 
-test('a posted owner notice whose local receipt cannot be saved becomes uncertain and is not repeated', windowsOnly, async t => {
+test('LC04: an accepted owner notice survives a receipt failure and replays only the disk write', windowsOnly, async t => {
   let posted = false;
   const fixture = await setup(t, { onNotice() { posted = true; } });
   const originalRename = fs.renameSync;
@@ -168,9 +172,11 @@ test('a posted owner notice whose local receipt cannot be saved becomes uncertai
   finally { fs.renameSync = originalRename; }
   assert.equal(injected, true);
   assert.equal(first.delivery.status, 'submitted');
-  assert.equal(first.notice_status, 'uncertain');
+  assert.equal(first.notice_status, 'submitted');
   assert.deepEqual(first.notice_outcome, { delivered: true, retry: 'no', reason: 'settlement_failed' });
-  assert.equal((await manualSend(fixture.args, fixture.context)).notice_status, 'uncertain');
+  assert.equal(JSON.parse(fs.readFileSync(fixture.ledgerFile)).records[recordKey(fixture.args)].notice_status, 'pending');
+  assert.equal((await manualSend(fixture.args, fixture.context)).notice_status, 'submitted');
+  assert.equal(JSON.parse(fs.readFileSync(fixture.ledgerFile)).records[recordKey(fixture.args)].notice_status, 'submitted');
   assert.equal(userFrames(fixture.claude).length, 1);
   assert.equal(fixture.notices.length, 1);
 });
@@ -303,4 +309,252 @@ test('missing supplementary notice history cannot authorize a duplicate notice o
   assert.match(retry.notice_error, /record is missing/);
   assert.equal(userFrames(fixture.claude).length, 1);
   assert.equal(fixture.notices.length, 1);
+});
+
+const fault = code => Object.assign(new Error(`Injected ${code}`), { code });
+const readShadow = fixture => JSON.parse(fs.readFileSync(fixture.ledgerFile)).records[recordKey(fixture.args)];
+const history = fixture => readManualRecords({ stateDir: fixture.stateDir, threadId: fixture.owner });
+
+test('LC01: disk full after reserving only the shadow does not spend the ID', windowsOnly, async t => {
+  const fixture = await setup(t);
+  let full = false;
+  const rename = fs.renameSync, write = fs.writeFileSync;
+  t.mock.method(fs, 'renameSync', (source, target) => {
+    rename(source, target);
+    if (target === fixture.ledgerFile) full = true;
+  });
+  t.mock.method(fs, 'writeFileSync', (target, ...args) => {
+    if (full && String(target).startsWith(fixture.stateDir + path.sep)) throw fault('ENOSPC');
+    return write(target, ...args);
+  });
+  const first = await manualSend(fixture.args, fixture.context);
+  assert.equal(first.outcome.reason, 'state_unavailable');
+  assert.equal(first.outcome.delivered, false);
+  assert.equal(first.outcome.retry, 'after_fix');
+  assert.equal(userFrames(fixture.claude).length, 0);
+  assert.equal(fixture.notices.length, 0);
+  assert.equal(readShadow(fixture).send_status, 'sending');
+  const [visible] = history(fixture);
+  assert.equal(visible.send_status, 'failed');
+  assert.equal(visible.message, fixture.args.message);
+  full = false;
+  fs.renameSync.mock.restore();
+  const replay = await manualSend(fixture.args, fixture.context);
+  assert.equal(replay.delivery.status, 'submitted');
+  assert.equal(replay.notice_status, 'submitted');
+  assert.equal(readShadow(fixture).send_status, 'submitted');
+  assert.equal(userFrames(fixture.claude).length, 1);
+  assert.equal(fixture.notices.length, 1);
+});
+
+test('LC04: read-only shadow settlement preserves the primary, and only the unclaimed notice runs after recovery', windowsOnly, async t => {
+  const fixture = await setup(t);
+  let readOnly = true;
+  const rename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (source, target) => {
+    if (readOnly && target === fixture.ledgerFile && JSON.parse(fs.readFileSync(source)).records[recordKey(fixture.args)].send_status === 'submitted') {
+      throw fault('EROFS');
+    }
+    return rename(source, target);
+  });
+  const first = await manualSend(fixture.args, fixture.context);
+  assert.equal(first.outcome.reason, 'settlement_failed');
+  assert.equal(first.outcome.delivered, true);
+  assert.equal(first.notice_outcome.reason, 'state_unavailable');
+  assert.equal(readShadow(fixture).send_status, 'sending');
+  assert.equal(userFrames(fixture.claude).length, 1);
+  assert.equal(fixture.notices.length, 0);
+  readOnly = false;
+  const replay = await manualSend(fixture.args, fixture.context);
+  assert.equal(replay.outcome.reason, 'already_submitted');
+  assert.equal(replay.notice_status, 'submitted');
+  assert.equal(readShadow(fixture).send_status, 'submitted');
+  assert.equal(userFrames(fixture.claude).length, 1);
+  assert.equal(fixture.notices.length, 1);
+});
+
+test('LC05: a wall-clock jump on a sharing violation does not truncate the asynchronous rename retry', windowsOnly, async t => {
+  const fixture = await setup(t);
+  const wall = Date.now, rename = fs.renameSync;
+  let shift = 0, attempts = 0, inputRuns = false;
+  t.mock.method(Date, 'now', () => wall() + shift);
+  t.mock.method(fs, 'renameSync', (source, target) => {
+    if (target === fixture.ledgerFile && ++attempts === 1) {
+      shift = 3_600_000;
+      setImmediate(() => { inputRuns = true; });
+      throw fault('EBUSY');
+    }
+    if (target === fixture.ledgerFile && attempts === 2) assert.equal(inputRuns, true);
+    return rename(source, target);
+  });
+  assert.equal((await manualSend(fixture.args, fixture.context)).notice_status, 'submitted');
+  assert.ok(attempts > 1);
+});
+
+test('LC06: either wall-clock jump leaves a live manual attempt in flight; old text is never fabricated', windowsOnly, async t => {
+  const fixture = await setup(t);
+  const originalProbe = fixture.context.processProbe;
+  let pass, enter;
+  const entered = new Promise(resolve => { enter = resolve; });
+  const barrier = new Promise(resolve => { pass = resolve; });
+  fixture.context.processProbe = async (...args) => { enter(); await barrier; return originalProbe(...args); };
+  const sending = manualSend(fixture.args, fixture.context);
+  await entered;
+  const wall = Date.now;
+  let shift = 3_600_000;
+  t.mock.method(Date, 'now', () => wall() + shift);
+  try {
+    assert.equal(history(fixture)[0].send_status, 'sending');
+    assert.equal((await manualSend(fixture.args, fixture.context)).outcome.reason, 'in_flight');
+    assert.equal(readShadow(fixture).send_status, 'sending');
+    shift = -3_600_000;
+    assert.equal(history(fixture)[0].send_status, 'sending');
+  } finally {
+    pass();
+    await sending.catch(() => {});
+  }
+  assert.equal((await sending).delivery.status, 'submitted');
+  const ledger = JSON.parse(fs.readFileSync(fixture.ledgerFile));
+  delete ledger.records[recordKey(fixture.args)].message;
+  fs.writeFileSync(fixture.ledgerFile, JSON.stringify(ledger));
+  assert.equal(Object.hasOwn(history(fixture)[0], 'message'), false);
+});
+
+function blockManualLock(t, fixture) {
+  const lock = path.join(path.dirname(fixture.ledgerFile), 'state.lock');
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, token: randomUUID(), createdAt: Date.now() }));
+  let wasContended;
+  const contended = new Promise(resolve => { wasContended = resolve; });
+  const link = fs.linkSync, asyncLink = fs.promises.link;
+  t.mock.method(fs, 'linkSync', (from, to) => {
+    if (to === lock) wasContended();
+    return link(from, to);
+  });
+  t.mock.method(fs.promises, 'link', (from, to) => {
+    if (to === lock) wasContended();
+    return asyncLink(from, to);
+  });
+  const release = () => { if (fs.existsSync(lock)) fs.unlinkSync(lock); };
+  t.after(release);
+  return { lock, contended, release };
+}
+
+test('D02: cancellation ends lock contention before release and cannot send after release', windowsOnly, async t => {
+  const fixture = await setup(t);
+  const held = blockManualLock(t, fixture);
+  const controller = new AbortController();
+  const result = assert.rejects(manualSend(fixture.args, { ...fixture.context, signal: controller.signal }), { code: 'ABORT_ERR' });
+  await held.contended;
+  await turn();
+  assert.equal(fs.existsSync(held.lock), true);
+  assert.deepEqual(history(fixture), []); // Reads still run while the writer is waiting.
+  controller.abort();
+  await result;
+  assert.equal(fs.existsSync(held.lock), true);
+  held.release();
+  await turn();
+  assert.equal(userFrames(fixture.claude).length, 0);
+  assert.equal(fixture.notices.length, 0);
+  assert.equal(fs.existsSync(fixture.ledgerFile), false);
+});
+
+test('D02: lock contention cannot extend the call deadline or write after it', windowsOnly, async t => {
+  const fixture = await setup(t);
+  const held = blockManualLock(t, fixture);
+  const normal = performance.now.bind(performance);
+  let elapsed = 0;
+  t.mock.method(performance, 'now', () => normal() + elapsed);
+  const call = startCall({ deadlineMs: 15_000 });
+  t.after(() => call.dispose());
+  const result = assert.rejects(manualSend(fixture.args, { ...fixture.context, signal: call.signal }), { code: 'BRIDGE_DEADLINE' });
+  await held.contended;
+  elapsed = 16_000;
+  await result;
+  assert.equal(fs.existsSync(held.lock), true);
+  held.release();
+  await turn();
+  assert.deepEqual(history(fixture), []);
+  assert.equal(userFrames(fixture.claude).length, 0);
+});
+
+test('D02: an explicit notice retry cancelled while waiting cannot change the old notice or write later', windowsOnly, async t => {
+  const fixture = await setup(t, { noticeFailure: 'schema' });
+  await manualSend(fixture.args, fixture.context);
+  fixture.failureMode.current = null;
+  const previous = fs.readFileSync(fixture.ledgerFile);
+  const held = blockManualLock(t, fixture);
+  const controller = new AbortController();
+  const { session_id, message_id } = fixture.args;
+  const retry = assert.rejects(retryManualNotice({ session_id, message_id }, { ...fixture.context, signal: controller.signal }), { code: 'ABORT_ERR' });
+  await held.contended;
+  await turn();
+  controller.abort();
+  await retry;
+  held.release();
+  await turn();
+  assert.deepEqual(fs.readFileSync(fixture.ledgerFile), previous);
+  assert.equal(fixture.notices.length, 0);
+  assert.equal(userFrames(fixture.claude).length, 1);
+});
+
+test('D02: cancellation after a notice write still settles the possibly delivered notice on disk', windowsOnly, async t => {
+  const controller = new AbortController();
+  const fixture = await setup(t, { onNotice() { controller.abort(); } });
+  const result = await manualSend(fixture.args, { ...fixture.context, signal: controller.signal });
+  assert.equal(result.outcome.delivered, true);
+  assert.equal(result.notice_outcome.delivered, 'unknown');
+  assert.equal(readShadow(fixture).notice_status, 'uncertain');
+  assert.equal(readShadow(fixture).notice_retryable, false);
+  assert.equal((await manualSend(fixture.args, fixture.context)).notice_status, 'uncertain');
+  assert.equal(userFrames(fixture.claude).length, 1);
+  assert.equal(fixture.notices.length, 1);
+});
+
+test('A04: a filled v1 shadow preserves old entries while new primary sends and exact text continue in bounded records', windowsOnly, async t => {
+  const fixture = await setup(t);
+  const cap = 4 * 1024 * 1024, target = cap - 64;
+  const legacy = { schemaVersion: 1, owner_thread_id: fixture.owner, records: {} };
+  const args = fixture.args;
+  const route = { from: { kind: 'codex', id: fixture.owner }, to: { kind: 'claude', id: args.session_id } };
+  const fingerprint = hash(JSON.stringify({ direction: 'to_claude', message: args.message, route }));
+  const now = Date.now();
+  const seed = { message_id: '', session_id: args.session_id, fingerprint, manual: true, send_status: 'submitted',
+    notice_status: 'submitted', notice_attempted: true, notice_retryable: false, sender_pid: process.pid, createdAt: now, updatedAt: now };
+  let bytes = Buffer.byteLength(JSON.stringify(legacy, null, 2) + '\n'), row;
+  for (let index = 0; ; index++) {
+    const message_id = `legacy-${String(index).padStart(5, '0')}`;
+    const key = recordKey({ ...args, message_id });
+    const record = { ...seed, message_id };
+    legacy.records[key] = record;
+    if (index < 2) {
+      const size = Buffer.byteLength(JSON.stringify(legacy, null, 2) + '\n');
+      row = size - bytes;
+      bytes = size;
+    } else bytes += row;
+    if (bytes + row > target) break;
+  }
+  const pad = Object.values(legacy.records)[0];
+  pad.notice_error = '';
+  pad.notice_error = 'x'.repeat(Math.max(0, target - Buffer.byteLength(JSON.stringify(legacy, null, 2) + '\n')));
+  const before = JSON.stringify(legacy, null, 2) + '\n';
+  assert.ok(Buffer.byteLength(before) <= cap && Buffer.byteLength(before) >= target);
+  fs.mkdirSync(path.dirname(fixture.ledgerFile), { recursive: true });
+  fs.writeFileSync(fixture.ledgerFile, before);
+  for (const message_id of ['overflow-first', 'overflow-second']) {
+    const overflow = { ...args, message_id, message: args.message.repeat(50) };
+    const result = await manualSend(overflow, fixture.context);
+    assert.equal(result.outcome.delivered, true);
+    assert.equal(result.notice_outcome.delivered, false);
+    assert.equal(result.notice_retryable, false);
+    assert.match(result.notice_error, /compatible manual ledger is full/);
+    assert.equal((await manualSend(overflow, fixture.context)).outcome.reason, 'already_submitted');
+    assert.equal(history(fixture).find(record => record.message_id === message_id).message, overflow.message);
+  }
+  const rows = history(fixture);
+  assert.equal(rows.length, Object.keys(legacy.records).length + 2);
+  assert.equal(rows.find(record => record.message_id === 'legacy-00000').message, undefined);
+  assert.equal(fs.readFileSync(fixture.ledgerFile, 'utf8'), before);
+  assert.equal(userFrames(fixture.claude).length, 2);
+  assert.equal(fixture.notices.length, 0);
 });

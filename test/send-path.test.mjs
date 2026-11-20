@@ -290,10 +290,11 @@ test('a panel shadow failure after both acceptances preserves both transport out
     if (s.notices.length && dest === shadowFile) throw Object.assign(new Error('Fixture shadow save failed'), { code: 'EIO' });
     return rename.call(this, source, dest);
   });
-  const error = await rejection(executeBridgeTool('panel_send', { session_id: s.record.sessionId, message: 'fixture', message_id: 'panel' }, s.context));
-  assert.equal(error.outcome.delivered, true); assert.equal(error.outcome.retry, 'no');
-  assert.deepEqual(error.notice_outcome, { delivered: true, retry: 'no', reason: 'settlement_failed' });
-  assert.doesNotMatch(error.message, /message not sent/i);
+  const result = await executeBridgeTool('panel_send', { session_id: s.record.sessionId, message: 'fixture', message_id: 'panel' }, s.context);
+  assert.equal(result.outcome.delivered, true); assert.equal(result.outcome.retry, 'no');
+  assert.equal(result.notice_status, 'submitted');
+  assert.deepEqual(result.notice_outcome, { delivered: true, retry: 'no', reason: 'settlement_failed' });
+  assert.doesNotMatch(result.notice_error, /message not sent/i);
   assert.equal(s.userFrames().length, 1); assert.equal(s.notices.length, 1);
 });
 
