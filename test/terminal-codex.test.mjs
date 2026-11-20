@@ -195,7 +195,7 @@ claudeTest('a pre-aborted send contacts no daemon and records no message', async
 });
 
 /** A registered Codex Desktop app that lists `threads` and accepts sends. */
-async function desktopApp(t, setup, threads, { dropSend = false, beforeListReply } = {}) {
+async function desktopApp(t, setup, threads, { dropSend = false, beforeListReply, listFailed = false, pins = [] } = {}) {
   const listTool = { name: 'list_threads', namespace: 'codex_app', inputSchema: { type: 'object', properties: { limit: { type: 'integer' } } } };
   const sent = [];
   const answer = (socket, id, result) => socket.write(encodeFrame({ jsonrpc: '2.0', id, result }));
@@ -203,7 +203,8 @@ async function desktopApp(t, setup, threads, { dropSend = false, beforeListReply
     if (message.method === 'tools/list') return answer(socket, message.id, { tools: [messageTool, listTool] });
     if (message.params.tool === 'list_threads') {
       beforeListReply?.();
-      const listing = { threads: threads.map(thread => ({ kind: 'codex', ...thread })) };
+      if (listFailed) return answer(socket, message.id, { success: false, contentItems: [] });
+      const listing = { pinnedThreads: pins.map(thread => ({ kind: 'codex', ...thread })), threads: threads.map(thread => ({ kind: 'codex', ...thread })) };
       return answer(socket, message.id, { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(listing) }] });
     }
     sent.push(message.params);
@@ -305,8 +306,13 @@ claudeTest('a terminal Codex caller can send to a Claude session and the notice 
   assert.equal(result.delivery.status, 'submitted');
   await new Promise(resolve => setTimeout(resolve, 100));
   assert.equal(Object.hasOwn(result.delivery, 'message'), false);
-  assert.match(received.join(''), /From Codex terminal session/);
-  if (context.platform === 'win32' || (!context.platform && process.platform === 'win32')) assert.match(received.join(''), /reply transport=\\"terminal\\"/);
+  const users = received.join('').trimEnd().split('\n').map(line => JSON.parse(line)).filter(row => row.type === 'user');
+  assert.equal(users.length, 1); const [envelope] = users;
+  const history = await executeBridgeTool('list_deliveries', { message_id: 'm-6' }, context);
+  assert.deepEqual(history.deliveries.map(row => row.message), ['Hello from terminal.']);
+  assert.equal(envelope.message.content.slice(envelope.message.content.indexOf('\n\n') + 2), 'Hello from terminal.\n</cross-session-message>', 'the entire delivered body is unchanged');
+  assert.match(envelope.message.content, /From Codex terminal session/);
+  if (context.platform === 'win32' || (!context.platform && process.platform === 'win32')) assert.match(received.join(''), /reply transport unverified/);
 });
 
 claudeTest('listing returns terminal chats with a warning when Desktop is not registered', async t => {
@@ -571,6 +577,7 @@ claudeTest('a message the queue route cannot carry is refused before its message
   for (const [body, excess] of [['x'.repeat(16000 - overhead + 1), 1], ['x'.repeat(15990), overhead - 10]]) {
     await assert.rejects(() => send(body, 'q-edge'), error => {
       assert.equal(error.outcome.reason, 'queued_message_too_long');
+      assert.equal(error.outcome.retry, 'after_fix');
       assert.equal(error.outcome.delivered, false);
       assert.match(error.message, new RegExp(`by ${excess} UTF-16 unit`));
       return true;
@@ -768,4 +775,58 @@ claudeTest('listing with no Desktop and no Codex executable reports both reasons
   const { daemon, ...rest } = setup.context;
   await assert.rejects(() => executeBridgeTool('list_codex_threads', {}, { ...rest, env }),
     /Codex Desktop unavailable.*Codex terminal sessions unavailable: The Codex executable was not found/s);
+});
+
+claudeTest('DR02: an observed daemon access denial ends both automatic and explicit terminal sends', async t => {
+  const s = await claudeCallerSetup(t, { unreachable: true, unreachableStderr: 'Access is denied. (os error 5)' });
+  const target = randomUUID(), queue = await fakeQueue(t), desktop = await desktopApp(t, s, [{ id: target }]);
+  for (const transport of ['auto', 'terminal']) {
+    await assert.rejects(executeBridgeTool('send_to_codex', { transport, thread_id: target, message: 'fixture' }, { ...s.context, queue: queue.queue }), { reason: 'access_denied' });
+  }
+  assert.equal(queue.queueCalls().length, 0); assert.equal(desktop.sent().length, 0);
+  assert.deepEqual((await executeBridgeTool('list_deliveries', {}, s.context)).deliveries, []);
+});
+
+claudeTest('DR01: discovery includes disjoint local Desktop catalogs and a send cannot select the wrong app', async t => {
+  const s = await claudeCallerSetup(t, { threads: [] }), older = await desktopApp(t, s, [{ id: 'older' }]), newer = await desktopApp(t, s, [{ id: 'newer' }]);
+  const catalog = await executeBridgeTool('list_codex_threads', {}, s.context);
+  assert.deepEqual(catalog.threads.map(row => row.thread_id).sort(), ['newer', 'older']);
+  await executeBridgeTool('send_to_codex', { transport: 'desktop', thread_id: 'older', message: 'fixture' }, s.context);
+  assert.equal(newer.sent().length, 0); assert.equal(older.sent().length, 1);
+});
+
+for (const closeFrame of [undefined, [0x88, 0]]) claudeTest(`SP04: a clean pre-write daemon ${closeFrame ? 'WebSocket close' : 'proxy exit'} permits only the explicitly selected terminal queue`, async t => {
+  const target = randomUUID(), s = await claudeCallerSetup(t, { threads: [{ id: target, status: { type: 'active' } }], dropAfter: 'thread/turns/list', closeFrame });
+  const queue = await fakeQueue(t), context = { ...s.context, queue: queue.queue };
+  await assert.rejects(executeBridgeTool('send_to_codex', { thread_id: target, message: 'fixture' }, context));
+  assert.equal(queue.queueCalls().length, 0);
+  const result = await executeBridgeTool('send_to_codex', { thread_id: target, transport: 'terminal', message: 'fixture' }, context);
+  assert.equal(result.outcome.reason, 'submitted'); assert.equal(queue.queueCalls().length, 1);
+  assert.ok(s.requests().every(row => !['turn/start','turn/steer'].includes(row.method)));
+});
+
+claudeTest('SP05: size refusal after reservation requires a new ID for shortened text', async t => {
+  const target = randomUUID(), s = await claudeCallerSetup(t, { threads: [{ id: target, statusByRead: [{ type: 'idle' }, { type: 'notLoaded' }] }] });
+  const queue = await fakeQueue(t), context = { ...s.context, queue: queue.queue };
+  const args = { message_id: 'reserved-size', thread_id: target, transport: 'terminal', message: 'x'.repeat(16000) };
+  await assert.rejects(executeBridgeTool('send_to_codex', args, context), error => error.outcome.retry === 'new_id' && /new ID/.test(error.message));
+  await assert.rejects(executeBridgeTool('send_to_codex', { ...args, retry_failed: true }, context), error => error.outcome.retry === 'new_id');
+  assert.equal(queue.queueCalls().length, 0);
+});
+
+claudeTest('EC05/DR01: one failed Desktop listing stays visible beside another app\'s verified rows', async t => {
+  const s = await claudeCallerSetup(t, { threads: [] });
+  await desktopApp(t, s, [{ id: 'listed' }]); await desktopApp(t, s, [], { listFailed: true });
+  const result = await executeBridgeTool('list_codex_threads', {}, s.context);
+  assert.deepEqual(result.threads.map(row => row.thread_id), ['listed']);
+  assert.ok(result.issues.some(issue => issue.source === 'desktop' && issue.reason === 'desktop_listing_failed'));
+  assert.ok(result.warnings.some(text => /Desktop discovery requests failed/.test(text)) && !result.warnings.some(text => /removed|stale/i.test(text)));
+});
+
+claudeTest('DR01: merged Desktop catalogs keep one recent-thread limit and list pinned tasks separately', async t => {
+  const s = await claudeCallerSetup(t, { threads: [] });
+  await desktopApp(t, s, [{ id: 'recent-a' }], { pins: [{ id: 'pinned-a' }] }); await desktopApp(t, s, [{ id: 'recent-b' }]);
+  const rows = (await executeBridgeTool('list_codex_threads', { limit: 1 }, s.context)).threads.filter(row => row.source === 'desktop');
+  assert.equal(rows.filter(row => row.thread_id.startsWith('recent-')).length, 1);
+  assert.ok(rows.some(row => row.thread_id === 'pinned-a'));
 });

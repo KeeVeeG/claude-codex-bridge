@@ -221,8 +221,8 @@ export async function verifyClaudeProcess(record, { platform = process.platform,
       return { start };
     }, { signal });
   } catch (error) {
-    if (error.code === 'BRIDGE_DEADLINE' || error.code === 'ABORT_ERR') throw error;
-    if (error.transient || error.inconclusive) {
+    if (error.code === 'ABORT_ERR' || error.code === 'BRIDGE_OUTPUT_BUSY') throw error;
+    if (error.code === 'BRIDGE_DEADLINE' || error.transient || error.inconclusive) {
       throw Object.assign(new Error('Could not verify the Claude Code process in time.'), { kind: 'unverified' });
     }
     throw Object.assign(new Error('The Claude Code process check cannot run on this computer.'), { kind: 'unavailable' });

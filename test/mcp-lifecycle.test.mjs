@@ -9,7 +9,7 @@ import { once } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import { setImmediate as turn } from 'node:timers/promises';
 import test from 'node:test';
-import { CALL_DEADLINE_MS, WRITE_RESERVE_MS } from '../lib/call-time.mjs';
+import { WRITE_RESERVE_MS } from '../lib/call-time.mjs';
 import { outcome } from '../lib/outcome.mjs';
 import { runMcpServer } from '../scripts/mcp.mjs';
 
@@ -135,7 +135,7 @@ test('a queued send expires at the production deadline even while the earlier se
   await started.promise;
   client.write(send('expired'), request('ready', 'ping'));
   assert.deepEqual((await client.response('ready')).result, {}, 'the server received the queued send');
-  t.mock.timers.tick(CALL_DEADLINE_MS);
+  t.mock.timers.tick(55_000); // Independent of production policy: a 65 s deadline exceeds the host budget.
   await turn();
   const expired = client.replies.find(reply => reply.id === 'expired');
   assert.equal(expired?.result.isError, true);

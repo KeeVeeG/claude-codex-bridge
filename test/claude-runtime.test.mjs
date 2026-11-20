@@ -110,7 +110,7 @@ test('a hung process check ends with the call deadline, not after its own attemp
   const started = performance.now();
   try {
     await assert.rejects(verifyClaudeProcess(windowsRecord, { platform: 'win32', hostName: 'fixture', probe, signal: call.signal }),
-      error => error.code === 'BRIDGE_DEADLINE');
+      error => error.kind === 'unverified');
   } finally { call.dispose(); }
   assert.ok(performance.now() - started < 2000, 'the probe is abandoned at the deadline');
 });

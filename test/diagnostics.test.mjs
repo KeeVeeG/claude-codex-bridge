@@ -514,6 +514,20 @@ test('a wait the budget cut short is reported as unchecked, not as a stalled Des
     desktop: { catalogMs: 1000, listMs: 1450, budgetMs: 1500 } });
   const check = doctor.checks.find(entry => entry.name === 'codex_context');
   assert.equal(check.status, 'warning');
-  assert.match(check.detail, /^Codex Desktop: 1 saved endpoint record could not be checked within 1\.5 s; 1 saved task context was not accepted\.$/);
+  assert.match(check.detail, /^Codex Desktop: 1 saved endpoint record could not be checked within 1\.5 s; 1 discovery request failed\.$/);
   assert.equal(Object.hasOwn(doctor, 'diagnosis'), false);
+});
+
+test('CA04: a Desktop without host-pinned sends can still return local discovery with an issue', windowsOnly, async t => {
+  const fixture = await claudeFixture(t);
+  const codex = await mockPipe(t, { framed: true, onMessage(message, socket) {
+    if (message.method === 'tools/list') return answer(socket, message.id, { tools: [listTool] });
+    assert.equal(message.params.tool, 'list_threads');
+    answer(socket, message.id, { success: true, contentItems: [{ type: 'inputText', text: '{"threads":[{"id":"local-id","kind":"codex"}]}' }] });
+  } });
+  publishCodexHost({ stateDir: fixture.stateDir, pipePath: codex.pipePath, threadId: 'saved' });
+  const context = claudeCaller(fixture), result = await executeBridgeTool('list_codex_threads', {}, context);
+  assert.deepEqual(result.threads.map(row => row.thread_id), ['local-id']);
+  assert.ok(result.issues.some(issue => issue.source === 'desktop' && issue.reason === 'protocol_incompatible'));
+  await assert.rejects(executeBridgeTool('send_to_codex', { thread_id: 'local-id', transport: 'desktop', message: 'fixture' }, context), { reason: 'protocol_incompatible' });
 });

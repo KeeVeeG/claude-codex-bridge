@@ -108,6 +108,11 @@ process.stdin.on('data', chunk => {
     if (scenario.dropAfter === request.method) {
       // Simulate a connection lost after the request was written and before any answer.
       log({ method: request.method, params: request.params });
+      if (scenario.closeFrame) {
+        leaving = true;
+        process.stdout.write(Buffer.from(scenario.closeFrame), () => process.exit(0));
+        return;
+      }
       process.exit(0);
     }
     if (scenario.silent === request.method) { log({ method: request.method, params: request.params }); continue; }

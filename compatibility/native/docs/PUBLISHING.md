@@ -33,6 +33,8 @@ claude plugin validate dist/marketplace
 if ($LASTEXITCODE -ne 0) { throw 'Claude marketplace validation failed' }
 ```
 
+On Windows, also run the real released-writer check. Export the pinned Git tag `v1.0.6` into an empty disposable directory (`git archive v1.0.6 --output=bridge-106.tar`, then extract that archive there). Run `node test/released-writer.mjs <export-directory>`. It requires the real-writer test to pass and rejects a skipped test or the wrong version. The ordinary suite without the export does not cover the released writer.
+
 Also run the tests on Node.js 20, the oldest supported version. CI runs tests and packaging on Windows and macOS across Node.js 20, 22, 24, and 26.
 
 The packager writes these artifacts under `dist/`:

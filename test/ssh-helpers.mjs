@@ -18,7 +18,7 @@ function frame(data, opcode = 1, fin = true) {
 export function sshFixture({ status = 'idle', handshake = 'valid', dropTurn = false,
   rpcError = false, fragmented = false, malformedTurn = false, silent = false,
   loaded = ['target-thread'], onTurn, thread = {}, collidingRequests = false,
-  historyBytes = 0, unloadAfterRead = false, statuses = {}, turnSuffix } = {}) {
+  historyBytes = 0, unloadAfterRead = false, statuses = {}, turnSuffix, closeAfterRead = false } = {}) {
   const requests = [], launches = [], children = [], acceptedTurns = [], pongs = [];
   function spawnImpl(command, args, options) {
     launches.push({ command, args, options });
@@ -94,6 +94,8 @@ export function sshFixture({ status = 'idle', handshake = 'valid', dropTurn = fa
           child.stdout.write(frame(bytes.subarray(0, 7), 1, false));
           child.stdout.write(frame(Buffer.from('ping'), 9));
           child.stdout.write(frame(bytes.subarray(7), 0));
+        } else if (closeAfterRead && request.method === 'thread/read') {
+          child.stdout.write(Buffer.concat([frame(bytes), frame(Buffer.alloc(0), 8)]));
         } else if (turnSuffix && request.method === 'turn/start') {
           child.stdout.write(Buffer.concat([frame(bytes), turnSuffix]));
         } else child.stdout.write(frame(bytes));

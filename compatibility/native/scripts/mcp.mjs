@@ -26,7 +26,8 @@ const object = value => value !== null && typeof value === 'object' && !Array.is
 const textProperty = (description, maxLength = 256) => ({ type: 'string', minLength: 1, maxLength, description });
 const idField = description => ({ ...textProperty(description, 100),
   pattern: '^[a-zA-Z0-9_-]{1,100}$', not: { enum: ['prototype', ...Object.getOwnPropertyNames(Object.prototype)] } });
-const messageId = idField('Omit for a new send or reply. For exact retry/lookup use a fresh UUID; keep it with the same recipient and text.');
+const messageId = idField('Omit for a new send or reply. For tracking, choose a UUID before the first send; reuse that ID for lookup or retry.');
+const retryFailed = { type: 'boolean', default: false, description: 'Retry a recorded no-write failure with its explicit ID, route and text; otherwise repeat calls only report the record.' };
 const includeMessage = { type: 'boolean', default: true, description: 'Use false to omit your text from this receipt only.' };
 const messageText = textProperty('Text to send; at most 65,536 UTF-8 bytes.', 65536);
 const schema = (properties = {}, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
@@ -43,7 +44,7 @@ const claudeSession = schema({ session_id: outputText, title: outputText, cwd: o
 }, ['session_id', 'title', 'cwd', 'entrypoint', 'status']);
 const codexChat = schema({ thread_id: outputText, title: outputText, status: outputText,
   cwd: outputText, host_id: outputText, source: { type: 'string', enum: ['desktop', 'terminal', 'ssh'], description: 'Discovery transport only: Desktop app, local daemon store, or configured SSH host. Local discovery does not establish the current client or prove a session is open.' } }, ['thread_id', 'title', 'status', 'cwd', 'host_id', 'source']);
-const outcomeProperty = { ...OUTCOME_SCHEMA, description: 'retry: same_id = repeat the identical call; after_fix = fix the cause first; new_id = only a new message_id can send it; inspect = check the recipient and list_deliveries before any further send; no = done.' };
+const outcomeProperty = { ...OUTCOME_SCHEMA, description: 'retry: same_id = repeat with the original ID and text (retry_failed: true for a recorded failure); after_fix = fix the cause first; new_id = only a new message_id can send it; inspect = check the recipient and list_deliveries before any further send; no = done.' };
 const issues = (key, keyProperty) => ({ type: 'array', items: schema({ [key]: keyProperty, ...(key === 'check' ? { status: { type: 'string', enum: ['fail', 'warning'] } } : {}), reason: { type: 'string', enum: Object.keys(REASONS) } }, key === 'check' ? [key, 'status', 'reason'] : [key, 'reason']) });
 // Only the public send echo is optional. A ledger row and a panel receipt still require the text.
 const sendDelivery = { ...delivery, required: delivery.required.filter(key => key !== 'message') };
@@ -100,7 +101,7 @@ export const TOOLS = [
     inputSchema: schema({
       session_id: textProperty('Exact Claude session UUID from discovery or the verified sender header.'),
       message: messageText,
-      message_id: messageId, include_message: includeMessage,
+      message_id: messageId, include_message: includeMessage, retry_failed: retryFailed,
     }, ['session_id', 'message']),
     outputSchema: sendOutput,
   },
@@ -112,7 +113,7 @@ export const TOOLS = [
       thread_id: textProperty('Exact Codex thread ID from discovery or the verified sender header.'),
       transport: { type: 'string', enum: ['auto', 'desktop', 'terminal', 'ssh'], description: 'macOS: auto/ssh only to a loaded idle thread on the pinned host. Windows auto: loaded daemon thread, Desktop if absent; for notLoaded choose the known client. Local daemon input can steer active work. Explicit terminal can queue a UUID: no NUL, 16,000 UTF-16 units including wrapper.' },
       message: messageText,
-      message_id: messageId, include_message: includeMessage,
+      message_id: messageId, include_message: includeMessage, retry_failed: retryFailed,
     }, ['thread_id', 'message']),
     outputSchema: sendOutput,
   },
@@ -168,7 +169,7 @@ export const TOOLS = [
     title: 'Manually send message to Claude',
     description: 'Send the user’s text to the selected live Claude session and copy it to this Codex chat.',
     inputSchema: schema({ session_id: textProperty('Exact selected live Claude Code conversation ID.'),
-      message: messageText, message_id: idField('Required stable ID for this manual send.') }, ['session_id', 'message', 'message_id']),
+      message: messageText, message_id: idField('Required stable ID for this manual send.'), retry_failed: retryFailed }, ['session_id', 'message', 'message_id']),
     outputSchema: schema({ delivery, manual: { type: 'boolean', const: true }, notice_retryable: { type: 'boolean' }, notice_error: outputText, notice_omitted: noticeOmitted,
       notice_status: { type: 'string', enum: ['submitted', 'failed', 'uncertain', 'pending'] },
       outcome: outcomeProperty, notice_outcome: outcomeProperty }, ['delivery', 'manual', 'notice_status']),
@@ -218,7 +219,7 @@ function validateArguments(args, tool) {
   if (!object(args)) throw new Error('Tool arguments must be an object.');
   const specification = tool.inputSchema;
   for (const name of Object.keys(args)) {
-    if (!Object.hasOwn(specification.properties, name)) throw new Error(`Unknown argument: ${name}`);
+    if (!Object.hasOwn(specification.properties, name)) throw new Error('Unknown argument. Use only the fields in this tool’s input schema.');
     validateValue(args[name], specification.properties[name], name);
   }
   for (const name of specification.required) {

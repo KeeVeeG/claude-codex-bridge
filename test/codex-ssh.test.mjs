@@ -195,3 +195,9 @@ test('SSH times out a silent handshake and cleans up its subprocess', async () =
   assert.ok(fixture.children[0].stdin.destroyed);
   assert.equal(fixture.requests.length, 0);
 });
+
+test('LF04: close in the read response preserves a pre-write SSH route failure', async () => {
+  const f = sshFixture({ closeAfterRead: true });
+  await assert.rejects(sendToCodex(options(f)), e => e.reason === 'route_unavailable' && !e.deliveryUnknown);
+  assert.equal(f.requests.some(request => request.method === 'turn/start'), false);
+});

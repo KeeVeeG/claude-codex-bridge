@@ -8,6 +8,9 @@ import { createSession, ledgerAt, lookupMessage, recordMessage, getMessages, rea
 import * as calls from '../lib/call-store.mjs';
 import { executeBridgeTool } from '../lib/bridge-service.mjs';
 import { nativeFixture } from './native-helpers.mjs';
+import { startCall } from '../lib/call-time.mjs';
+import { performance } from 'node:perf_hooks';
+import { setTimeout as delay } from 'node:timers/promises';
 
 async function setup(t) {
   const root = await nativeFixture(t), owner = { ...root, threadId: randomUUID() };
@@ -39,7 +42,7 @@ for (const status of ['submitted', 'failed']) test(`a known ${status} receipt su
   assert.equal(read().attemptId, message.attemptId);
   if (status === 'submitted') assert.deepEqual(read().receipt, terminal.receipt);
   if (status === 'failed') {
-    const next = await calls.recordMessage(session, draft);
+    const next = await calls.recordMessage(session, { ...draft, retryFailed: true });
     assert.notEqual(next.message.attemptId, message.attemptId);
     calls.retainSettlement(session, message, terminal);
     assert.equal((await calls.repairSettlement(session, read())).status, 'sending');
@@ -189,7 +192,7 @@ test('rearming an older failed delivery does not jump across an issued page curs
   recordMessage(session, { ...draft, route, id: 'latest' });
   const first = await getBridgeConversation(options);
   assert.equal(first.messages[0].id, 'latest');
-  const retry = recordMessage(session, { ...draft, route });
+  const retry = recordMessage(session, { ...draft, route, retryFailed: true });
   assert.equal(retry.retried, true);
   assert.deepEqual((await getBridgeConversation({ ...options, cursor: first.next_cursor })).messages.map(r => r.id), [draft.id]);
 });
@@ -209,4 +212,32 @@ test('doctor reports dead sender and manual recovery owners without changing loc
   assert.deepEqual(report.diagnosis, { reason: 'state_unavailable',
     next_action: 'Consult the README’s shared-state lock recovery guidance before sending.' });
   for (const dir of [session.dir, manual]) for (const lock of ['state.lock', 'state.lock.recovery']) assert.equal(fs.readFileSync(path.join(dir, lock), 'utf8'), contents);
+});
+
+test('TL04: a manual-only recovery lock is observed without diagnosing a primary sender failure', async t => {
+  const { owner, session } = await setup(t), manual = path.join(owner.stateDir, 'manual', session.key);
+  fs.mkdirSync(manual, { recursive: true }); fs.writeFileSync(path.join(manual, 'state.lock.recovery'), '{"pid":2147483647}');
+  const report = await executeBridgeTool('bridge_doctor', {}, { stateDir: owner.stateDir, env: { CLAUDE_CODEX_BRIDGE_DAEMON: 'off' },
+    metadata: { 'openai/threadId': owner.threadId }, registryDir: path.join(owner.root, 'absent') });
+  assert.equal(report.checks.find(entry => entry.name === 'manual_lock')?.status, 'fail');
+  assert.notEqual(report.diagnosis?.reason, 'state_unavailable');
+});
+
+test('SP08: a replay blocked by a held ledger lock answers its known handoff within the call budget', async t => {
+  const { owner, session, draft } = await setup(t);
+  const { message } = await calls.recordMessage(session, draft);
+  calls.retainSettlement(session, message, { status: 'submitted', route: draft.route, receipt: { status: 'written' } });
+  let release; const locked = new Promise(resolve => { release = resolve; });
+  let entered; const holding = new Promise(resolve => { entered = resolve; });
+  const held = withStateLockAsync(session.dir, () => { entered(); return locked; });
+  await holding;
+  const call = startCall({ deadlineMs: 400 }), started = performance.now();
+  try {
+    await assert.rejects(executeBridgeTool('send_to_claude', { session_id: 'peer', message: draft.message, message_id: draft.id },
+      { stateDir: owner.stateDir, env: { CLAUDE_CODEX_BRIDGE_DAEMON: 'off' }, metadata: { 'openai/threadId': owner.threadId }, signal: call.signal }),
+      error => error.outcome.delivered === true && error.outcome.reason === 'settlement_failed' && error.outcome.retry === 'no');
+    assert.ok(performance.now() - started < 400, 'the client wait ended inside the call budget');
+  } finally { call.dispose(); release(); await held; }
+  for (let i = 0; i < 100 && lookupMessage(owner, draft).prior.status !== 'submitted'; i++) await delay(20);
+  assert.equal(lookupMessage(owner, draft).prior.status, 'submitted', 'disk repair continued after the reply');
 });

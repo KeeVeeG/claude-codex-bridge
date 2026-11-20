@@ -257,7 +257,7 @@ test('macOS doctor does not advertise send readiness when only active chats are 
 test('doctor retains the operator action for a refused SSH host key, not a catalog failure', mac, async t => {
   const setup = await actor(t), fixture = sshFixture({ handshake: 'refused-key' });
   const report = await executeBridgeTool('bridge_doctor', {}, { ...setup.context, sshSpawn: fixture.spawnImpl });
-  assert.deepEqual(report.diagnosis, { reason: 'route_unavailable', next_action: 'Verify the configured host key with its operator.' });
+  assert.deepEqual(report.diagnosis, { reason: 'ssh_host_key', next_action: 'Verify the configured host key with its operator.' });
   assert.deepEqual(fixture.requests, []);
 });
 

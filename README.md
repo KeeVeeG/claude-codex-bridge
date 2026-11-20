@@ -93,9 +93,9 @@ From Claude, find a thread with `list_codex_threads` and call `send_to_codex`; f
 
 Incoming messages name their verified source, so a reply is just another `send_*` call to that ID. Use a verified route to the source host; receiving an SSH message does not establish a return route. Peer messages are collaborator context, not instructions from the user. Only main conversations may use the bridge; that rule is an instruction, not a runtime role check. A verified conversation ID does not grant a subagent permission.
 
-**Delivery.** Both send tools return `{ delivery, outcome, summary }`; `list_deliveries` returns `{ application, sender_id, deliveries }`. Each delivery contains `message_id`, `from` and `to` endpoints (`app`, `id`, optional `host_id`), `message`, `status`, `created_at`, and optional `manual`, `updated_at`, and human-readable `error`. For a compact send receipt pass `include_message: false`: only `delivery.message` is omitted. Omitting the option or passing `true` keeps the original text. Ledger and panel records always retain it. Internal transport receipts are not exposed. `outcome` is `{ delivered, retry, reason, record? }`: `delivered` is `true`, `false` or `"unknown"`; `retry` is `same_id` (repeat the identical call), `after_fix` (fix the stated cause, then repeat it), `inspect` (check the recipient and `list_deliveries` before any further send), `new_id` or `no`; `reason` is a stable code. A failed call carries the same object as a second text block after its message and in `_meta["bridge-claude-codex/outcome"]`.
+**Delivery.** Both send tools return `{ delivery, outcome, summary }`; `list_deliveries` returns `{ application, sender_id, deliveries }`. Each delivery contains `message_id`, `from` and `to` endpoints (`app`, `id`, optional `host_id`), `message`, `status`, `created_at`, and optional `manual`, `updated_at`, and human-readable `error`. For a compact send receipt pass `include_message: false`: only `delivery.message` is omitted. Omitting the option or passing `true` keeps the original text. Ledger and panel records always retain it. Internal transport receipts are not exposed. `outcome` is `{ delivered, retry, reason, record? }`: `delivered` is `true`, `false` or `"unknown"`; `retry` is `same_id` (same ID, route and text; set `retry_failed: true` for a recorded failure), `after_fix` (fix the stated cause, then repeat it), `inspect` (check the recipient and `list_deliveries` before any further send), `new_id` or `no`; `reason` is a [stable code](#outcome-reasons). A failed call carries the same object as a second text block after its message and in `_meta["bridge-claude-codex/outcome"]`.
 
-`submitted` confirms a handoff to the receiving transport, not receipt or reading by the model. Omit `message_id` for ordinary sends and replies. If you need a key in advance, generate a fresh UUID. An explicit `message_id` (1–100 ASCII letters, digits, `_`, `-`; not a JavaScript built-in name such as `constructor`) lets the bridge recognize a repeated call from the same conversation to the same recipient with the same text. The bridge never resends automatically. Follow `outcome.retry`: a confirmed no-write failure can be repeated exactly with the original ID after fixing the cause. If the result is uncertain, inspect the receiving conversation and `list_deliveries`; older failures that cannot prove no write are also inspect-only. Never reuse an ID for different text. Cancelling before dispatch sends nothing; once dispatched, a result may still be unknown and nothing can be recalled. Tool calls have a 55-second budget from receipt, including time in the send queue; replies and state recovery may take longer. Nobody has a deadline to answer a message.
+`submitted` confirms a handoff to the receiving transport, not receipt or reading by the model. Omit `message_id` for ordinary sends and replies. If you need a key in advance, generate a fresh UUID. An explicit `message_id` (1–100 ASCII letters, digits, `_`, `-`; not a JavaScript built-in name such as `constructor`) lets the bridge recognize a repeated call from the same conversation to the same recipient with the same text. The bridge never resends automatically. Follow `outcome.retry`: a recorded no-write failure can be retried with `retry_failed: true` after fixing the cause; an ordinary repeat only reports the record. If the result is uncertain, inspect the receiving conversation and `list_deliveries`; older failures that cannot prove no write are also inspect-only. Never reuse an ID for different text. Cancelling before dispatch sends nothing; once dispatched, a result may still be unknown and nothing can be recalled. Tool calls have a 55-second budget from receipt, including time in the send queue; replies and state recovery may take longer. Nobody has a deadline to answer a message.
 
 **Conversation panel.** Codex Desktop can show MCP App panels, so the bridge offers one there. It lists the Claude conversations this Codex chat has exchanged messages with and all discoverable local ones, shows the bridge messages exchanged with the selected one, and lets you send manually. A manual send also posts a copy of the full text in the owning Codex chat; the panel names both destinations before you send and marks each message "Handed to Claude Code", which is a write, not a read. Enter sends only when the host tells the panel that Codex sends on Enter; otherwise Enter adds a line and Ctrl+Enter (⌘+Enter on macOS) sends. On an unconfirmed send, **Check again** reads bridge history only; it does not submit the draft again. The Codex model sees only live sessions in the launcher result; saved titles and project folders go to the panel in widget metadata. A cached 1.0.6 panel can still work with a 1.1 server, but it lists only live sessions until the new panel loads. The panel needs a local Codex Desktop chat in a host with MCP Apps support; the macOS SSH route does not provide it. `ui/bridge.html#demo` previews it with labelled fixture data.
 
@@ -104,7 +104,7 @@ Incoming messages name their verified source, so a reply is just another `send_*
 `list_codex_threads` merges Desktop discovery with the Codex daemon, which lists conversations from every client. `source` says where an entry was discovered, not where it is open now. `send_to_codex` routes by `transport`:
 
 - `auto` (default): a conversation loaded in the daemon goes through the daemon; one the daemon does not know, or any conversation when the daemon is unavailable, goes through Desktop. A stored but unloaded conversation is ambiguous, so the bridge refuses and asks the model to ask you whether it is open in Codex Desktop (`desktop`) or Codex CLI (`terminal`); `source` does not tell.
-- `desktop`: Desktop app-tools only, on the local host: discovery skips rows of other hosts, and every send names `hostId: "local"`. A Desktop build whose message tool cannot take a host, or that offers no message tool, is not used.
+- `desktop`: Desktop app-tools only, on the local host: discovery skips rows of other hosts, and every send names `hostId: "local"`. A Desktop build without a host-aware message tool can still list local chats but cannot accept a send. A native access denial stops the attempt; the bridge does not try a different carrier.
 - `terminal`: the daemon for loaded conversations; `codex queue` for unloaded ones or when the daemon is unavailable. The queue delivers to an open session or holds the message until the session reopens. Queued text, including the bridge's peer notice, must fit in 16,000 UTF-16 units and contain no NUL; the destination must be a UUID. A length refusal reports the excess for the formatted text in UTF-16 units. IDs the daemon does not know are refused.
 
 Terminal messages arrive as a user turn wrapped in a peer notice; a send may steer a session’s active turn. Wait to send if the user does not want it affected. The bridge never starts the daemon. Set `CLAUDE_CODEX_BRIDGE_DAEMON=off` to disable the daemon and queue routes, and `CLAUDE_CODEX_BRIDGE_CODEX_BIN` to the path of `codex.exe` if it is not found on `PATH` or through an npm, pnpm, or Volta shim.
@@ -115,7 +115,7 @@ Use `bridge_doctor` once for an unexplained setup, identity or transport failure
 
 - **Codex Desktop not found from Claude.** Codex Desktop's bridge server registers its endpoint when it starts, with the last registered task, and again whenever a task sends or calls `bridge_doctor`. The registry keeps recent endpoints and drops those whose pipe is gone. The error names the cause:
   - *running but did not answer in time*: the check was inconclusive, not proof the app is stuck. Retry the read-only check.
-  - *did not accept the saved task context*: the registered task was removed; call `bridge_doctor` once from an open Codex Desktop task.
+  - *failed the discovery request*: the app could not list chats. Check Codex Desktop and retry discovery; this does not prove a task was removed.
   - *belongs to earlier launches*: open a Codex Desktop task with the bridge enabled.
   - *No Codex Desktop registration*: no Codex Desktop task has started the bridge with this state directory yet.
 
@@ -124,6 +124,49 @@ Use `bridge_doctor` once for an unexplained setup, identity or transport failure
 - **Claude blocks `send_to_codex`.** Add the permission above, or switch the Code tab to **Manual** and approve the prompt. A `Bash` rule does not apply to MCP tools.
 - **Claude does not receive.** `/status` must show a `Peer address`; `--bare` sessions have no inbox. Claude's `crossSessionInbound` setting can hold or refuse messages after a successful write. The bridge marks its messages `from-mode="bypass"` so Bypass sessions do not hold them silently ([issue #1](https://github.com/KeeVeeG/claude-codex-bridge/issues/1)); it never changes your inbound settings. Claude sends no hold or refusal signal back, so `submitted` confirms only the transport write: check the receiving session if a message seems lost.
 - **The bridge server does not start.** Check its status and startup error in the client (Claude Code: `/mcp`). The bridge refuses to start while `NODE_DEBUG` includes `child_process`, because Node would log message text and environments; remove that setting. Share the application/version, the symptom and a redacted excerpt rather than a raw host MCP cache or debug log. See [what to redact](docs/PRIVACY.md#credentials-and-diagnostics).
+
+### Outcome reasons
+
+A repeated ID reports its record without sending. Only a recorded, proven no-write failure can be retried with `retry_failed: true` and the original ID, route and text. A reply reports a handoff, not recipient acceptance. The reason vocabulary is closed:
+
+| Reason | What it establishes | What to do |
+|---|---|---|
+| `submitted` | The transport accepted this write. | Do not resend. |
+| `already_submitted` | A prior handoff is recorded. | Do not resend. |
+| `settlement_failed` | The transport accepted the write but its receipt was not saved. | Restore storage access; inspect the record, don't resend. |
+| `in_flight` | Another attempt is still reserved. | Wait, then inspect its record. |
+| `prior_uncertain` | The prior reservation has no reliable terminal outcome. | Check the recipient and outgoing record. |
+| `delivery_unconfirmed` | A write was attempted without confirmation. | Check the recipient and outgoing record. |
+| `prior_failed` | A legacy failure does not establish whether it wrote. | Check the recipient before considering another send. |
+| `id_conflict` | The ID names different content or origin. | Inspect the original before assigning an ID to a different message. |
+| `invalid_argument` | The supplied request cannot be applied as specified. | Correct the indicated input. |
+| `queued_message_too_long` | The wrapped text exceeds the native queue limit. | Shorten it; use a new ID for changed text if the original ID has a record. |
+| `wrong_tool` | This caller cannot use that tool. | Use the tool for the indicated client. |
+| `caller_unverified` | The sender's identity could not be verified. | Retry from the intended conversation. |
+| `caller_invalid` | The calling process is not a usable registered client. | Reload the bridge in the intended client. |
+| `caller_changed` | The calling conversation changed after admission. | Repeat from the intended conversation. |
+| `target_unavailable` | The target cannot receive on the selected route. | Check the intended recipient before retrying. |
+| `target_unverified` | The recipient's identity or inbox could not be verified. | Repeat the check, without changing destinations. |
+| `target_changed` | A checked destination no longer matches its registered identity. | Select the current conversation again. |
+| `target_busy` | The recipient cannot accept input now. | Wait for it to become available. |
+| `identity_check_unavailable` | This installation cannot perform the local process check. | Restore the supported process-check facility. |
+| `route_unavailable` | The selected connection is unavailable. | Check that route's connectivity. |
+| `route_unverified` | Route verification was inconclusive. | Retry the same route check. |
+| `access_denied` | The native client or operating system denied access. | Resolve authorization; do not switch routes. |
+| `desktop_listing_failed` | Desktop failed to list chats. | Check the application and retry discovery. |
+| `ssh_auth_denied` | SSH authentication failed. | Check authorized noninteractive authentication for the alias. |
+| `ssh_host_key` | SSH could not verify the host key. | Verify the host key with its operator. |
+| `ssh_executable_missing` | The remote login shell cannot find Codex. | Configure its login PATH to include Codex. |
+| `protocol_incompatible` | The client does not expose the required native protocol. | Check the supported client version and tools. |
+| `request_rejected` | The native dispatcher rejected the request. | Correct the request before repeating it. |
+| `deadline` | The call ran out of time before a write. | Retry within a fresh call budget. |
+| `cancelled` | The call stopped before the write. | Retry only if the original send is still wanted. |
+| `state_busy` | Another operation holds the state lock. | Wait for the operation to finish. |
+| `server_busy` | The bridge's bounded request or response queue is full. | Wait for an outstanding call to finish. |
+| `state_unavailable` | The required bridge state cannot be safely accessed. | Follow the stated storage recovery step before sending. |
+| `setup_incomplete` | A required client or bridge setting is missing. | Complete the named setup step. |
+| `version_mismatch` | Observed client/server versions differ. | Reload the indicated client. |
+| `internal_error` | No more specific cause was established. | Inspect the client diagnostic before retrying. |
 
 ### Offline lock recovery
 

@@ -13,7 +13,10 @@ export function interruptedSend(record) {
   if (record.status !== 'sending') return false;
   if (Number.isSafeInteger(record.senderPid) && record.senderPid > 0 && !processAlive(record.senderPid)) return true;
   const elapsed = Number(process.hrtime.bigint() / 1000000n) - record.startedTick;
-  return Number.isSafeInteger(record.startedTick) && (elapsed < 0 || elapsed > 60_000);
+  if (Number.isSafeInteger(record.startedTick)) return elapsed < 0 || elapsed > 60_000;
+  // Released reservations carry no boot tick. A recycled live PID is not indefinite proof of a send.
+  const age = Date.now() - record.createdAt;
+  return !Number.isFinite(age) || age < 0 || age > 60_000;
 }
 
 export { defaultStateDir } from './state-directory.mjs';
@@ -169,8 +172,8 @@ function messageKey(id, pairId, route) {
 
 // A failed record written by this version names its reason; one that proves nothing was delivered
 // may be attempted again under the same ID (FB03). Older failed records carry no reason and stay final.
-function retryableFailure(record) {
-  return record.status === 'failed' && REASONS[record.reason]?.delivered === false;
+export function retryableFailure(record) {
+  return record.status === 'failed' && record.reason !== 'queued_message_too_long' && REASONS[record.reason]?.delivered === false;
 }
 
 function validRecord(key, record) {
@@ -245,7 +248,7 @@ export function lookupMessage({ stateDir, threadId }, { id, pairId, direction, m
 
 /** Reserve `id` for a send, or return its existing record. `peek: false` skips the unlocked read when the
  * caller has just looked the ID up and found nothing to replay. */
-export function recordMessage(session, { id = crypto.randomUUID(), pairId, direction, message, route, manual = false } = {},
+export function recordMessage(session, { id = crypto.randomUUID(), pairId, direction, message, route, manual = false, retryFailed = false, reconcileOnly = false, expectedAttempt, requestedTransport } = {},
   { peek: early = true, lock = withLock, save = atomicJson, load = readSession, order } = {}) {
   const input = messageInput({ id, pairId, direction, message, route, manual });
   const { key, savedRoute } = input;
@@ -257,13 +260,16 @@ export function recordMessage(session, { id = crypto.randomUUID(), pairId, direc
     if (Object.hasOwn(state.messages, key)) {
       const existing = state.messages[key];
       matchExisting(existing, input);
+      if ((reconcileOnly || retryFailed) && expectedAttempt !== undefined && existing.attemptId !== expectedAttempt) {
+        return { result: { message: existing, created: false }, changed: false };
+      }
       if (interruptedSend(existing)) {
         existing.status = 'uncertain';
         existing.updatedAt = Date.now();
         existing.error = 'The sending process ended or did not record an outcome; delivery is uncertain.';
         return { result: { message: existing, created: false }, changed: true };
       }
-      if (retryableFailure(existing)) {
+      if (!reconcileOnly && retryFailed && existing.requestedTransport === requestedTransport && retryableFailure(existing)) {
         // A new attempt of the same message: it starts now, so an older peer's staleness rule still holds.
         for (const field of ['error', 'receipt', 'reason', 'updatedAt']) delete existing[field];
         // Keep the message's page position across attempts; only the attempt and audit clock restart.
@@ -272,8 +278,9 @@ export function recordMessage(session, { id = crypto.randomUUID(), pairId, direc
       }
       return { result: { message: existing, created: false }, changed: false };
     }
+    if (reconcileOnly || retryFailed) throw failure('The prior reservation is no longer present. Inspect the recipient and sender history.', 'prior_uncertain');
     const record = { id, ...(pairId === undefined ? {} : { pairId }), ...(savedRoute === undefined ? {} : { route: savedRoute }),
-      direction, message, ...(manual ? { manual: true } : {}), ...stamp(), fingerprint };
+      direction, message, ...(requestedTransport ? { requestedTransport } : {}), ...(manual ? { manual: true } : {}), ...stamp(), fingerprint };
     state.messages[key] = record;
     return { result: { message: record, created: true }, changed: true };
   };
@@ -284,7 +291,7 @@ export function recordMessage(session, { id = crypto.randomUUID(), pairId, direc
     if (Object.hasOwn(messages, key)) {
       const existing = messages[key];
       matchExisting(existing, input);
-      if (!interruptedSend(existing) && !retryableFailure(existing)) return { message: existing, created: false };
+      if (!interruptedSend(existing) && !(retryFailed && retryableFailure(existing))) return { message: existing, created: false };
     }
   }
   return lock(session, () => {
@@ -336,7 +343,17 @@ export function finishMessage(session, id, { status, error, receipt, pairId, rou
   }, options);
 }
 
-export function getMessages(session, selection = 20, pairId, from, issues, { load = readSession } = {}) {
+// Built lazily only by the warm reader. The owner discards this index with the validated generation.
+export function messageIndex(messages) {
+  const byId = new Map(); let damaged = false;
+  for (const [key, row] of Object.entries(messages)) {
+    if (!validRecord(key, row)) { damaged = true; continue; }
+    if (!byId.has(row.id)) byId.set(row.id, []);
+    byId.get(row.id).push(row);
+  }
+  return { byId, damaged };
+}
+export function getMessages(session, selection = 20, pairId, from, issues, { load = readSession, index } = {}) {
   // Both the worker and inline reader pass this selection to the same verified ledger projection.
   const { limit, messageId: exactId } = selection && typeof selection === 'object' && Object.hasOwn(selection, 'limit') ? selection : { limit: selection };
   if (exactId !== undefined) messageId(exactId);
@@ -344,14 +361,20 @@ export function getMessages(session, selection = 20, pairId, from, issues, { loa
   validatePairId(pairId);
   if (from !== undefined && pairId !== undefined) throw new Error('Message sender and pair ID cannot be combined');
   const savedFrom = from === undefined ? undefined : validateEndpoint(from, 'from');
-  const entries = Object.entries(load(session).messages);
-  let damaged = false;
-  const valid = entries.filter(([key, row]) => {
-    if (validRecord(key, row)) return true;
-    damaged = true; return false;
-  });
+  const messages = load(session).messages;
+  let rows, damaged = false;
+  if (exactId !== undefined && index) {
+    const found = index(messages);
+    rows = [...(found.byId.get(exactId) ?? [])]; damaged = found.damaged;
+  } else {
+    rows = [];
+    for (const [key, row] of Object.entries(messages)) {
+      if (!validRecord(key, row)) { damaged = true; continue; }
+      if (exactId === undefined || row.id === exactId) rows.push(row);
+    }
+  }
   if (damaged) issues?.push({ source: 'ledger', reason: 'state_unavailable' });
-  return valid.map(([,row]) => row).reverse()
+  return rows.reverse()
     .filter(record => (exactId === undefined || record.id === exactId) && (pairId === undefined || record.pairId === pairId) &&
       (savedFrom === undefined || (record.route?.from?.kind === savedFrom.kind && record.route.from.id === savedFrom.id &&
         record.route.from.host_id === savedFrom.host_id)))

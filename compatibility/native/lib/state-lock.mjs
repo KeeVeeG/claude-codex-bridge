@@ -65,11 +65,11 @@ function readOwner(file) {
   const stat = fs.lstatSync(file);
   const data = stat.isFile() && stat.size < 8192 ? fs.readFileSync(file, 'utf8') : undefined;
   let value; try { value = JSON.parse(data); } catch {}
-  if (!Number.isSafeInteger(value?.pid) || value.pid <= 0) throw failure('The saved bridge records have an unverifiable lock owner. Stop all bridge sessions and run bridge_doctor before coordinated recovery.', 'state_unavailable', { code: 'LOCK_INCOMPLETE' });
+  if (!Number.isSafeInteger(value?.pid) || value.pid <= 0) throw failure('The saved bridge records have an unverifiable lock owner. Quit both apps, stop all bridge servers and installers, back up the complete state and follow the READMEвЂ™s offline lock recovery steps.', 'state_unavailable', { code: 'LOCK_INCOMPLETE' });
   return value;
 }
 // Read-only doctor check. Never acquire, remove or refresh either lock while diagnosing it.
-export function inspectStateLocks(directory) {
+export async function inspectStateLocks(directory, { signal, probe = pid => asyncStart(pid, { signal, until: mono() + 750 }) } = {}) {
   const offline = 'Quit both apps, stop every bridge server and installer, and back up the complete state. Follow the offline lock recovery steps in the README; do not resend to reconstruct a receipt.';
   try {
     const stat = fs.lstatSync(directory);
@@ -80,7 +80,14 @@ export function inspectStateLocks(directory) {
         if (e.code === 'ENOENT') continue;
         return { status: 'fail', detail: `The lock owner cannot be verified. If another bridge is just starting, check again after it finishes. If the condition persists: ${offline}` };
       }
-      if (recovery && !processAlive(owner.pid)) return { status: 'fail', detail: `Recovery was interrupted and its owner no longer runs. ${offline}` };
+      if (!recovery) continue;
+      let unverified = false;
+      const step = alive(owner, { start: async pid => {
+        const actual = await probe(pid); unverified = !actual; return actual;
+      } });
+      let state = step.next(); while (!state.done) state = step.next(await state.value);
+      if (!state.value) return { status: 'fail', detail: `Recovery was interrupted and its owner no longer runs. ${offline}` };
+      if (unverified) return { status: 'warning', detail: 'Could not verify the recovery owner. Leave the locks alone and check again after the current operation finishes.' };
     }
   } catch (e) { if (e.code !== 'ENOENT') return { status: 'fail', detail: 'The bridge could not inspect the lock location. Check access to the shared state.' }; }
 }
@@ -131,6 +138,12 @@ function* release(file, token, io) {
     }
   }
 }
+// Released macOS readers distinguish an explicitly unknown start token from a legacy owner with
+// only a civil timestamp. Never invite a legacy clock comparison when our start probe failed.
+function publisherIdentity(platform, start) {
+  if (platform === 'darwin') return { procStartUtc: validDate(start) ? start : null };
+  return platform === 'win32' && isFt(start) ? { procStartFt: start, procStartMs: winMs(start) } : {};
+}
 function* transaction(directory, callback, io) {
   const busy = () => failure('Bridge state is busy. Wait for the current operation to finish, then retry.', 'state_busy');
   const check = () => { throwIfStopped(io.signal); if (io.now() >= io.until) throw busy(); };
@@ -151,7 +164,7 @@ function* transaction(directory, callback, io) {
   const token = randomUUID();
   const start = ownStart ?? (yield io.start(process.pid));
   if (start) ownStart = start; // Only this same process's own immutable creation token is cached.
-  const owner = { pid: process.pid, token, createdAt: Date.now(), ...(process.platform === 'win32' && isFt(start) ? { procStartFt: start, procStartMs: winMs(start) } : {}), ...(process.platform === 'darwin' && validDate(start) ? { procStartUtc: start } : {}) };
+  const owner = { pid: process.pid, token, createdAt: Date.now(), ...publisherIdentity(process.platform, start) };
   let observedOwner;
   for (;;) {
     check();
@@ -169,7 +182,7 @@ function* transaction(directory, callback, io) {
       if (e.code !== 'EEXIST') { yield* retry(e); continue; }
       let guardian;
       try { guardian = readOwner(guard); } catch (e) { if (e.code !== 'ENOENT') yield* retry(e); continue; }
-      if (!(yield* alive(guardian, io))) throw failure('Bridge lock recovery was interrupted. Stop all bridge sessions and run bridge_doctor for coordinated recovery.', 'state_unavailable');
+      if (!(yield* alive(guardian, io))) throw failure('Bridge lock recovery was interrupted. Quit both apps, stop all bridge servers and installers, back up the complete state and follow the READMEвЂ™s offline lock recovery steps.', 'state_unavailable');
       yield io.pause(15, true); continue;
     }
     try {

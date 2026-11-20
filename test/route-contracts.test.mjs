@@ -83,7 +83,8 @@ test('daemon connection failures name the observed cause; only a missing listene
   assert.equal(shouldReportTerminalUnavailable(denied, true), true, 'a denial is never hidden behind a working Desktop');
   const absent = await daemonFailure(t, 'failed to connect to socket (os error 10061)\n');
   assert.equal(absent.message, NOT_RUNNING_MESSAGE);
-  for (const error of [long, denied, absent]) assert.ok(error instanceof DaemonUnavailableError);
+  assert.equal(denied.reason, 'access_denied'); assert.ok(!(denied instanceof DaemonUnavailableError));
+  for (const error of [long, absent]) assert.ok(error instanceof DaemonUnavailableError);
 });
 
 test('a broken executable override names the setting instead of advising an install (E11)', async () => {
@@ -221,12 +222,13 @@ test('SSH startup failures that need different repairs say which, without echoin
   const cases = [
     [{ stderr: 'Host key verification failed.\r\n' }, /^SSH host-key verification failed\. Verify the configured host key with its operator\.$/],
     [{ stderr: 'bash: line 1: exec: codex: not found\n', code: 127 }, /^The remote login shell could not find Codex\. Configure its login PATH to include Codex\.$/],
-    [{ stderr: 'operator@fixture: Permission denied (publickey).\r\n' }, /^SSH authentication was denied\. Configure noninteractive authentication/],
+    [{ stderr: 'operator@fixture: Permission denied (publickey).\r\n' }, /^SSH authentication was denied\. Check authorized noninteractive authentication/],
     [{ stderr: 'ssh: connect to host fixture port 22: Connection timed out\r\n' }, /^The configured SSH proxy closed before replying\. Check connectivity to the configured host\.$/],
   ];
-  for (const [child, expected] of cases) {
+  const reasons = ['ssh_host_key', 'ssh_executable_missing', 'ssh_auth_denied', 'route_unavailable'];
+  for (const [i, [child, expected]] of cases.entries()) {
     await assert.rejects(listSshCodexChats({ sshHostAlias: 'fixture', spawnImpl: sshChild(child) }),
-      error => expected.test(error.message) && error.reason === 'route_unavailable', String(expected));
+      error => expected.test(error.message) && error.reason === reasons[i], String(expected));
   }
 });
 

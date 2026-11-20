@@ -7,12 +7,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { verifiedClaudeSessions, resolveClaudeSession, resolveClaudeCaller, sendToClaude } from './claude-sessions.mjs';
-import { ensureCall, inquire, INQUIRY_ATTEMPT_MS, isCancelledError, monotonicNow, remainingMs, startCall, throwIfStopped } from './call-time.mjs';
+import { ensureCall, inquire, INQUIRY_ATTEMPT_MS, isCancelledError, monotonicNow, remainingMs, startCall, throwIfStopped, waitForSettlement } from './call-time.mjs';
 import { manualSend, retryManualNotice } from './manual-service.mjs';
 import { listClaudeConversations } from './claude-history.mjs';
 import { getBridgeConversation } from './bridge-history.mjs';
 import { REASONS, errorOutcome, failure, outcome, sendErrorText } from './outcome.mjs';
-import { desktopCompatible, listCodexTools, listCodexChats, sendToCodex } from './codex-desktop.mjs';
+import { desktopCompatible, MAX_CODEX_CHAT_LIMIT, listCodexTools, listCodexChats, sendToCodex } from './codex-desktop.mjs';
 import { publishCodexHost, getCodexHosts } from './codex-host.mjs';
 import { canonicalLocalSocket, localSocketPresence } from './local-socket.mjs';
 import { defaultStateDir, ledgerAt, ownerId } from './store.mjs';
@@ -133,6 +133,7 @@ async function resolveTerminalTarget(threadId, transport, config, signal, held) 
     checkCancellation(signal);
     // Explicit terminal selection also supports a standalone CLI without a running daemon.
     // The queue command still enforces the kill switch and validates the exact thread ID.
+    if (error.reason === 'access_denied' || ['EACCES', 'EPERM'].includes(error.code)) throw failure('Access to the selected Codex route was denied. Resolve authorization before retrying.', 'access_denied');
     if (error.inconclusive) throw failure('The Codex daemon did not answer the routing check in time. Retry the same call.', 'route_unverified');
     if (error instanceof DaemonUnavailableError) return transport === 'terminal'
       ? { queueRoute: true, queueOnly: true, allowQueue: true } : false;
@@ -219,7 +220,7 @@ const acceptedContexts = new Map();
  * longer exist are skipped without a connection, and a pipe that stalls is not retried with its
  * other contexts. Returns { host, catalog, chats } on success and always a report of the rest.
  */
-async function selectDesktopHost(hosts, config, signal, { limit = 1, reuse = false, compatible = desktopCompatible } = {}) {
+async function selectDesktopHost(hosts, config, signal, { limit = 1, targetId, collect = false, compatible = desktopCompatible } = {}) {
   const timeouts = { ...DESKTOP_TIMEOUTS, ...(config.desktop ?? {}) };
   const deadline = monotonicNow() + Math.min(timeouts.budgetMs, remainingMs(signal));
   // A wait the budget cut short proves nothing about the app: its timeout counts as unchecked, not stalled.
@@ -232,7 +233,8 @@ async function selectDesktopHost(hosts, config, signal, { limit = 1, reuse = fal
   const report = { budgetMs: timeouts.budgetMs, gone: 0, stalled: 0, incompatible: 0, compatible: 0,
     unchecked: 0, errors: [] };
   const pipes = new Map();
-  let empty;
+  let empty, chosen;
+  const listed = new Map(), pinnedIds = new Set();
   for (const host of hosts) {
     const pipePath = host && canonicalLocalSocket(host.pipePath);
     if (!pipePath) continue;
@@ -244,6 +246,7 @@ async function selectDesktopHost(hosts, config, signal, { limit = 1, reuse = fal
   for (const key of acceptedContexts.keys()) if (!pipes.has(key)) acceptedContexts.delete(key);
   const present = localSocketPresence();
   const failed = error => {
+    if (error.reason === 'access_denied' && targetId) throw error;
     checkCancellation(signal);
     if (error.code === 'ENDPOINT_GONE') report.gone++;
     else if (error.inconclusive || error.code === 'DESKTOP_TIMEOUT') report[monotonicNow() >= deadline - 1 ? 'unchecked' : 'stalled']++;
@@ -256,19 +259,30 @@ async function selectDesktopHost(hosts, config, signal, { limit = 1, reuse = fal
     let catalog;
     try { catalog = await read(timeouts.catalogMs, attempt => listCodexTools(pipePath, { signal: attempt.signal, timeoutMs: attempt.timeoutMs })); }
     catch (error) { failed(error); continue; }
-    if (compatible && !compatible(catalog)) { report.incompatible++; continue; }
+    if (compatible && !compatible(catalog)) {
+      report.incompatible++;
+      if (!collect || !catalog.some(tool => tool.name === 'list_threads' && tool.namespace)) continue;
+    }
     report.compatible++;
     const accepted = contexts.includes(acceptedContexts.get(pipePath)) ? acceptedContexts.get(pipePath) : undefined;
-    if (reuse && accepted) return { host: { pipePath, threadId: accepted }, catalog, report };
+    if (targetId && pipes.size === 1 && accepted) return { host: { pipePath, threadId: accepted }, catalog, report };
     for (const threadId of accepted ? [accepted, ...contexts.filter(id => id !== accepted)] : contexts) {
       if (monotonicNow() >= deadline) { report.unchecked++; continue; }
       try {
-        const chats = await read(timeouts.listMs, attempt => listCodexChats({ pipePath, contextThreadId: threadId, limit, signal: attempt.signal, catalog, timeoutMs: attempt.timeoutMs }));
+        const chats = await read(timeouts.listMs, attempt => listCodexChats({ pipePath, contextThreadId: threadId, limit, pinnedIds, signal: attempt.signal, catalog, timeoutMs: attempt.timeoutMs }));
         // An empty listing proves this context but says nothing about another running app, so the
         // search goes on and settles for it only when no other app lists a chat (F02).
         if (!chats.length) { empty ??= { host: { pipePath, threadId }, catalog, chats, report }; break; }
         acceptedContexts.set(pipePath, threadId);
-        return { host: { pipePath, threadId }, catalog, chats, report };
+        const candidate = { host: { pipePath, threadId }, catalog, chats, report };
+        if (collect) {
+          chosen ??= candidate;
+          for (const chat of chats) if (!listed.has(chat.thread_id)) listed.set(chat.thread_id, chat);
+          break;
+        }
+        if (!targetId || pipes.size === 1 || chats.some(chat => chat.thread_id === targetId)) return candidate;
+        // Another Desktop instance may own the target. A bounded listing cannot prove absence.
+        break;
       } catch (error) {
         // Desktop has no explicit context-rejection reply, so a definite failure only makes the next
         // send prove the context again. A stalled or cut-short listing says nothing about it, and
@@ -282,6 +296,15 @@ async function selectDesktopHost(hosts, config, signal, { limit = 1, reuse = fal
       }
     }
   }
+  if (collect && chosen) {
+    const rows = [...listed.values()];
+    return { ...chosen, chats: [...rows.filter(row => pinnedIds.has(row.thread_id)).slice(0, MAX_CODEX_CHAT_LIMIT),
+      ...rows.filter(row => !pinnedIds.has(row.thread_id)).slice(0, limit)] };
+  }
+  if (targetId && pipes.size > 1) {
+    if (report.compatible) throw failure('Could not verify which Desktop instance knows the selected thread. Check the intended task before retrying.', 'route_unverified');
+    return { report };
+  }
   if (empty) acceptedContexts.set(empty.host.pipePath, empty.host.threadId);
   return empty ?? { report };
 }
@@ -290,9 +313,8 @@ async function selectDesktopHost(hosts, config, signal, { limit = 1, reuse = fal
  * facts, so a stale record never hides a stalled app and no reader gets two competing steps (V08). */
 function desktopFailure(report, { factsOnly = false } = {}) {
   const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
-  // Only an unsuccessful listing for a context says the context was refused; any other failure is the app's (E06).
-  const rejected = (report.errors ?? []).filter(reason => reason === 'route_unavailable').length;
-  const failedRequests = (report.errors ?? []).length - rejected;
+  // No Desktop response identifies a removed task. Describe the failed operation, not an inferred cause.
+  const failedRequests = (report.errors ?? []).filter(reason => reason !== 'access_denied').length;
   const causes = [
     [report.stalled, 'Codex Desktop is running but did not answer in time. Retry the same call.',
       `${plural(report.stalled, 'saved endpoint')} did not answer in time`],
@@ -300,10 +322,9 @@ function desktopFailure(report, { factsOnly = false } = {}) {
       `${plural(report.unchecked, 'saved endpoint record')} could not be checked ${factsOnly ? `within ${report.budgetMs / 1000} s` : 'in time'}`],
     [report.incompatible, 'Codex Desktop does not offer local discovery and message tools this bridge can use. Check that its app tools are enabled.',
       `${plural(report.incompatible, 'endpoint')} lacked compatible local tools`],
+    [report.errors?.includes('access_denied'), 'Access to a registered Desktop endpoint was denied. Check authorization before sending.', 'access to a registered endpoint was denied'],
     [failedRequests, 'Codex Desktop failed the discovery request. Restart Codex Desktop, then retry the same call.',
       `${plural(failedRequests, 'discovery request')} failed`],
-    [rejected, 'Codex Desktop did not accept the saved task context for discovery. Call bridge_doctor once from an open Codex Desktop task to register it.',
-      `${plural(rejected, 'saved task context')} ${rejected === 1 ? 'was' : 'were'} not accepted`],
     [report.gone, `${plural(report.gone, 'saved Codex Desktop endpoint')} belong${report.gone === 1 ? 's' : ''} to earlier launches. Open a Codex Desktop task with the bridge enabled; its bridge server registers the current endpoint when it starts.`,
       `${plural(report.gone, 'saved endpoint')} belong${report.gone === 1 ? 's' : ''} to earlier Codex Desktop launches`],
   ].filter(([count]) => count);
@@ -613,7 +634,7 @@ async function bridgeDoctor(context, config) {
       if (who.kind === 'codex') locations.push(['manual_lock', path.join(config.stateDir, 'manual', owner.key)]);
     }
     for (const [name, directory] of locations) {
-      const issue = inspectStateLocks(directory);
+      const issue = await inspectStateLocks(directory, { signal });
       if (!issue) continue;
       const outbound = name === 'host_lock' ? desktopCaller : who && name !== 'manual_lock';
       add(name, issue.status, outbound ? issue.detail : doctorFact(issue.detail), 'state_unavailable');
@@ -670,6 +691,10 @@ function transportReason(error, signal) {
 /** The answer for an exact earlier attempt with this message_id; only a submitted one is a result. */
 function replay(record) {
   if (record.status === 'submitted') return { delivery: publicDelivery(record), outcome: outcome('already_submitted', { record }) };
+  if (record.status === 'failed' && REASONS[record.reason]?.delivered === false) {
+    const repair = record.reason === 'queued_message_too_long' ? 'Shorten the message and use a new ID.' : 'To retry after fixing the cause, use retry_failed: true with the original ID, route and text.';
+    throw failure(`No new send was made. This ID has a recorded no-write failure. ${repair}`, record.reason, { outcome: outcome(record.reason, { record }) });
+  }
   const [text, reason] = record.status === 'sending'
     ? ['No new send was made: the first attempt with this message_id is still in progress. Let it finish, then check list_deliveries.', 'in_flight']
     : record.status === 'uncertain'
@@ -697,7 +722,7 @@ async function overHeld(held, send, fresh, signal) {
     return pending;
   } };
   try { return await send(tracked); } catch (error) {
-    if (answered || writing || error.deliveryUnknown || error.code === 'DAEMON_TIMEOUT') throw error;
+    if (error.reason === 'access_denied' || writing || error.deliveryUnknown || (answered && error.code !== 'DAEMON_TIMEOUT')) throw error;
     throwIfStopped(signal);
     connection.close();
     held.connection = null;
@@ -724,15 +749,19 @@ async function deliver(name, args, context, config, who, held) {
   const route = { from: sender(who), to: direction === 'to_claude'
     ? { kind: 'claude', id: args.session_id }
     : { kind: 'codex', id: targetThreadId, ...(ssh ? { host_id: `ssh:${ssh.sshHostAlias}` } : {}) } };
-  const draft = { direction, message: args.message, route, manual: context.manual === true };
+  const draft = { direction, message: args.message, route, manual: context.manual === true, ...(direction === 'to_codex' ? { requestedTransport: transport } : {}) };
   // One read answers an exact earlier attempt before any recipient check: its result does not depend on
   // whether the recipient is still open (C01, A06), reading it writes nothing (D04), and the same read
   // finds the sender's ledger for the reservation below (O04).
   const lookup = await lookupMessage({ stateDir: config.stateDir, threadId: senderLedgerId(who) }, { id: args.message_id, ...draft }, { signal });
-  const prior = await repairSettlement(lookup.session, lookup.prior);
-  if (prior && !prior.retryable) {
+  const prior = await repairSettlement(lookup.session, lookup.prior, signal);
+  const retryFailed = args.retry_failed === true && typeof args.message_id === 'string';
+  if (args.retry_failed === true && !prior) throw failure('Retry requires an existing explicit message_id with a recorded no-write failure on this route. No new send was made.', 'invalid_argument');
+  if (prior && !(retryFailed && prior.retryable && prior.requestedTransport === draft.requestedTransport)) {
     if (prior.interrupted) {
-      try { await recordMessage(lookup.session, { id: args.message_id, ...draft }, { signal }); } catch { /* the reply below does not depend on it */ }
+      let current;
+      try { current = await recordMessage(lookup.session, { id: args.message_id, ...draft, expectedAttempt: prior.attemptId, reconcileOnly: true }, { signal }); } catch { /* remain inspect-only */ }
+      if (current) return replay(current.message);
     }
     return replay(prior);
   }
@@ -743,7 +772,7 @@ async function deliver(name, args, context, config, who, held) {
     ? await resolveClaudeSession(args.session_id, { registryDir: config.registryDir, signal, probe: context.processProbe }) : null;
   const terminalTarget = direction === 'to_codex' && !ssh ? await resolveTerminalTarget(targetThreadId, transport, config, signal, held) : false;
   const desktop = direction === 'to_codex' && !ssh && !terminalTarget
-    ? await desktopRoute(who, config, signal, { reuse: true }) : null;
+    ? await desktopRoute(who, config, signal, { targetId: targetThreadId, limit: MAX_CODEX_CHAT_LIMIT }) : null;
   const host = ssh || desktop?.host || null;
   const messageId = args.message_id ?? crypto.randomUUID();
   const peerText = terminalTarget || ssh ? codexPeerContent({ fromKind: 'claude', fromId: route.from.id, bridgeMessageId: messageId, body: args.message, remote: Boolean(ssh) }) : undefined;
@@ -757,7 +786,7 @@ async function deliver(name, args, context, config, who, held) {
   const session = lookup.session ?? await senderLedger(who, config, signal);
   throwIfStopped(signal);
   // The lookup above has just read this ledger, so the reservation goes straight to its lock.
-  const reserved = await recordMessage(session, { id: messageId, ...draft }, { signal });
+  const reserved = await recordMessage(session, { id: messageId, ...draft, retryFailed, expectedAttempt: prior?.attemptId }, { signal });
   if (!reserved.created) return replay(reserved.message);
   const record = status => ({ id: messageId, status });
   let receipt;
@@ -769,7 +798,7 @@ async function deliver(name, args, context, config, who, held) {
       // A terminal/queue return path on Windows is explicit. Neither a carrier nor a matching ID
       // identifies the caller's host across SSH; do not invent a local or remote return address.
       const hint = context.manual === true ? '' : config.platform === 'darwin' ? '; reply host unverified'
-        : who.transport === 'terminal' && config.platform === 'win32' ? '; reply transport="terminal"' : '';
+        : who.transport === 'terminal' && config.platform === 'win32' ? '; reply transport unverified' : '';
       const notice = collaboratorNotice(`[${source} ${quoted(route.from.id)}; bridge message ${quoted(messageId)}${hint}]`, args.message,
         context.manual === true ? 'human' : 'peer');
       receipt = await sendToClaude({ ...endpoint, message: notice, senderName: senderLabel(route.from.id), signal, probe: context.processProbe });
@@ -814,21 +843,22 @@ async function deliver(name, args, context, config, who, held) {
     const status = REASONS[reason].delivered === false ? 'failed' : 'uncertain';
     let saved = true;
     const terminal = { status, route, attemptId: reserved.message.attemptId, error: error.message, ...(status === 'failed' ? { reason } : {}) };
-    try { await finishMessage(session, messageId, terminal); }
+    try { await waitForSettlement(finishMessage(session, messageId, terminal), signal); }
     catch { saved = false; retainSettlement(session, reserved.message, terminal); }
     // The record is still reserved until a disk-only repair. Do not suggest bypassing that repair.
     error.outcome = outcome(reason, { record: record(saved ? status : 'sending'), ...(saved || status !== 'failed' ? {} : { retry: 'inspect' }) });
+    if (reason === 'queued_message_too_long' && saved) error.message += ' This ID is already reserved for the original text; use a new ID for the shorter message.';
     if (!saved) error.message += ' The outcome could not be saved in the delivery record.';
     throw error;
   }
   try {
-    const settled = await finishMessage(session, messageId, { status: 'submitted', route, attemptId: reserved.message.attemptId, ...(receipt ? { receipt } : {}) });
+    const settled = await waitForSettlement(finishMessage(session, messageId, { status: 'submitted', route, attemptId: reserved.message.attemptId, ...(receipt ? { receipt } : {}) }), signal);
     return { delivery: publicDelivery(settled), outcome: outcome('submitted', { record: settled }) };
   } catch {
     // A rename can have committed before lock or temp cleanup failed. Return the authoritative
     // submission if it is readable; otherwise never claim a stale record state we have not seen.
     let saved;
-    try { saved = (await lookupMessage({ stateDir: config.stateDir, threadId: senderLedgerId(who) }, { id: messageId, ...draft })).prior; } catch {}
+    try { saved = (await waitForSettlement(lookupMessage({ stateDir: config.stateDir, threadId: senderLedgerId(who) }, { id: messageId, ...draft }, { signal }), signal)).prior; } catch {}
     if (saved?.status === 'submitted') return { delivery: publicDelivery(saved), outcome: outcome('submitted', { record: saved }) };
     retainSettlement(session, reserved.message, { status: 'submitted', route, ...(receipt ? { receipt } : {}) });
     // The transport took the message; only its record is missing or stale (R01).
@@ -847,11 +877,10 @@ async function listCodexThreads(args, context, config, who) {
   const [desktop, terminal] = await Promise.allSettled([
     (async () => {
       // The listing itself proves the context; a separate one-chat probe would double the wait.
-      const found = await desktopRoute(who, config, signal, { limit });
+      const found = await desktopRoute(who, config, signal, { limit, collect: true });
       if (found.chats) return found;
       const catalog = await listCodexTools(found.host.pipePath, { signal });
-      if (!desktopCompatible(catalog)) throw failure(desktopFailure({ incompatible: 1 }), 'protocol_incompatible');
-      return { chats: await listCodexChats({ pipePath: found.host.pipePath, contextThreadId: found.host.threadId, limit, signal, catalog }) };
+      return { report: { incompatible: desktopCompatible(catalog) ? 0 : 1 }, chats: await listCodexChats({ pipePath: found.host.pipePath, contextThreadId: found.host.threadId, limit, signal, catalog }) };
     })(),
     daemonInquiry(config, signal, (connection, attempt) =>
       listTerminalThreads(connection, { limit, signal: attempt.signal, timeoutMs: attempt.timeoutMs })),
@@ -862,6 +891,15 @@ async function listCodexThreads(args, context, config, who) {
   let chats = [];
   if (desktop.status === 'fulfilled') {
     chats = desktop.value.chats.map(chat => ({ ...chat, source: 'desktop' }));
+    if (desktop.value.report?.incompatible) {
+      warnings.push('A registered Desktop cannot accept a host-pinned send. Its readable local chats can still be listed.');
+      issues.push({ source: 'desktop', reason: 'protocol_incompatible' });
+    }
+    const errors = [...new Set(desktop.value.report?.errors)];
+    if (errors.length) {
+      warnings.push('Some registered Desktop discovery requests failed; the local chat list may be incomplete.');
+      for (const reason of errors) issues.push({ source: 'desktop', reason });
+    }
     // A saved endpoint that could not be checked may be a running app with more chats.
     if (desktop.value.report?.stalled || desktop.value.report?.unchecked) {
       warnings.push('Some saved Codex Desktop endpoints did not answer in time, so Desktop chats may be missing. Retry the same call.');
@@ -941,7 +979,7 @@ async function runBridgeTool(name, args, context) {
       ownerThreadId: who.threadId, sessionId: args.session_id, limit: args.limit, cursor: args.cursor, signal: context.signal });
     const catalog = await listClaudeConversations({ registryDir: config.registryDir,
       projectsDir: path.join(config.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects'),
-      stateDir: config.stateDir, ownerThreadId: who.threadId, cursor: args.cursor, signal: context.signal });
+      stateDir: config.stateDir, ownerThreadId: who.threadId, cursor: args.cursor, signal: context.signal, probe: context.processProbe });
     // The model sees only what opens the panel: live sessions, which list_claude_sessions already
     // shows it. Archived titles and project paths travel as UI-only result metadata (PR02).
     // config.toml is not the Enter action Codex applies (K03), so the 1.0 field names the safe mode.

@@ -7,8 +7,8 @@ import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 import * as store from './store.mjs';
-import { failure, REASONS, outcome } from './outcome.mjs';
-import { remainingMs, throwIfStopped } from './call-time.mjs';
+import { failure, outcome } from './outcome.mjs';
+import { remainingMs, throwIfStopped, waitForSettlement } from './call-time.mjs';
 import { isWindowsSharingError } from './state-files.mjs';
 
 let worker, startup, workerFailure, sequence = 0;
@@ -91,7 +91,7 @@ export function lookupMessage(owner, draft, { signal } = {}) {
 }
 export function recordMessage(session, input, { signal } = {}) {
   return store.withStateLockAsync(session.dir, async () => {
-    const order = await store.allocateOrder(session, { lock: store.withStateLockAsync, save: saveJson, signal });
+    const order = input.reconcileOnly ? undefined : await store.allocateOrder(session, { lock: store.withStateLockAsync, save: saveJson, signal });
     throwIfStopped(signal);
     return large(session.stateFile) ? offThread('record', [session, input, order], signal)
       : store.recordMessage(session, input, { peek: false, lock: unlocked, order, save: (file, state) => saveJson(file, state, { signal }) });
@@ -113,24 +113,58 @@ export function listMessages(session, limit, from, signal) {
 
 // At capacity refuse new reservations instead of forgetting an outcome which storage has not taken.
 const deferred = new Map();
+const storedAttempt = (session, record) => routedRecord({ stateDir: path.dirname(session.dir), threadId: session.threadId }, record.route, record.id);
+let drainTimer, draining = false;
+function scheduleDrain(ms = 1000) {
+  if (drainTimer || draining || !deferred.size) return;
+  drainTimer = setTimeout(async () => {
+    drainTimer = undefined; draining = true;
+    try {
+      // Only terminal metadata is repaired. No send API is involved; repeated failures rotate to the back.
+      for (const [key, pending] of [...deferred].slice(0, 4)) {
+        try {
+          const prior = await storedAttempt(pending.session, pending.record);
+          if (prior) await repairSettlement(pending.session, prior);
+        } catch { /* keep the outcome until the exact reservation can be verified */ }
+        if (deferred.get(key) === pending) { deferred.delete(key); deferred.set(key, pending); }
+      }
+    } finally { draining = false; scheduleDrain(); }
+  }, ms); drainTimer.unref();
+}
 const pendingKey = (session, route, id) => JSON.stringify([session.stateFile, route, id]);
 export function retainSettlement(session, record, terminal) {
-  deferred.set(pendingKey(session, record.route, record.id), { record, terminal: { ...terminal, attemptId: record.attemptId } });
+  deferred.set(pendingKey(session, record.route, record.id), { session, record, terminal: { ...terminal, attemptId: record.attemptId } });
+  scheduleDrain();
 }
 export function checkSettlementCapacity() {
   if (deferred.size >= 256) throw failure('Bridge storage has unsaved delivery receipts. Restore write access and inspect the pending deliveries before sending.', 'state_unavailable');
 }
-export async function repairSettlement(session, prior) {
+export async function repairSettlement(session, prior, signal) {
   if (!session || !prior) return prior;
   const key = pendingKey(session, prior.route, prior.id), pending = deferred.get(key);
   if (!pending) return prior;
   if (pending.record.attemptId !== prior.attemptId || !['sending','uncertain'].includes(prior.status)) { deferred.delete(key); return prior; }
-  try { const repaired = await finishMessage(session, prior.id, pending.terminal); deferred.delete(key);
-    return { ...repaired, retryable: repaired.status === 'failed' && REASONS[repaired.reason]?.delivered === false }; }
+  const clear = () => { if (deferred.get(key) === pending) deferred.delete(key); };
+  async function repair() {
+    try {
+      const repaired = await finishMessage(session, prior.id, pending.terminal); clear();
+      return { ...repaired, retryable: store.retryableFailure(repaired) };
+    } catch { /* a competing settlement can win a rename */ }
+    // A detached settlement or another inspector may have committed while this repair waited for the lock.
+    try {
+      const saved = await storedAttempt(session, prior);
+      if (saved && (saved.attemptId !== prior.attemptId || !['sending', 'uncertain'].includes(saved.status) || saved.status === pending.terminal.status)) {
+        clear();
+        return { ...saved, retryable: store.retryableFailure(saved) };
+      }
+    } catch { /* keep the positive transport evidence below */ }
+    throw new Error();
+  }
+  try { return await (signal ? waitForSettlement(repair(), signal) : repair()); }
   catch {
     if (pending.terminal.status === 'failed') throw Object.assign(new Error('This attempt sent nothing, but its receipt still cannot be saved. Restore write access and inspect list_deliveries before retrying.'),
       { outcome: outcome(pending.terminal.reason, { record: prior, retry: 'inspect' }) });
-    if (pending.terminal.status === 'submitted') throw failure('The message was submitted, but its receipt still cannot be saved. Do not send it again. Restore write access before checking the record.', 'settlement_failed', { outcome: outcome('settlement_failed', { record: prior }) });
+    if (pending.terminal.status === 'submitted') throw failure('The message was submitted, but its receipt is not yet confirmed saved. Do not send it again. If this persists, restore write access before checking the record.', 'settlement_failed', { outcome: outcome('settlement_failed', { record: prior }) });
     return { ...prior, ...pending.terminal, retryable: false, interrupted: false };
   }
 }

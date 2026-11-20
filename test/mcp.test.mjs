@@ -11,9 +11,9 @@ import test from 'node:test';
 import { runMcpServer, TOOLS } from '../scripts/mcp.mjs';
 import { createSession, getSession, readSession, updateSession, recordMessage, finishMessage } from '../lib/store.mjs';
 import { nativeFixture, mockPipe, encodeFrame, messageTool } from './native-helpers.mjs';
-import { CALL_DEADLINE_MS, WRITE_RESERVE_MS } from '../lib/call-time.mjs';
+import { WRITE_RESERVE_MS } from '../lib/call-time.mjs';
 
-const childWaitMs = CALL_DEADLINE_MS + WRITE_RESERVE_MS;
+const childWaitMs = 60_000; // External host ceiling, independent of the bridge policy.
 const serverPath = fileURLToPath(new URL('../scripts/mcp.mjs', import.meta.url));
 const identityServer = fileURLToPath(new URL('./fixtures/mcp-identity-child.mjs', import.meta.url));
 const fixtureStarts = { desktop: '133700000000000000', cli: '133700000000010000' };
@@ -579,7 +579,7 @@ test('MCP advertises direct, addressed messages without pair-management tools or
   for (const toolName of ['send_to_claude', 'send_to_codex']) {
     const schema = listed.result.tools.find(tool => tool.name === toolName).inputSchema;
     const targetField = toolName === 'send_to_claude' ? 'session_id' : 'thread_id';
-    assert.deepEqual(Object.keys(schema.properties).sort(), ['include_message', 'message', 'message_id', targetField,
+    assert.deepEqual(Object.keys(schema.properties).sort(), ['include_message', 'message', 'message_id', 'retry_failed', targetField,
       ...(toolName === 'send_to_codex' ? ['transport'] : [])].sort());
     assert.deepEqual(schema.required.sort(), ['message', targetField].sort());
     assert.ok(isToolFailure(await callTool(client, toolName, { message: 'Missing destination.' })));
@@ -587,7 +587,8 @@ test('MCP advertises direct, addressed messages without pair-management tools or
       const response = await callTool(client, toolName, { message: 'Plain text only.', [targetField]: 'chosen-target',
         [field]: field === 'files' ? [] : 'retired' });
       assert.ok(isToolFailure(response));
-      assert.match(JSON.stringify(response), new RegExp(`Unknown argument: ${field}`));
+      assert.match(JSON.stringify(response), /Unknown argument/);
+      assert.equal(JSON.stringify(response).includes(field), false, 'do not reflect caller-provided argument names');
     }
   }
   assert.ok(isToolFailure(await callTool(client, 'ack_codex_request')));

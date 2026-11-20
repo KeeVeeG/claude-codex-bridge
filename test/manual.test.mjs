@@ -345,7 +345,8 @@ test('LC01: disk full after reserving only the shadow does not spend the ID', wi
   assert.equal(visible.message, fixture.args.message);
   full = false;
   fs.renameSync.mock.restore();
-  const replay = await manualSend(fixture.args, fixture.context);
+  assert.equal((await manualSend(fixture.args, fixture.context)).delivery.status, 'failed');
+  const replay = await manualSend({ ...fixture.args, retry_failed: true }, fixture.context);
   assert.equal(replay.delivery.status, 'submitted');
   assert.equal(replay.notice_status, 'submitted');
   assert.equal(readShadow(fixture).send_status, 'submitted');
@@ -583,6 +584,7 @@ async function legacyManual(fixture, method = 'manualSend') {
 
 test('real v1.0.6 sees the v1 primary reservation and notice claim while the new writer is still live',
   { skip: windowsOnly.skip || (!legacyRoot && 'Set BRIDGE_TEST_106_ROOT to a disposable archive of v1.0.6.') }, async t => {
+    assert.equal(JSON.parse(fs.readFileSync(path.join(legacyRoot, 'package.json'), 'utf8')).version, '1.0.6', 'pin the actual released writer');
     let resumePrimary, sawPrimary, sawNotice, acknowledge;
     let holdNotice = true;
     const primary = new Promise(resolve => { sawPrimary = resolve; });

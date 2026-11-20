@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 // Send-path contract (stage C1): time, replay, outcome truth. Identity is answered by a fixture-owned
 // process probe, so these cases never depend on how fast the OS answers a real one.
 import test from 'node:test';
@@ -78,7 +79,9 @@ test('a send that wrote nothing can be repeated with the same message_id once it
   assert.deepEqual(failed.outcome, { delivered: false, retry: 'after_fix', reason: 'target_unavailable',
     record: { message_id: 'fb03', status: 'failed' } });
   setup.writeRecord({ messagingSocketPath: live });
-  const sent = await setup.send({ message_id: 'fb03' });
+  const inspected = await rejection(setup.send({ message_id: 'fb03' }));
+  assert.equal(inspected.outcome.reason, 'target_unavailable'); assert.equal(setup.userFrames().length, 0);
+  const sent = await setup.send({ message_id: 'fb03', retry_failed: true });
   assert.equal(sent.delivery.status, 'submitted');
   assert.deepEqual(sent.outcome, { delivered: true, retry: 'no', reason: 'submitted', record: { message_id: 'fb03', status: 'submitted' } });
   assert.equal(setup.userFrames().length, 1);
@@ -194,7 +197,8 @@ test('panel replay repairs a known pre-write rejection before rearming the manua
   assert.equal(first.outcome.delivered, false); assert.equal(setup.userFrames().length, 0);
   assert.equal(Object.values(JSON.parse(fs.readFileSync(primary)).messages)[0].status, 'sending');
   fault.mock.restore(); setup.writeRecord({ messagingSocketPath: live });
-  const replay = await manualSend(args, setup.context);
+  assert.equal((await manualSend(args, setup.context)).delivery.status, 'failed');
+  const replay = await manualSend({ ...args, retry_failed: true }, setup.context);
   assert.equal(replay.delivery.status, 'submitted'); assert.equal(setup.userFrames().length, 1);
   assert.equal(setup.notices.length, 1);
 });
@@ -227,7 +231,7 @@ test('a call without time left for the write never writes, and the same message_
   assert.match(error.message, /^Message not sent\. The bridge call ran out of time before the message was written\./);
   assert.deepEqual(error.outcome, { delivered: false, retry: 'same_id', reason: 'deadline', record: { message_id: 'late', status: 'failed' } });
   assert.equal(setup.inbox.messages.length, 0, 'neither the auth line nor the message was written');
-  const sent = await setup.send({ message_id: 'late' });
+  const sent = await setup.send({ message_id: 'late', retry_failed: true });
   assert.equal(sent.outcome.reason, 'submitted');
   assert.equal(setup.userFrames().length, 1);
 });
@@ -243,7 +247,7 @@ test('a call cancelled during the last identity check writes nothing and can be 
   assert.deepEqual(error.outcome, { delivered: false, retry: 'same_id', reason: 'cancelled', record: { message_id: 'cancel', status: 'failed' } });
   assert.equal(setup.inbox.messages.length, 0);
   setup.probe.answer = undefined;
-  assert.equal((await setup.send({ message_id: 'cancel' })).outcome.reason, 'submitted');
+  assert.equal((await setup.send({ message_id: 'cancel', retry_failed: true })).outcome.reason, 'submitted');
 });
 
 test('a destination already known to have changed fails before another process check (FB05)', nativeOnly, async t => {
@@ -333,7 +337,8 @@ test('a panel send retries its durably unwritten failure with the identical ID (
   const call = () => executeBridgeTool('panel_send', args, s.context);
   const first = await call(); assert.equal(first.outcome.retry, 'same_id');
   s.probe.answer = undefined;
-  assert.equal((await call()).outcome.delivered, true); assert.equal((await call()).outcome.reason, 'already_submitted');
+  assert.equal((await call()).outcome.delivered, false); assert.equal(s.userFrames().length, 0);
+  args.retry_failed = true; assert.equal((await call()).outcome.delivered, true); assert.equal((await call()).outcome.reason, 'already_submitted');
   assert.equal(s.userFrames().length, 1); assert.equal(s.notices.length, 1);
 });
 
@@ -343,4 +348,55 @@ test('a malformed registration makes the Claude list explicitly partial', native
   const result = await executeBridgeTool('list_claude_sessions', {}, s.context);
   assert.equal(result.sessions.length, 1);
   assert.deepEqual(result.issues, [{ source: 'claude', reason: 'state_unavailable' }]);
+});
+
+test('EC04: a damaged registration during final proof is unverified, not changed', nativeOnly, async t => {
+  const s = await codexToClaude(t);
+  s.probe.answer = () => {
+    if (s.probe.calls === 2) fs.writeFileSync(path.join(s.registryDir, `${s.record.pid}.json`), '{');
+    return { start: START };
+  };
+  await assert.rejects(s.send({ message_id: 'unreadable' }), { reason: 'target_unverified' });
+  assert.equal(s.userFrames().length, 0);
+});
+
+test('LF02: EOF observed during final proof prevents any later message write', nativeOnly, async t => {
+  const s = await codexToClaude(t), original = net.connect; let active;
+  const mock = t.mock.method(net, 'connect', (...args) => { active = original(...args); return active; });
+  syncBuiltinESMExports(); t.after(() => { mock.mock.restore(); syncBuiltinESMExports(); });
+  s.probe.answer = () => { if (s.probe.calls === 2) active.emit('end'); return { start: START }; };
+  await assert.rejects(s.send({ message_id: 'before-eof' }), error => error.outcome?.delivered === false && error.outcome.reason === 'target_unavailable');
+  assert.equal(s.userFrames().length, 0);
+});
+
+test('DR04: a keyed but disconnected Claude registration is not live in the panel', nativeOnly, async t => {
+  const s = await codexToClaude(t); s.writeRecord({ messagingSocketPath: missingSocket() });
+  const result = await executeBridgeTool('bridge_panel', {}, s.context);
+  assert.equal(result.sessions.some(row => row.session_id === s.record.sessionId), false);
+});
+
+test('SP03/DR03/EC01: an inconclusive window outweighs a stale window for sends, listing and doctor', nativeOnly, async t => {
+  const s = await codexToClaude(t), child = spawn(process.execPath, ['-e', 'process.stdin.resume()'], { stdio: ['pipe', 'ignore', 'ignore'] });
+  t.after(() => child.kill());
+  const base = { ...s.record };
+  s.writeRecord({ statusUpdatedAt: 100 });
+  writeClaudeRecord(s.registryDir, { ...base, pid: child.pid, statusUpdatedAt: 50 });
+  const processProbe = async pid => { if (pid === child.pid) throw Object.assign(new Error('fixture query unavailable'), { transient: true }); return { start: process.platform === 'win32' ? '133700000000000001' : 'Thu Oct  8 02:03:05 2026' }; };
+  await assert.rejects(s.send({ message_id: 'mixed' }, { processProbe }), { reason: 'target_unverified' });
+  const list = await executeBridgeTool('list_claude_sessions', {}, { ...s.context, processProbe });
+  assert.equal(list.sessions.length, 0); assert.ok(list.issues.some(issue => issue.reason === 'target_unverified'));
+  const doctor = await executeBridgeTool('bridge_doctor', {}, { ...s.context, processProbe });
+  assert.ok(doctor.issues.some(issue => issue.reason === 'target_unverified')); assert.equal(s.userFrames().length, 0);
+});
+
+test('SP02: expiry while the final proof is pending says the destination was not verified', nativeOnly, async t => {
+  const s = await codexToClaude(t), call = startCall(); t.after(() => call.dispose());
+  s.probe.answer = () => {
+    if (s.probe.calls !== 2) return { start: START };
+    call.cancel(Object.assign(new Error('fixture deadline'), { code: 'BRIDGE_DEADLINE' }));
+    return new Promise(() => {});
+  };
+  await assert.rejects(s.send({ message_id: 'proof-expiry' }, { signal: call.signal }),
+    error => error.outcome.reason === 'target_unverified' && error.outcome.retry === 'same_id' && error.outcome.delivered === false);
+  assert.equal(s.userFrames().length, 0);
 });

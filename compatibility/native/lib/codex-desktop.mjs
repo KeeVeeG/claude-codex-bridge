@@ -73,6 +73,7 @@ function request(pipePath, method, params, { timeoutMs = 30000, mutating = false
       socket.write(frame);
     });
     socket.on('error', error => {
+      if (['EACCES', 'EPERM'].includes(error.code)) { fail(failure('Access to the selected Codex Desktop endpoint was denied. Check authorization before retrying.', 'access_denied')); return; }
       if (error.code === 'ENOENT') {
         fail(Object.assign(new Error('This Codex Desktop endpoint belongs to an earlier Codex Desktop launch and no longer exists.'),
           { code: 'ENDPOINT_GONE' }));
@@ -149,7 +150,7 @@ function appToolResult(result) {
 }
 
 /** Discover actual local Codex chats through the running Desktop app. */
-async function listNativeCodexChats({ pipePath, contextThreadId, limit = 30, signal, timeoutMs = 10000, catalog }) {
+async function listNativeCodexChats({ pipePath, contextThreadId, limit = 30, pinnedIds, signal, timeoutMs = 10000, catalog }) {
   throwIfAborted(signal);
   requiredText(contextThreadId, 'Registered Codex context task id');
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_CODEX_CHAT_LIMIT) {
@@ -164,7 +165,7 @@ async function listNativeCodexChats({ pipePath, contextThreadId, limit = 30, sig
     threadId: contextThreadId, callId: `bridge-list-${randomUUID()}`, turnId: `bridge-list-${randomUUID()}`,
   }, { timeoutMs, signal });
   if (!appToolResult(result)) throw failure('Codex Desktop returned an unsupported chat discovery result', 'protocol_incompatible');
-  if (!result.success) throw failure('Codex Desktop could not list chats for the supplied task context. Run bridge_doctor from an open Desktop task.', 'route_unavailable');
+  if (!result.success) throw failure('Codex Desktop did not complete its chat listing. Check the application and retry discovery.', 'desktop_listing_failed');
   let listing;
   for (const item of result.contentItems) {
     if (item.type !== 'inputText' || typeof item.text !== 'string') continue;
@@ -183,6 +184,7 @@ async function listNativeCodexChats({ pipePath, contextThreadId, limit = 30, sig
       if (typeof id !== 'string' || !id.trim()) throw failure('Codex Desktop returned a chat without a usable ID.', 'protocol_incompatible');
       if (seen.has(id)) continue;
       seen.add(id);
+      if (items === listing.pinnedThreads) pinnedIds?.add(id);
       rows.push({ thread_id: id, title: typeof item.title === 'string' ? item.title.slice(0, 512) : '',
         status: typeof item.status === 'string' ? item.status : 'unknown', cwd: typeof item.cwd === 'string' ? item.cwd.slice(0, 4096) : '', host_id: 'local' });
       if (++count >= cap) break;
