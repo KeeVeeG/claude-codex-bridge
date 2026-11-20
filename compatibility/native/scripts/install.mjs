@@ -177,21 +177,21 @@ function refuseLink(filename) {
 const backupFolder = '.bridge-claude-codex-backups';
 const secureWindowsDirectory = `
 $ErrorActionPreference = 'Stop'
-$job = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())) | ConvertFrom-Json
-$p = $job.dir
+# One complete input line; no EOF wait or module discovery in a fresh Windows profile.
+$p,$temporary,$original = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadLine())).Split([char]0)
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
 $acl = [IO.Directory]::GetAccessControl($p,[Security.AccessControl.AccessControlSections]::Access)
 $acl.SetAccessRuleProtection($true,$false)
 foreach ($existing in @($acl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier]))) { $acl.RemoveAccessRuleSpecific($existing) }
-$rule = New-Object Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+$rule = [Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
 $acl.AddAccessRule($rule)
 [IO.Directory]::SetAccessControl($p,$acl)
-if ($job.original) {
+if ($original) {
   # Make the replacement inherit no broader rights than the existing file, even under a shared parent.
-  $saved = [IO.File]::GetAccessControl($job.original,[Security.AccessControl.AccessControlSections]::Access)
+  $saved = [IO.File]::GetAccessControl($original,[Security.AccessControl.AccessControlSections]::Access)
   $saved.SetAccessRuleProtection($true,$true)
-  [IO.File]::Open($job.temporary,[IO.FileMode]::CreateNew).Dispose()
-  [IO.File]::SetAccessControl($job.temporary,$saved)
+  [IO.File]::Open($temporary,[IO.FileMode]::CreateNew).Dispose()
+  [IO.File]::SetAccessControl($temporary,$saved)
 }
 `;
 function privateBackupFolder(dir, temporary, original) {
@@ -209,7 +209,7 @@ function restrictDirectory(dir, temporary, original) {
     const system = process.env.SystemRoot;
     if (!system || !path.isAbsolute(system)) throw new Error('Cannot secure the installer backup directory.');
     const result = spawnSync(path.join(system, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', secureWindowsDirectory],
-      { input: Buffer.from(JSON.stringify({ dir, temporary, original })).toString('base64'), windowsHide: true, timeout: 15000, stdio: ['pipe', 'ignore', 'ignore'] });
+      { input: Buffer.from([dir, temporary, original].join('\0')).toString('base64') + '\n', windowsHide: true, timeout: 15000, stdio: ['pipe', 'ignore', 'ignore'] });
     if (result.status !== 0) throw new Error('Cannot set a private Windows ACL on the installer backup directory. No settings were written.');
   } else fs.chmodSync(dir, 0o700);
 }

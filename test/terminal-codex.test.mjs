@@ -111,7 +111,8 @@ async function claudeCallerSetup(t, scenario, { entrypoint = 'cli' } = {}) {
   fs.writeFileSync(path.join(registryDir, `${record.pid}.${hash}.key`),
     JSON.stringify({ peerToken: '1'.repeat(32), [keyStartField]: processStart, pidDomain: record.pidDomain }));
   const processProbe = async pid => pid === process.pid ? { start: processStart } : { missing: true };
-  const context = { processProbe, env: { CLAUDE_CODEX_BRIDGE_STATE_DIR: daemon.stateDir, CLAUDE_CODEX_BRIDGE_REGISTRY_DIR: registryDir },
+  // The Codex route under test is local. Claude identity and sockets still use the actual OS.
+  const context = { platform: 'win32', processProbe, env: { CLAUDE_CODEX_BRIDGE_STATE_DIR: daemon.stateDir, CLAUDE_CODEX_BRIDGE_REGISTRY_DIR: registryDir },
     stateDir: daemon.stateDir, registryDir, parentPid: process.pid, daemon: daemon.daemon };
   return { ...daemon, registryDir, record, context };
 }
@@ -312,7 +313,7 @@ claudeTest('a terminal Codex caller can send to a Claude session and the notice 
   assert.deepEqual(history.deliveries.map(row => row.message), ['Hello from terminal.']);
   assert.equal(envelope.message.content.slice(envelope.message.content.indexOf('\n\n') + 2), 'Hello from terminal.\n</cross-session-message>', 'the entire delivered body is unchanged');
   assert.match(envelope.message.content, /From Codex terminal session/);
-  if (context.platform === 'win32' || (!context.platform && process.platform === 'win32')) assert.match(received.join(''), /reply transport unverified/);
+  assert.match(received.join(''), /reply transport unverified/);
 });
 
 claudeTest('listing returns terminal chats with a warning when Desktop is not registered', async t => {

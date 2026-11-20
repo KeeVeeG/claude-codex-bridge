@@ -128,6 +128,23 @@ test('an SSH failure does not fall back to a local daemon or Desktop that knows 
   local.assertUntouched();
 });
 
+test('doctor cancellation stops a stalled macOS SSH probe without trying a local catalog', mac, async t => {
+  const setup = await actor(t), peer = sshFixture({ silent: true }), controller = new AbortController();
+  const local = await localCandidates(t, setup);
+  const sshSpawn = (...args) => {
+    const child = peer.spawnImpl(...args);
+    child.stdin.once('data', () => queueMicrotask(() => controller.abort('private cancellation reason')));
+    return child;
+  };
+  await assert.rejects(executeBridgeTool('bridge_doctor', {}, { ...local.context, sshSpawn, signal: controller.signal }), error => {
+    assert.equal(error.name, 'AbortError');
+    assert.doesNotMatch(error.message, /private cancellation reason/);
+    return true;
+  });
+  assert.equal(peer.launches.length, 1);
+  local.assertUntouched();
+});
+
 test('configured SSH routes refuse explicit local transports before reserving a message', mac, async t => {
   const setup = await actor(t), fixture = sshFixture({ loaded: [targetId] });
   const local = await localCandidates(t, setup);

@@ -60,7 +60,8 @@ test('I03: installer follows the npm Codex shim to its native executable without
   const f = fixture(t); const bin = path.join(f.homeDir, 'bin');
   const exe = path.join(bin, 'node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe');
   fs.mkdirSync(path.dirname(exe), { recursive: true });
-  try { fs.linkSync(process.execPath, exe); } catch { fs.copyFileSync(process.execPath, exe); }
+  // Do not hard-link the running test engine: Windows can deny unlink of even its other name.
+  fs.copyFileSync(process.execPath, exe);
   fs.writeFileSync(path.join(bin, 'codex.cmd'), '@exit /b 89');
   // A disposable Node binary stands in for the native CLI. Only the add event is counted.
   const preload = path.join(bin, 'fixture.cjs'), mark = path.join(bin, 'add-count');

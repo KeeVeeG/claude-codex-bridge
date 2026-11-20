@@ -30,7 +30,8 @@ async function world(t) {
   const daemon = await fakeDaemon(t, { unreachable: true });
   const registryDir = path.join(daemon.root, 'claude-registry');
   fs.mkdirSync(registryDir);
-  const context = { processProbe, registryDir, stateDir: daemon.stateDir, daemon: daemon.daemon, parentPid: process.pid,
+  // The Codex route under test is local. Claude identity and sockets still use the actual OS.
+  const context = { platform: 'win32', processProbe, registryDir, stateDir: daemon.stateDir, daemon: daemon.daemon, parentPid: process.pid,
     env: { CLAUDE_CODEX_BRIDGE_STATE_DIR: daemon.stateDir, CLAUDE_CODEX_BRIDGE_REGISTRY_DIR: registryDir } };
   return { ...daemon, registryDir, context };
 }

@@ -456,7 +456,7 @@ test('unknown, malformed, completed, and initialization cancellations do not can
   assert.ok(signals.every(signal => !signal.aborted));
 });
 
-async function setupMcp(t, { envThreadId, entrypoint = 'claude-desktop', holdFirstNotification = false, rejectedContextIds = [], identityMode } = {}) {
+async function setupMcp(t, { envThreadId, entrypoint = 'claude-desktop', holdFirstNotification = false, rejectedContextIds = [], identityMode, server = serverPath } = {}) {
   const fixture = await nativeFixture(t);
   const claude = await mockPipe(t);
   const notifications = [];
@@ -520,7 +520,7 @@ async function setupMcp(t, { envThreadId, entrypoint = 'claude-desktop', holdFir
   };
   const probeFile = identityMode && path.join(fixture.root, 'process-proofs.json');
   const client = identityMode ? startIdentityMcp(t, env, { identityMode, probeFile, caller: 'codex', parentProxy: true })
-    : startMcp(t, env, { parentProxy: true });
+    : startMcp(t, env, { parentProxy: true, server });
   await initialize(client);
   return { ...fixture, registryDir, sessionId, token, claude, codex, notifications, catalogCalls, codexChats, env, client, probeFile,
     firstNotification, releaseFirstNotification() { releaseHeldNotification?.(); releaseHeldNotification = undefined; } };
@@ -646,7 +646,8 @@ test('a cached server checks its pinned installer stage and names the verified C
 });
 
 test('a rejected direct Desktop caller receives doctor registration advice through MCP', async t => {
-  const setup = await setupMcp(t, { rejectedContextIds: ['rejected-direct-context'] });
+  const server = fileURLToPath(new URL('./fixtures/local-desktop-mcp.mjs', import.meta.url));
+  const setup = await setupMcp(t, { rejectedContextIds: ['rejected-direct-context'], server });
   const response = await callTool(setup.client, 'list_codex_threads', {}, metadata('rejected-direct-context'));
   assert.equal(response.result.isError, true);
   assert.match(response.result.content[0].text, /could not complete the app tool request\. Run bridge_doctor from an open Desktop task\./);

@@ -135,7 +135,9 @@ const run = promisify(execFile);
 // warning, not an Effective Access check (deny ACEs and group expansion vary).
 const ACL_PROBE = `
 $ErrorActionPreference = 'Stop'
-$acl = Get-Acl -LiteralPath $env:BRIDGE_ACL_TARGET
+# Read only the DACL and owner. Do not load a provider module or translate account names.
+try { $acl = [IO.Directory]::GetAccessControl($env:BRIDGE_ACL_TARGET, [Security.AccessControl.AccessControlSections]'Access, Owner') }
+catch { exit 11 }
 $sid = [System.Security.Principal.SecurityIdentifier]
 $trusted = @([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18', 'S-1-5-32-544')
 $rootExists = $env:BRIDGE_ACL_PARENT -eq '0'
@@ -155,6 +157,7 @@ foreach ($ace in $acl.GetAccessRules($true, $true, $sid)) {
 export async function stateDirectoryPrivacyWarning(directory, { signal, timeoutMs = 2500 } = {}) {
   if (process.platform !== 'win32') return;
   const remedy = 'Use a private per-user state directory in both apps. Review Windows Properties > Security > Advanced (including inheritance and existing delivery files); stop both apps before moving state. The bridge does not change ACLs.';
+  let detail = 'The state path could not be resolved.';
   try {
     const root = path.resolve(directory);
     let target = root;
@@ -163,15 +166,20 @@ export async function stateDirectoryPrivacyWarning(directory, { signal, timeoutM
       if (parent === target) throw new Error('State parent not found');
       target = parent;
     }
+    const real = resolveStateDirectory(target);
+    detail = 'The Windows permissions probe did not complete.';
     const { stdout } = await run(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
       ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ACL_PROBE], {
-        env: { ...process.env, BRIDGE_ACL_TARGET: resolveStateDirectory(target), BRIDGE_ACL_PARENT: target === root ? '0' : '1' },
+        env: { ...process.env, BRIDGE_ACL_TARGET: real, BRIDGE_ACL_PARENT: target === root ? '0' : '1' },
         maxBuffer: 4096, timeout: timeoutMs, windowsHide: true, signal,
       });
     if (stdout.trim() === 'clear') return;
     if (stdout.trim() === 'review') return `The Windows state directory or its inherited permissions may grant other accounts access to plaintext delivery records. ${remedy}`;
-  } catch {
+    detail = 'The Windows permissions probe returned an unrecognized result.';
+  } catch (error) {
     if (signal?.aborted) throw signal.reason;
+    if (error.code === 11) detail = 'Windows could not read the directory security descriptor.';
+    else if (error.killed) detail = 'The Windows permissions probe timed out.';
   }
-  return `The bridge could not verify the Windows state directory's permissions. ${remedy}`;
+  return `The bridge could not verify the Windows state directory's permissions. ${detail} ${remedy}`;
 }

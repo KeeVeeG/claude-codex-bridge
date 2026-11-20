@@ -236,6 +236,16 @@ test('Windows privacy diagnostic warns on inherited read access without changing
   assert.match(warning, /may grant other accounts access.*private per-user/);
   assert.ok(!warning.includes(f.homeDir));
   assert.equal(spawnSync('icacls.exe', [directory], options).stdout, before.stdout);
+
+  // A real private DACL is clear; inability to inspect is not clear. Only the fixture changes the ACL.
+  const identity = spawnSync('whoami.exe', ['/user', '/fo', 'csv', '/nh'], options);
+  const sid = identity.stdout?.match(/"(S-1-[\d-]+)"\s*$/)?.[1];
+  assert.ok(identity.status === 0 && sid, 'could not identify the fixture owner');
+  const protect = spawnSync('icacls.exe', [directory, '/inheritance:r', '/grant:r', `*${sid}:(OI)(CI)(F)`], options);
+  assert.equal(protect.status, 0);
+  assert.equal(await probe(), undefined);
+  const file = path.join(directory, 'not-a-directory'); fs.writeFileSync(file, '');
+  assert.match(await stateDirectoryPrivacyWarning(file), /could not verify.*state path could not be resolved/i);
 });
 
 test('separate default trees block selection, but two aliases of one directory share it', t => {

@@ -39,9 +39,14 @@ function copySource(t) {
 }
 
 function isolatedEnv(directory) {
-  const env = Object.fromEntries(['SystemRoot', 'SystemDrive', 'WINDIR', 'COMSPEC', 'PATHEXT', 'PATH']
+  // Retain machine directories used by Windows PowerShell, not the user's clients, modules or profile.
+  const env = Object.fromEntries(['SystemRoot', 'SystemDrive', 'WINDIR', 'COMSPEC', 'PATHEXT', 'ProgramData',
+    'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'CommonProgramFiles', 'CommonProgramFiles(x86)', 'CommonProgramW6432']
     .filter(name => process.env[name]).map(name => [name, process.env[name]]));
-  return { ...env, USERPROFILE: directory, HOME: directory, LOCALAPPDATA: directory, APPDATA: directory,
+  const osBins = process.platform === 'win32' ? [path.join(env.SystemRoot, 'System32'),
+    path.join(env.SystemRoot, 'System32/WindowsPowerShell/v1.0')] : ['/usr/bin', '/bin'];
+  return { ...env, PATH: [path.dirname(process.execPath), ...osBins].join(path.delimiter),
+    USERPROFILE: directory, HOME: directory, LOCALAPPDATA: directory, APPDATA: directory,
     TMPDIR: directory, TEMP: directory, TMP: directory, CLAUDE_CONFIG_DIR: path.join(directory, 'claude'),
     CODEX_HOME: path.join(directory, 'codex'), CLAUDE_CODEX_BRIDGE_DAEMON: 'off' };
 }
@@ -441,6 +446,7 @@ test('the native archive installer stages an inline Claude server that starts fr
   const env = isolatedEnv(profile);
   const prepared = spawnSync(process.execPath, [path.join(unpacked, 'scripts/install.mjs'), '--claude', '--prepare-only'],
     { cwd: directory, env, encoding: 'utf8', timeout: 15_000, windowsHide: true });
+  assert.ifError(prepared.error);
   assert.equal(prepared.status, 0, prepared.stderr);
   const installed = path.join(profile, 'plugins', PLUGIN_NAME);
   assert.equal(fs.existsSync(path.join(installed, '.mcp.json')), false);

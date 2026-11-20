@@ -31,7 +31,8 @@ async function actor(t) {
   const hash = createHash('sha256').update(canonicalClaudeSocket(inbox.pipePath)).digest('hex');
   fs.writeFileSync(path.join(registryDir, `${process.pid}.${hash}.key`), JSON.stringify({ peerToken: 'a'.repeat(32),
     [process.platform === 'win32' ? 'procStartFt' : 'procStart']: start, pidDomain }));
-  const context = { stateDir, registryDir, parentPid: process.pid, processProbe: async () => ({ start }), env: {} };
+  // The Codex route under test is local. Claude identity and sockets still use the actual OS.
+  const context = { platform: 'win32', stateDir, registryDir, parentPid: process.pid, processProbe: async () => ({ start }), env: {} };
   return { context, inbox, sessionId };
 }
 

@@ -263,7 +263,7 @@ test('doctor cancellation stops a stalled catalog probe after registering the ca
   const fixture = await nativeFixture(t);
   const controller = new AbortController();
   const codex = await mockPipe(t, { framed: true, onMessage() { controller.abort('private cancellation reason'); } });
-  await assert.rejects(executeBridgeTool('bridge_doctor', {}, { env: { CODEX_APP_TOOLS_PIPE_PATH: codex.pipePath },
+  await assert.rejects(executeBridgeTool('bridge_doctor', {}, { platform: 'win32', env: { CODEX_APP_TOOLS_PIPE_PATH: codex.pipePath },
     metadata: { 'openai/threadId': 'doctor-context' }, stateDir: fixture.stateDir,
     registryDir: path.join(fixture.root, 'absent'), signal: controller.signal }), error => {
     assert.equal(error.name, 'AbortError');

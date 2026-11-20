@@ -16,7 +16,9 @@ childProcess.spawnSync = (command, args, options) => command === 'powershell.exe
 // Report the first actual failure of the real exclusive link, not merely entry
 // into a send. Also report any later acquisition of this lock after release.
 const { linkSync } = fs;
-const lockKey = file => path.toNamespacedPath(file).toLowerCase();
+// Compare the directory that holds the lock, including after its owner removes the file.
+// Runner TEMP may name it through an 8.3 path or junction instead of the resolved ledger root.
+const lockKey = file => path.join(fs.realpathSync.native(path.dirname(file)), path.basename(file));
 const heldLock = lockKey(process.env.FIXTURE_HELD_LOCK);
 let contending = false;
 fs.linkSync = (from, to) => {
