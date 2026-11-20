@@ -4,19 +4,14 @@ import net from 'node:net';
 import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { canonicalClaudeSocket, discoverClaudeSessions, resolveClaudeCaller, resolveClaudeSession } from '../lib/claude-sessions.mjs';
 import { getCodexHost, getCodexHosts, publishCodexHost } from '../lib/codex-host.mjs';
 import { mockPipe, nativeFixture } from './native-helpers.mjs';
 
 const windowsOnly = { skip: process.platform !== 'win32' && 'Native Claude Desktop process metadata is Windows-specific.' };
-const processStart = process.platform === 'win32'
-  ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${process.pid}).StartTime.ToFileTimeUtc().ToString()`], { encoding: 'utf8', windowsHide: true }).stdout.trim()
-  : process.platform === 'darwin'
-    ? spawnSync('/bin/ps', ['-o', 'lstart=', '-p', String(process.pid)],
-      { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' } }).stdout.trim()
-    : 'unsupported-process-token';
+const processStart = process.platform === 'win32' ? '133700000000000000' : 'Thu Oct  8 02:03:04 2026';
+const staleStart = 'Thu Oct  8 02:03:05 2026';
 const localEndpoint = name => process.platform === 'win32' ? `\\\\.\\pipe\\${name}` : `/tmp/${name}.sock`;
 
 async function callerFixture(t, entrypoint = 'claude-desktop') {
@@ -32,34 +27,36 @@ async function callerFixture(t, entrypoint = 'claude-desktop') {
   const keyPath = path.join(registryDir, `${record.pid}.${hash}.key`);
   const key = { peerToken: '1'.repeat(32), procStartFt: processStart, pidDomain: record.pidDomain };
   fs.writeFileSync(keyPath, JSON.stringify(key));
-  return { ...fixture, registryDir, record, socketPath, keyPath, key };
+  const starts = new Map([[process.pid, processStart]]);
+  const probe = async pid => starts.has(pid) ? { start: starts.get(pid) } : { missing: true };
+  return { ...fixture, registryDir, record, socketPath, keyPath, key, starts, probe };
 }
 
 test('Claude caller matches the exact direct parent and validates its current process identity', windowsOnly, async t => {
   const setup = await callerFixture(t);
-  const caller = resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid });
+  const caller = await resolveClaudeCaller({ registryDir: setup.registryDir, probe: setup.probe, parentPid: process.pid });
   assert.equal(caller.sessionId, setup.record.sessionId);
   assert.equal(caller.pid, process.pid);
   assert.equal(caller.socketPath, canonicalClaudeSocket(setup.socketPath));
   assert.equal(caller.token, setup.key.peerToken);
-  assert.throws(() => resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: 2_147_483_647 }), /Cannot identify/);
+  await assert.rejects(async () => resolveClaudeCaller({ registryDir: setup.registryDir, probe: setup.probe, parentPid: 2_147_483_647 }), /Cannot identify/);
   setup.key.procStartFt = '1';
   fs.writeFileSync(setup.keyPath, JSON.stringify(setup.key));
-  assert.throws(() => resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid }), /key does not match/);
+  await assert.rejects(async () => resolveClaudeCaller({ registryDir: setup.registryDir, probe: setup.probe, parentPid: process.pid }), /key does not match/);
 });
 
 test('terminal Claude Code sessions are discoverable and addressable like Desktop sessions', windowsOnly, async t => {
   const setup = await callerFixture(t, 'cli');
   const sessions = discoverClaudeSessions({ registryDir: setup.registryDir });
   assert.deepEqual(sessions.map(session => [session.sessionId, session.entrypoint]), [[setup.record.sessionId, 'cli']]);
-  const endpoint = resolveClaudeSession(setup.record.sessionId, { registryDir: setup.registryDir });
+  const endpoint = await resolveClaudeSession(setup.record.sessionId, { registryDir: setup.registryDir, probe: setup.probe });
   assert.equal(endpoint.socketPath, canonicalClaudeSocket(setup.socketPath));
   assert.equal(endpoint.token, setup.key.peerToken);
 });
 
 test('a terminal Claude Code caller is identified by its direct parent', windowsOnly, async t => {
   const setup = await callerFixture(t, 'cli');
-  const caller = resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid, socketPath: setup.socketPath });
+  const caller = await resolveClaudeCaller({ registryDir: setup.registryDir, probe: setup.probe, parentPid: process.pid, socketPath: setup.socketPath });
   assert.equal(caller.sessionId, setup.record.sessionId);
   assert.equal(caller.entrypoint, 'cli');
 });
@@ -67,33 +64,34 @@ test('a terminal Claude Code caller is identified by its direct parent', windows
 test('sessions from other Claude entrypoints are not addressable', windowsOnly, async t => {
   const setup = await callerFixture(t, 'unsupported-cli');
   assert.deepEqual(discoverClaudeSessions({ registryDir: setup.registryDir }), []);
-  assert.throws(() => resolveClaudeSession(setup.record.sessionId, { registryDir: setup.registryDir }), /unavailable or has no live inbox/);
-  assert.throws(() => resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid }), /Cannot identify/);
+  await assert.rejects(async () => resolveClaudeSession(setup.record.sessionId, { registryDir: setup.registryDir, probe: setup.probe }), /unavailable or has no live inbox/);
+  await assert.rejects(async () => resolveClaudeCaller({ registryDir: setup.registryDir, probe: setup.probe, parentPid: process.pid }), /not registered as a supported Claude Code client/);
 });
 
 test('Claude own socket must match its direct parent and cannot spoof another caller', windowsOnly, async t => {
   const setup = await callerFixture(t);
-  const caller = resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid,
+  const caller = await resolveClaudeCaller({ registryDir: setup.registryDir, probe: setup.probe, parentPid: process.pid,
     socketPath: setup.socketPath.toLowerCase() });
   assert.equal(caller.sessionId, setup.record.sessionId);
-  assert.throws(() => resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: 2_147_483_647,
+  await assert.rejects(async () => resolveClaudeCaller({ registryDir: setup.registryDir, probe: setup.probe, parentPid: 2_147_483_647,
     socketPath: setup.socketPath }), /Cannot identify/);
-  assert.throws(() => resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid,
-    socketPath: '\\\\.\\pipe\\not-this-session' }), /Cannot identify/);
-  assert.throws(() => resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid,
+  await assert.rejects(async () => resolveClaudeCaller({ registryDir: setup.registryDir, probe: setup.probe, parentPid: process.pid,
+    socketPath: '\\\\.\\pipe\\not-this-session' }), /exported to this bridge does not match/);
+  await assert.rejects(async () => resolveClaudeCaller({ registryDir: setup.registryDir, probe: setup.probe, parentPid: process.pid,
     socketPath: 'https://example.invalid' }), /invalid messaging socket/);
 });
 
 test('a different process claiming the same socket cannot change the direct parent identity', windowsOnly, async t => {
   const setup = await callerFixture(t);
+  setup.starts.set(process.ppid, '133700000000000001');
   fs.writeFileSync(path.join(setup.registryDir, `${process.ppid}.json`), JSON.stringify({
     ...setup.record, pid: process.ppid, sessionId: randomUUID(), procStart: '1',
   }));
-  const caller = resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid, socketPath: setup.socketPath });
+  const caller = await resolveClaudeCaller({ registryDir: setup.registryDir, probe: setup.probe, parentPid: process.pid, socketPath: setup.socketPath });
   assert.equal(caller.sessionId, setup.record.sessionId);
   assert.equal(caller.pid, process.pid);
-  assert.throws(() => resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.ppid,
-    socketPath: setup.socketPath }), /process identity changed|invalid creation metadata|key/);
+  await assert.rejects(async () => resolveClaudeCaller({ registryDir: setup.registryDir, probe: setup.probe, parentPid: process.ppid,
+    socketPath: setup.socketPath }), /does not match its running process/);
 });
 
 test('Codex host publication is atomic, survives publisher exit without an arbitrary expiry, and drops vanished endpoints', async t => {
@@ -197,21 +195,20 @@ test('Claude socket canonicalization accepts normalized absolute Unix paths off 
 
 test('macOS Claude inbox keys resolve only with the live UTC process token and local domain', { skip: process.platform !== 'darwin' }, async t => {
   const setup = await callerFixture(t);
-  const { resolveClaudeSession } = await import('../lib/claude-sessions.mjs');
   const record = { ...setup.record, entrypoint: 'claude-desktop', pidDomain: 'darwin', pid: process.pid };
   fs.writeFileSync(path.join(setup.registryDir, `${record.pid}.json`), JSON.stringify(record));
   const hash = createHash('sha256').update(canonicalClaudeSocket(record.messagingSocketPath)).digest('hex');
   const keyPath = path.join(setup.registryDir, `${record.pid}.${hash}.key`);
   fs.writeFileSync(keyPath, JSON.stringify({ peerToken: '2'.repeat(32), procStart: record.procStart, pidDomain: 'darwin' }));
-  assert.equal(resolveClaudeSession(record.sessionId, { registryDir: setup.registryDir }).token, '2'.repeat(32));
+  assert.equal((await resolveClaudeSession(record.sessionId, { registryDir: setup.registryDir, probe: setup.probe })).token, '2'.repeat(32));
   fs.writeFileSync(keyPath, JSON.stringify({ peerToken: '2'.repeat(32), procStart: 'other', pidDomain: 'darwin' }));
-  assert.throws(() => resolveClaudeSession(record.sessionId, { registryDir: setup.registryDir }), /key does not match/);
-  fs.writeFileSync(path.join(setup.registryDir, `${record.pid}.json`), JSON.stringify({ ...record, procStart: 'stale-start' }));
-  fs.writeFileSync(keyPath, JSON.stringify({ peerToken: '2'.repeat(32), procStart: 'stale-start', pidDomain: 'darwin' }));
-  assert.throws(() => resolveClaudeSession(record.sessionId, { registryDir: setup.registryDir }), /process identity changed/);
+  await assert.rejects(async () => resolveClaudeSession(record.sessionId, { registryDir: setup.registryDir, probe: setup.probe }), /key does not match/);
+  fs.writeFileSync(path.join(setup.registryDir, `${record.pid}.json`), JSON.stringify({ ...record, procStart: staleStart }));
+  fs.writeFileSync(keyPath, JSON.stringify({ peerToken: '2'.repeat(32), procStart: staleStart, pidDomain: 'darwin' }));
+  await assert.rejects(async () => resolveClaudeSession(record.sessionId, { registryDir: setup.registryDir, probe: setup.probe }), /does not match its running process/);
   fs.writeFileSync(path.join(setup.registryDir, `${record.pid}.json`), JSON.stringify({ ...record, pidDomain: 'linux' }));
   fs.writeFileSync(keyPath, JSON.stringify({ peerToken: '2'.repeat(32), procStart: record.procStart, pidDomain: 'linux' }));
-  assert.throws(() => resolveClaudeSession(record.sessionId, { registryDir: setup.registryDir }), /different process namespace/);
+  await assert.rejects(async () => resolveClaudeSession(record.sessionId, { registryDir: setup.registryDir, probe: setup.probe }), /registration for another computer/);
 });
 
 test('Codex host registry accepts an absolute Unix socket endpoint off Windows', { skip: process.platform === 'win32' }, async t => {

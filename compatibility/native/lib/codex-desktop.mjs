@@ -3,6 +3,9 @@
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { listSshCodexChats, sendSshCodex } from './codex-ssh.mjs';
+import { beforeWrite } from './call-time.mjs';
+import { markDeliveryUnknown, rpcReplyKind, unconfirmedReply } from './codex-daemon.mjs';
+import { failure } from './outcome.mjs';
 
 const maxFrameBytes = 8 * 1024 * 1024;
 export const MAX_CODEX_CHAT_LIMIT = 50;
@@ -29,6 +32,8 @@ function checkCancellation(signal) {
   if (signal?.aborted) throw cancelled();
 }
 
+// Class (b): one framed request to the local Desktop pipe. A submitted call is reported unconfirmed and
+// never repeated; discovery passes the sub-budgets in DESKTOP_TIMEOUTS (bridge-service) instead.
 function request(pipePath, method, params, { timeoutMs = 30000, mutating = false, signal } = {}) {
   checkCancellation(signal);
   requiredText(pipePath, 'Codex Desktop pipe path');
@@ -40,7 +45,7 @@ function request(pipePath, method, params, { timeoutMs = 30000, mutating = false
     let finished = false;
     let submitted = false;
     const timer = setTimeout(() => fail(Object.assign(new Error(submitted
-      ? 'Codex Desktop accepted the request but did not answer before the local request timeout.'
+      ? 'Codex Desktop did not answer before the local request timeout.'
       : 'Codex Desktop did not accept the connection before the local request timeout.'), { code: 'DESKTOP_TIMEOUT' })), timeoutMs);
 
     function finish(error, result) {
@@ -54,11 +59,12 @@ function request(pipePath, method, params, { timeoutMs = 30000, mutating = false
     }
 
     function fail(error) {
-      if (mutating && submitted) {
-        error.deliveryUnknown = true;
-        error.message += ' Delivery is uncertain; inspect the selected task before retrying.';
-      }
-      finish(error);
+      finish(mutating && submitted ? markDeliveryUnknown(error) : error);
+    }
+
+    function malformedReply(detail) {
+      finish(mutating && submitted ? unconfirmedReply('Codex Desktop', detail)
+        : failure(`Codex Desktop returned ${detail}.`, 'protocol_incompatible'));
     }
 
     function onAbort() { fail(cancelled()); }
@@ -68,6 +74,9 @@ function request(pipePath, method, params, { timeoutMs = 30000, mutating = false
     socket.on('connect', () => {
       if (finished) return;
       if (signal?.aborted) { onAbort(); return; }
+      if (mutating) {
+        try { beforeWrite(signal); } catch (error) { fail(error); return; }
+      }
       submitted = true;
       socket.write(frame);
     });
@@ -89,7 +98,7 @@ function request(pipePath, method, params, { timeoutMs = 30000, mutating = false
       while (!finished && pending.length >= 4) {
         const length = pending.readUInt32LE(0);
         if (length === 0 || length > maxFrameBytes) {
-          fail(new Error('Codex Desktop returned an invalid frame length.'));
+          malformedReply('an invalid frame length');
           return;
         }
         if (pending.length < length + 4) return;
@@ -97,29 +106,28 @@ function request(pipePath, method, params, { timeoutMs = 30000, mutating = false
         pending = pending.subarray(length + 4);
         let response;
         try {
-          response = JSON.parse(payload.toString('utf8'));
+          response = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(payload));
         } catch {
-          fail(new Error('Codex Desktop returned an invalid JSON response.'));
+          malformedReply('an invalid JSON response');
           return;
         }
         if (!response || typeof response !== 'object' || Array.isArray(response)) {
-          fail(new Error('Codex Desktop returned an invalid response.'));
+          malformedReply('an invalid response');
           return;
         }
-        if (String(response.id) !== String(id)) continue;
-        if (response.error) {
-          const detail = String(response.error.message ?? 'request rejected');
-          const error = new Error(`Codex Desktop: ${detail}`);
-          error.code = response.error.code;
-          if (mutating && detail !== 'Invalid app tool request') {
-            error.deliveryUnknown = true;
-            error.message += ' Delivery is uncertain; inspect the selected task before retrying.';
-          }
-          finish(error);
-        } else if (Object.hasOwn(response, 'result')) {
+        // A server request can reuse our numeric ID without answering this call.
+        if (Object.hasOwn(response, 'method') || response.id !== id) continue;
+        const kind = rpcReplyKind(response, true);
+        if (kind === 'error') {
+          const { code, message } = response.error;
+          const reason = code === -32602 && message === 'Invalid app tool request' ? 'request_rejected'
+            : code === -32601 ? 'protocol_incompatible' : 'internal_error';
+          finish(mutating && submitted && reason === 'internal_error' ? unconfirmedReply('Codex Desktop')
+            : failure(`Codex Desktop: ${message}`, reason, { code }));
+        } else if (kind === 'result') {
           finish(null, response.result);
         } else {
-          fail(new Error('Codex Desktop response has neither a result nor an error.'));
+          malformedReply('a malformed response');
         }
       }
     });
@@ -128,8 +136,22 @@ function request(pipePath, method, params, { timeoutMs = 30000, mutating = false
 
 export async function listCodexTools(pipePath, { signal, timeoutMs = 10000 } = {}) {
   const result = await request(pipePath, 'tools/list', { threadStartKind: 'all' }, { timeoutMs, signal });
-  if (!result || !Array.isArray(result.tools)) throw new Error('Codex Desktop returned no app-tools catalog.');
+  if (!Array.isArray(result.tools) || result.tools.some(tool => typeof tool?.name !== 'string')) {
+    throw failure('Codex Desktop returned no usable app-tools catalog.', 'protocol_incompatible');
+  }
   return result.tools;
+}
+
+function appToolResult(result) {
+  if (typeof result.success !== 'boolean' || !Array.isArray(result.contentItems)) return false;
+  return result.contentItems.every(item => {
+    switch (item?.type) {
+      case 'inputText': return typeof item.text === 'string';
+      case 'inputImage': return typeof item.imageUrl === 'string';
+      case 'inputAudio': return typeof item.audioUrl === 'string';
+      default: return false;
+    }
+  });
 }
 
 /** Discover actual local Codex chats through the running Desktop app. */
@@ -139,8 +161,10 @@ async function listNativeCodexChats({ pipePath, contextThreadId, limit = 30, sig
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_CODEX_CHAT_LIMIT) {
     throw new Error(`limit must be between 1 and ${MAX_CODEX_CHAT_LIMIT}`);
   }
-  const tool = (catalog ?? await listCodexTools(pipePath, { signal, timeoutMs })).find(item => item.name === 'list_threads');
-  if (!tool?.namespace) throw new Error('This Codex Desktop version does not expose chat discovery');
+  const tool = (catalog ?? await listCodexTools(pipePath, { signal, timeoutMs })).find(item => item?.name === 'list_threads');
+  if (typeof tool?.namespace !== 'string' || !tool.namespace) {
+    throw failure('This Codex Desktop version does not expose chat discovery', 'protocol_incompatible');
+  }
   const result = await request(pipePath, 'tools/call', {
     arguments: { limit }, callerSource: 'codex', namespace: tool.namespace, tool: tool.name,
     threadId: contextThreadId, callId: `bridge-list-${randomUUID()}`, turnId: `bridge-list-${randomUUID()}`,
@@ -151,9 +175,7 @@ async function listNativeCodexChats({ pipePath, contextThreadId, limit = 30, sig
     }
     throw error;
   });
-  if (!result || typeof result.success !== 'boolean' || !Array.isArray(result.contentItems)) {
-    throw new Error('Codex Desktop returned an unsupported chat discovery result');
-  }
+  if (!appToolResult(result)) throw failure('Codex Desktop returned an unsupported chat discovery result', 'protocol_incompatible');
   if (!result.success) {
     const detail = result.contentItems
       .filter(item => item.type === 'inputText' && typeof item.text === 'string')
@@ -190,13 +212,13 @@ async function sendNativeToCodex({ pipePath, contextThreadId, threadId, message,
   requiredText(contextThreadId, 'Registered Codex context task id');
   requiredText(threadId, 'Selected Codex task id');
   requiredText(message, 'Message');
-  const tool = (catalog ?? await listCodexTools(pipePath, { signal })).find(item => item.name === 'send_message_to_thread');
-  if (!tool || typeof tool.namespace !== 'string' || !tool.namespace) {
-    throw new Error('This Codex Desktop version does not expose send_message_to_thread.');
+  const tool = (catalog ?? await listCodexTools(pipePath, { signal })).find(item => item?.name === 'send_message_to_thread');
+  if (typeof tool?.namespace !== 'string' || !tool.namespace) {
+    throw failure('This Codex Desktop version does not expose send_message_to_thread.', 'protocol_incompatible');
   }
   const schema = tool.inputSchema;
-  if (!schema?.properties?.threadId || !schema?.properties?.prompt) {
-    throw new Error('The installed Codex Desktop message tool has an unsupported input schema.');
+  if (schema?.properties?.threadId?.type !== 'string' || schema?.properties?.prompt?.type !== 'string') {
+    throw failure('The installed Codex Desktop message tool has an unsupported input schema.', 'protocol_incompatible');
   }
   const result = await request(pipePath, 'tools/call', {
     arguments: { threadId, prompt: message },
@@ -207,18 +229,9 @@ async function sendNativeToCodex({ pipePath, contextThreadId, threadId, message,
     tool: tool.name,
     turnId: turnId ?? `bridge-turn-${randomUUID()}`,
   }, { timeoutMs: 30000, mutating: true, signal });
-  if (!result || typeof result.success !== 'boolean' || !Array.isArray(result.contentItems)) {
-    const error = new Error('Codex Desktop returned an unsupported result. Inspect the selected task before retrying.');
-    error.deliveryUnknown = true;
-    throw error;
-  }
-  if (!result.success) {
-    const text = result.contentItems
-      .filter(item => item.type === 'inputText' && typeof item.text === 'string')
-      .map(item => item.text).join('\n');
-    const error = new Error(`Codex Desktop rejected the message${text ? `: ${text.slice(0, 2000)}` : '.'} Delivery is uncertain; inspect the selected task before retrying.`);
-    error.deliveryUnknown = true;
-    throw error;
+  if (!appToolResult(result) || !result.success) {
+    // An unsuccessful tool result does not prove the prompt was refused before acceptance.
+    throw unconfirmedReply('Codex Desktop');
   }
   return result;
 }

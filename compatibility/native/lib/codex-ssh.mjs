@@ -3,7 +3,10 @@
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
-import { normalizeCodexThreadId } from './codex-daemon.mjs';
+import { appServerError, appServerWriteError, markDeliveryUnknown, normalizeCodexThreadId, rpcReplyKind,
+  startedTurnId, unconfirmedReply } from './codex-daemon.mjs';
+import { beforeWrite } from './call-time.mjs';
+import { failure } from './outcome.mjs';
 
 const runtimeVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
@@ -24,15 +27,6 @@ function cancellation() {
 }
 
 function check(signal) { if (signal?.aborted) throw cancellation(); }
-
-const UNCERTAIN_NOTICE = 'Delivery is uncertain; inspect the selected chat before retrying.';
-
-function markUnknown(error) {
-  error.deliveryUnknown = true;
-  // MCP exposes error.message, so the text must preserve the delivery state too.
-  if (!error.message.includes(UNCERTAIN_NOTICE)) error.message += ` ${UNCERTAIN_NOTICE}`;
-  return error;
-}
 
 function text(value, name, limit = 65536) {
   if (typeof value !== 'string' || !value.trim() || Buffer.byteLength(value) > limit) {
@@ -60,6 +54,7 @@ function clientFrame(payload, opcode = 1) {
 }
 
 class SshRpc {
+  // Class (b): one SSH session including its connection; a written turn is never repeated.
   constructor({ sshHostAlias, signal, spawnImpl = spawn, timeoutMs = 30000 }) {
     check(signal);
     const alias = validateSshHostAlias(sshHostAlias);
@@ -74,7 +69,7 @@ class SshRpc {
     this.accept = createHash('sha1').update(this.nonce + GUID).digest('base64');
     this.abort = () => this.fail(cancellation());
     signal?.addEventListener('abort', this.abort, { once: true });
-    this.timer = setTimeout(() => this.fail(new Error('Codex SSH request timeout. Inspect delivery before retrying.')), timeoutMs);
+    this.timer = setTimeout(() => this.fail(failure('Codex SSH request timeout; the route could not be verified in time.', 'route_unverified')), timeoutMs);
     try {
       this.child = spawnImpl('/usr/bin/ssh', ['-T', '-oBatchMode=yes', '-oStrictHostKeyChecking=yes',
         '-oConnectTimeout=5', '--', alias, 'exec "$SHELL" -lc \'exec codex app-server proxy\''],
@@ -145,20 +140,25 @@ class SshRpc {
       if (this.fragmentBytes > MAX_MESSAGE) throw new Error('Codex SSH fragmented response exceeds the transport limit.');
       this.fragments.push(payload);
       if (fin) {
-        const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(this.fragments)));
+        let value;
+        try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(this.fragments))); }
+        catch { /* handled as a malformed response below */ }
         this.fragments = []; this.fragmentBytes = 0; this.fragmenting = false;
-        if (!object(value)) throw new Error('Invalid Codex SSH JSON-RPC response.');
+        if (!object(value)) throw failure('Invalid Codex SSH JSON-RPC response.', 'protocol_incompatible');
         // Each peer owns its request-ID namespace. A server request may have the
         // same ID as our pending call, but can never acknowledge that call.
         if (Object.hasOwn(value, 'method')) continue;
         const call = this.calls.get(value.id);
         if (!call) continue; // Notifications and unrelated responses are not approvals.
         this.calls.delete(value.id);
-        if (value.error || !Object.hasOwn(value, 'result')) {
-          const error = new Error(`Codex SSH request rejected: ${String(value.error?.message || 'unsupported response').slice(0, 300)}`);
-          if (call.mutating && call.written) markUnknown(error);
-          call.reject(error);
-        } else call.resolve(value.result);
+        const kind = rpcReplyKind(value);
+        const written = call.mutating && call.written;
+        if (kind === 'error') {
+          const error = appServerError('Codex SSH', value.error);
+          call.reject(written ? appServerWriteError('Codex SSH', error) : error);
+        } else if (kind === 'result') call.resolve(value.result);
+        else call.reject(written ? unconfirmedReply('Codex SSH', 'malformed response')
+          : failure('Invalid Codex SSH JSON-RPC response.', 'protocol_incompatible'));
       }
     }
   }
@@ -171,7 +171,7 @@ class SshRpc {
     return new Promise((resolve, reject) => {
       const call = { resolve, reject, mutating, written: false };
       this.calls.set(id, call);
-      try { check(this.signal); call.written = true; this.child.stdin.write(bytes); }
+      try { check(this.signal); if (mutating) beforeWrite(this.signal); call.written = true; this.child.stdin.write(bytes); }
       catch (error) { this.fail(error); }
     });
   }
@@ -182,9 +182,12 @@ class SshRpc {
     if (this.closed) return;
     this.rejectReady(error);
     for (const call of this.calls.values()) {
-      const failure = Object.assign(new Error(error.message), { name: error.name, code: error.code });
-      if (call.mutating && call.written) markUnknown(failure);
-      call.reject(failure);
+      const copy = Object.assign(new Error(error.message), { name: error.name, code: error.code, reason: error.reason });
+      if (call.mutating && call.written) {
+        if (error.reason === 'protocol_incompatible') unconfirmedReply('Codex SSH', 'malformed response', copy);
+        else markDeliveryUnknown(copy);
+      }
+      call.reject(copy);
     }
     this.calls.clear(); this.close();
   }
@@ -200,8 +203,11 @@ async function connected(options) {
   const rpc = new SshRpc(options);
   try {
     await rpc.ready;
-    await rpc.request('initialize', { clientInfo: { name: 'claude-codex-bridge',
+    const result = await rpc.request('initialize', { clientInfo: { name: 'claude-codex-bridge',
       title: 'Claude–Codex Bridge', version: runtimeVersion } });
+    if (typeof result.userAgent !== 'string' || !result.userAgent) {
+      throw failure('Codex SSH returned an unsupported initialize result.', 'protocol_incompatible');
+    }
     rpc.notify('initialized'); return rpc;
   } catch (error) { rpc.close(); throw error; }
 }
@@ -209,7 +215,7 @@ async function connected(options) {
 function target(result, threadId) {
   if (!object(result?.thread) || normalizeCodexThreadId(result.thread.id) !== threadId ||
       !object(result.thread.status) || !['idle', 'active', 'notLoaded', 'systemError'].includes(result.thread.status.type)) {
-    throw new Error('Codex SSH returned an unsupported target thread.');
+    throw failure('Codex SSH returned an unsupported target thread.', 'protocol_incompatible');
   }
   return result.thread;
 }
@@ -232,7 +238,7 @@ export async function listSshCodexChats(options = {}) {
   const rpc = await connected(options);
   try {
     const loaded = await rpc.request('thread/loaded/list', {});
-    if (!Array.isArray(loaded?.data)) throw new Error('Unsupported Codex SSH loaded-thread catalog.');
+    if (!Array.isArray(loaded.data)) throw failure('Unsupported Codex SSH loaded-thread catalog.', 'protocol_incompatible');
     const ids = [...new Set(loaded.data.map(selectedThreadId))];
     const chats = [];
     for (const id of ids.slice(0, limit)) {
@@ -252,13 +258,13 @@ export async function sendSshCodex(options = {}) {
   const rpc = await connected(options);
   try {
     const read = await rpc.request('thread/read', { threadId, includeTurns: false });
-    if (target(read, threadId).status.type !== 'idle') throw new Error('Open the target on the configured SSH host in Codex Desktop; it must be loaded and idle before sending.');
+    const status = target(read, threadId).status.type;
+    if (status !== 'idle') throw failure('Open the target on the configured SSH host in Codex Desktop; it must be loaded and idle before sending.',
+      status === 'active' ? 'target_busy' : 'target_unavailable');
     // Input to an already-loaded thread needs no subscription. Resuming here
     // could load a conversation closed after the read and hydrate its history.
-    const result = await rpc.request('turn/start', { threadId, input: [{ type: 'text', text: message }] }, true);
-    if (!object(result?.turn) || typeof result.turn.id !== 'string' || !result.turn.id) {
-      throw markUnknown(new Error('Codex SSH returned an unsupported send receipt.'));
-    }
-    return { transport: 'ssh-app-server', turnId: result.turn.id, threadId };
+    const turnId = startedTurnId(await rpc.request('turn/start', { threadId, input: [{ type: 'text', text: message }] }, true));
+    if (!turnId) throw unconfirmedReply('Codex SSH', 'unsupported turn/start receipt');
+    return { transport: 'ssh-app-server', turnId, threadId };
   } finally { rpc.close(); }
 }

@@ -8,7 +8,7 @@ import { sshFixture } from './ssh-helpers.mjs';
 
 const options = fixture => ({ sshHostAlias: 'codex-test-host', threadId: 'target-thread',
   message: 'Report with unicode ✅\nand a newline', spawnImpl: fixture.spawnImpl, timeoutMs: 1000 });
-const uncertaintyNotice = 'Delivery is uncertain; inspect the selected chat before retrying.';
+const uncertaintyNotice = 'The message may already have arrived.';
 
 function assertUnknown(error) {
   assert.equal(error.deliveryUnknown, true);
@@ -178,7 +178,7 @@ test('SSH cancellation after turn transmission is uncertain and is not resent', 
 
 test('SSH times out a silent handshake and cleans up its subprocess', async () => {
   const fixture = sshFixture({ silent: true });
-  await assert.rejects(sendToCodex({ ...options(fixture), timeoutMs: 30 }), /timeout/);
+  await assert.rejects(sendToCodex({ ...options(fixture), timeoutMs: 30 }), error => error.reason === 'route_unverified' && /timeout/.test(error.message));
   assert.ok(fixture.children[0].stdin.destroyed);
   assert.equal(fixture.requests.length, 0);
 });

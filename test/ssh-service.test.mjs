@@ -5,7 +5,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
 import { executeBridgeTool } from '../lib/bridge-service.mjs';
 import { canonicalClaudeSocket } from '../lib/claude-sessions.mjs';
 import { publishCodexHost } from '../lib/codex-host.mjs';
@@ -16,17 +15,13 @@ import { sshFixture } from './ssh-helpers.mjs';
 
 const mac = { skip: !['win32', 'darwin'].includes(process.platform) && 'Requires native Windows or macOS caller identity.' };
 const targetId = '01a13000-abcd-7000-8000-000000000001';
-let processStart;
+const processStart = process.platform === 'win32' ? '133700000000000000' : 'Thu Oct  8 02:03:04 2026';
 
 async function actor(t, { alias = 'codex-test-host', platform = 'darwin' } = {}) {
   const setup = await nativeFixture(t), sessionId = randomUUID();
   const registryDir = path.join(setup.root, 'sessions'); fs.mkdirSync(registryDir);
   const windows = process.platform === 'win32';
   const socketPath = windows ? `\\\\.\\pipe\\LOCAL\\cc-msg-${randomUUID().replaceAll('-', '')}` : `/tmp/bridge-caller-${randomUUID()}.sock`;
-  processStart ??= windows
-    ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-      `(Get-Process -Id ${process.pid}).StartTime.ToFileTimeUtc().ToString()`], { encoding: 'utf8', windowsHide: true }).stdout.trim()
-    : spawnSync('ps', ['-p', String(process.pid), '-o', 'lstart='], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' } }).stdout.trim();
   const pidDomain = windows ? `win32:${os.hostname().toLowerCase()}` : 'darwin';
   fs.writeFileSync(path.join(registryDir, `${process.pid}.json`), JSON.stringify({ pid: process.pid,
     sessionId, entrypoint: 'claude-desktop', procStart: processStart, pidDomain, messagingSocketPath: socketPath,
@@ -34,8 +29,8 @@ async function actor(t, { alias = 'codex-test-host', platform = 'darwin' } = {})
   const hash = createHash('sha256').update(canonicalClaudeSocket(socketPath)).digest('hex');
   fs.writeFileSync(path.join(registryDir, `${process.pid}.${hash}.key`), JSON.stringify({ peerToken: '1'.repeat(32), pidDomain,
     ...(windows ? { procStartFt: processStart } : { procStart: processStart }) }));
-  // Only routing is injected. Caller identity still uses the actual OS, process and native registry.
-  return { ...setup, sessionId, context: { platform, registryDir, stateDir: setup.stateDir, parentPid: process.pid,
+  const processProbe = async pid => pid === process.pid ? { start: processStart } : { missing: true };
+  return { ...setup, sessionId, context: { platform, registryDir, stateDir: setup.stateDir, parentPid: process.pid, processProbe,
     env: { CLAUDE_CODE_MESSAGING_SOCKET: socketPath, ...(alias ? { CLAUDE_CODEX_BRIDGE_SSH_HOST: alias } : {}) } } };
 }
 

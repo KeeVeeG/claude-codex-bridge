@@ -57,7 +57,7 @@ test('Claude transport failure never leaks the session token', async t => {
   const token = `do-not-print-${randomUUID()}`;
   await assert.rejects(sendToClaude({ socketPath: pipe.pipePath, token, message: 'undeliverable' }), error => {
     assert.doesNotMatch(error.message, new RegExp(token));
-    assert.match(error.message, /Cannot write|closed/);
+    assert.match(error.message, /Cannot connect|Cannot write|closed/);
     return true;
   });
 });

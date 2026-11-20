@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { codexIdentity, executeBridgeTool } from './bridge-service.mjs';
 import { sendToCodex } from './codex-desktop.mjs';
 import { publicDelivery } from './delivery.mjs';
+import { REASONS, errorOutcome, failure, outcome } from './outcome.mjs';
 import { defaultStateDir, getSession, readSession, processAlive, withStateLock } from './store.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -152,15 +153,33 @@ function originalMessage(stateDir, route, id) {
     record.route?.to?.kind === 'claude' && record.route.to.id === route.to.id) || null;
 }
 
-function resultFor(args, route, record, message, submittedDelivery) {
+function primaryOutcome(args, record, { fresh, error }) {
+  const saved = { id: args.message_id, status: record.send_status };
+  if (record.send_status === 'submitted') return outcome(fresh ? 'submitted' : 'already_submitted', { record: saved });
+  if (record.send_status === 'sending') return outcome('in_flight', { record: saved });
+  if (record.send_status === 'uncertain') return outcome(fresh ? 'delivery_unconfirmed' : 'prior_uncertain', { record: saved });
+  return outcome(record.send_reason ?? (fresh && error ? errorOutcome(error).reason : 'prior_failed'), { record: saved });
+}
+
+function noticeOutcome(record) {
+  if (record.notice_reason === 'settlement_failed') return outcome('settlement_failed');
+  if (record.notice_status === 'submitted') return outcome('submitted');
+  if (record.notice_status === 'failed') return outcome(record.notice_reason ?? 'request_rejected', { retry: record.notice_retryable ? 'same_id' : 'inspect' });
+  if (record.notice_status === 'uncertain') return outcome('delivery_unconfirmed');
+  return record.notice_attempted ? outcome('in_flight') : undefined;
+}
+
+function resultFor(args, route, record, message, submittedDelivery, { fresh = false, error } = {}) {
   const delivery = submittedDelivery || publicDelivery(message || {
     id: args.message_id, route, message: args.message,
     createdAt: record.createdAt, updatedAt: record.updatedAt, status: record.send_status,
   });
+  const notice = noticeOutcome(record);
   return { delivery: { ...delivery, status: record.send_status,
     ...(record.error ? { error: record.error } : {}), manual: true }, manual: true,
   notice_status: record.notice_status, notice_retryable: record.notice_retryable === true,
-  ...(record.notice_error ? { notice_error: record.notice_error } : {}) };
+  ...(record.notice_error ? { notice_error: record.notice_error } : {}),
+  outcome: primaryOutcome(args, record, { fresh, error }), ...(notice ? { notice_outcome: notice } : {}) };
 }
 
 function noticeText(args) {
@@ -176,17 +195,27 @@ async function submitNotice(args, context, identity, paths, key) {
     noticeSubmitted = true;
     return updateLedger(paths, ledger => {
       const saved = ledger.records[key]; saved.notice_status = 'submitted'; saved.notice_retryable = false;
-      delete saved.notice_error; saved.updatedAt = Date.now();
+      delete saved.notice_error; delete saved.notice_reason; saved.updatedAt = Date.now();
       return { ...saved };
     });
   } catch (error) {
-    return updateLedger(paths, ledger => {
-      const saved = ledger.records[key];
-      saved.notice_status = noticeSubmitted || error.deliveryUnknown ? 'uncertain' : 'failed';
-      saved.notice_retryable = saved.notice_status === 'failed';
-      saved.notice_error = error instanceof Error ? error.message : 'The Codex owner notice failed.'; saved.updatedAt = Date.now();
-      return { ...saved };
-    });
+    const notice = noticeSubmitted ? outcome('settlement_failed') : errorOutcome(error);
+    try {
+      return updateLedger(paths, ledger => {
+        const saved = ledger.records[key];
+        saved.notice_status = notice.delivered === false ? 'failed' : 'uncertain';
+        saved.notice_retryable = saved.notice_status === 'failed';
+        saved.notice_reason = notice.reason;
+        saved.notice_error = error instanceof Error ? error.message : 'The Codex owner notice failed.'; saved.updatedAt = Date.now();
+        return { ...saved };
+      });
+    } catch {
+      // A record failure cannot undo either transport's acceptance. Keep the two answers distinct.
+      throw Object.assign(new Error('The Claude message was submitted. The owner notice record could not be saved. Do not repeat the message; inspect the owning Codex conversation.'), {
+        outcome: outcome('submitted', { record: { id: args.message_id, status: 'submitted' } }),
+        notice_outcome: notice.delivered === false ? { ...notice, retry: 'inspect' } : notice,
+      });
+    }
   }
 }
 
@@ -203,6 +232,19 @@ function owningCodexContext(context) {
  * Neither the Claude send nor the native owner notice is retried automatically.
  */
 export async function manualSend(args, context = {}) {
+  const progress = {};
+  try { return await doManualSend(args, context, progress); } catch (error) {
+    if (!progress.primary || error.outcome) throw error;
+    // The primary operation is over. A subsequent shadow read, save or notice claim cannot change it.
+    throw Object.assign(new Error(progress.primary.delivered === true
+      ? 'The Claude message was submitted. The panel record could not be saved. Do not repeat the message; inspect the owning Codex conversation.'
+      : 'The panel record could not be saved. Inspect the delivery record and receiving conversation before sending again.'),
+    { outcome: progress.primary.delivered === false ? { ...progress.primary, retry: 'inspect' } : progress.primary,
+      notice_outcome: outcome('state_unavailable', { retry: 'inspect' }) });
+  }
+}
+
+async function doManualSend(args, context, progress) {
   checkCancellation(context.signal);
   if (!object(args) || Object.keys(args).some(key => !['session_id', 'message', 'message_id'].includes(key))) {
     throw new Error('Manual send accepts only session_id, message, and message_id.');
@@ -216,19 +258,32 @@ export async function manualSend(args, context = {}) {
   const paths = ledgerPaths(stateDir, identity.threadId);
   let message = originalMessage(stateDir, route, args.message_id);
   if (message && message.fingerprint !== fingerprint) {
-    throw new Error('This manual message_id already belongs to another recipient or message text.');
+    throw failure('This manual message_id already belongs to another recipient or message text.', 'id_conflict', { record: message });
   }
   if (message && message.manual !== true && message.origin !== 'manual') {
-    throw new Error('This message_id was already used outside the manual interface. Choose a new message_id.');
+    // Never advise a new ID from an origin conflict alone: the automatic send may have arrived (E02).
+    throw failure(`This message_id was already used by an automatic send (status: ${message.status}). Check that delivery with list_deliveries before sending again; use a new message_id only for a deliberately new message.`,
+      'id_conflict', { record: message });
   }
+  if (message?.status === 'submitted') progress.primary = outcome('already_submitted', { record: message });
   const key = recordKey(args.session_id, args.message_id);
   const reservation = updateLedger(paths, ledger => {
     let record = ledger.records[key];
     if (record) {
       if (record.session_id !== args.session_id || record.fingerprint !== fingerprint) {
-        throw new Error('This manual message_id already belongs to another recipient or message text.');
+        throw failure('This manual message_id already belongs to another recipient or message text.', 'id_conflict');
       }
-      if (record.send_status === 'sending') {
+      // Re-arm only an exact, durably unwritten attempt. Old shadow and primary failures do not
+      // establish that, so they remain inspect-only. The decision and reset share the shadow lock.
+      if (record.send_status === 'failed' && !record.notice_attempted &&
+          ['after_fix', 'same_id'].includes(REASONS[record.send_reason]?.retry) && REASONS[record.send_reason].delivered === false &&
+          (!message || (message.status === 'failed' && REASONS[message.reason]?.delivered === false))) {
+        Object.assign(record, { send_status: 'sending', sender_pid: process.pid, createdAt: Date.now(), updatedAt: Date.now() });
+        delete record.error; delete record.send_reason;
+        return { created: true, record: { ...record } };
+      }
+      // The primary record is authoritative: a submitted one settles a shadow left sending or uncertain (Q02).
+      if (record.send_status === 'sending' || (record.send_status === 'uncertain' && message?.status === 'submitted')) {
         if (message && ['submitted', 'failed', 'uncertain'].includes(message.status)) record.send_status = message.status;
         else if (interrupted(record)) record.send_status = 'uncertain';
       }
@@ -248,27 +303,38 @@ export async function manualSend(args, context = {}) {
   });
   let record = reservation.record;
   let submittedDelivery;
+  const fresh = reservation.created;
   if (reservation.created) {
     try {
       const submitted = await executeBridgeTool('send_to_claude', args, { ...context, stateDir, manual: true });
       submittedDelivery = submitted.delivery;
+      progress.primary = submitted.outcome;
       if (submittedDelivery?.status !== 'submitted') throw Object.assign(new Error('Manual Claude send returned an unsupported outcome.'), { deliveryUnknown: true });
       record = updateLedger(paths, ledger => {
         const saved = ledger.records[key]; saved.send_status = 'submitted'; saved.updatedAt = Date.now();
         return { ...saved };
       });
     } catch (error) {
+      progress.primary ??= errorOutcome(error);
+      const delivered = progress.primary.delivered;
       message = originalMessage(stateDir, route, args.message_id);
       record = updateLedger(paths, ledger => {
         const saved = ledger.records[key];
-        saved.send_status = error.deliveryUnknown ? 'uncertain' : message?.status === 'submitted' ? 'submitted' : 'failed';
-        saved.error = error instanceof Error ? error.message : 'Manual Claude send failed.'; saved.updatedAt = Date.now();
+        // Known submission wins over a later settlement error (R01, Q02); a possible write stays uncertain.
+        saved.send_status = delivered === true || message?.status === 'submitted' ? 'submitted'
+          : delivered === 'unknown' ? 'uncertain' : 'failed';
+        if (saved.send_status === 'failed') saved.send_reason = progress.primary.reason;
+        if (saved.send_status !== 'submitted') saved.error = error instanceof Error ? error.message : 'Manual Claude send failed.';
+        saved.updatedAt = Date.now();
         return { ...saved };
       });
-      return resultFor(args, route, record, message ? { ...message, status: record.send_status } : null);
+      if (record.send_status !== 'submitted') {
+        return resultFor(args, route, record, message ? { ...message, status: record.send_status } : null, undefined, { fresh, error });
+      }
     }
   }
-  if (record.send_status !== 'submitted') return resultFor(args, route, record, message, submittedDelivery);
+  if (record.send_status !== 'submitted') return resultFor(args, route, record, message, submittedDelivery, { fresh });
+  progress.primary = primaryOutcome(args, record, { fresh });
   const claim = updateLedger(paths, ledger => {
     const saved = ledger.records[key];
     if (saved.notice_status !== 'pending' || saved.notice_attempted) return { claimed: false, record: { ...saved } };
@@ -276,9 +342,9 @@ export async function manualSend(args, context = {}) {
     return { claimed: true, record: { ...saved } };
   });
   record = claim.record;
-  if (!claim.claimed) return resultFor(args, route, record, message, submittedDelivery);
+  if (!claim.claimed) return resultFor(args, route, record, message, submittedDelivery, { fresh });
   record = await submitNotice(args, context, identity, paths, key);
-  return resultFor(args, route, record, message, submittedDelivery);
+  return resultFor(args, route, record, message, submittedDelivery, { fresh });
 }
 
 /** Explicit human retry after a definite owner-notice rejection. The original

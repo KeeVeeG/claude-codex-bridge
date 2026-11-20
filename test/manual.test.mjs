@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { manualSend, retryManualNotice, readManualRecords } from '../lib/manual-service.mjs';
 import { executeBridgeTool } from '../lib/bridge-service.mjs';
 import { nativeFixture, mockPipe, encodeFrame, messageTool } from './native-helpers.mjs';
@@ -12,8 +12,7 @@ import { nativeFixture, mockPipe, encodeFrame, messageTool } from './native-help
 const windowsOnly = { skip: process.platform !== 'win32' && 'Manual native messaging requires verified Windows Desktop sessions.' };
 const hash = value => createHash('sha256').update(value).digest('hex');
 const recordKey = args => hash(JSON.stringify([args.session_id, args.message_id]));
-const processStart = process.platform === 'win32' ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-  `(Get-Process -Id ${process.pid}).StartTime.ToFileTimeUtc().ToString()`], { encoding: 'utf8', windowsHide: true }).stdout.trim() : '1';
+const processStart = '133700000000000000';
 
 async function setup(t, { noticeFailure, onNotice } = {}) {
   const fixture = await nativeFixture(t);
@@ -44,10 +43,12 @@ async function setup(t, { noticeFailure, onNotice } = {}) {
   const owner = 'manual-owner-task';
   const env = { CODEX_APP_TOOLS_PIPE_PATH: codex.pipePath, CODEX_THREAD_ID: 'untrusted-startup-thread',
     CLAUDE_CODEX_BRIDGE_STATE_DIR: fixture.stateDir, CLAUDE_CODEX_BRIDGE_REGISTRY_DIR: registryDir };
-  const context = { env, metadata: { 'x-codex-turn-metadata': { thread_id: owner } } };
+  const starts = new Map([[process.pid, processStart]]);
+  const processProbe = async pid => starts.has(pid) ? { start: starts.get(pid) } : { missing: true };
+  const context = { env, processProbe, metadata: { 'x-codex-turn-metadata': { thread_id: owner } } };
   const args = { session_id: sessionId, message: 'Full user text: Unicode 🦊\nSecond line.', message_id: 'manual-fixture-one' };
   const ledgerFile = path.join(fixture.stateDir, 'manual', hash(owner), 'state.json');
-  return { ...fixture, claude, codex, notices, failureMode, registryDir, keyPath, owner, args, context, ledgerFile };
+  return { ...fixture, claude, codex, notices, failureMode, registryDir, keyPath, owner, args, context, ledgerFile, starts };
 }
 
 const userFrames = claude => claude.messages.filter(entry => entry.message.type === 'user');
@@ -119,7 +120,7 @@ test('manual interface rejects source spoofing, unverified callers, Claude calle
   assert.equal(fs.existsSync(path.join(fixture.stateDir, 'manual')), false);
 });
 
-test('failed Claude resolution produces an honest failed result with no owner notice and no retry on the same ID', windowsOnly, async t => {
+test('failed Claude resolution produces an honest failed result with no owner notice until fixed', windowsOnly, async t => {
   const fixture = await setup(t);
   fs.unlinkSync(fixture.keyPath);
   const failed = await manualSend(fixture.args, fixture.context);
@@ -168,6 +169,7 @@ test('a posted owner notice whose local receipt cannot be saved becomes uncertai
   assert.equal(injected, true);
   assert.equal(first.delivery.status, 'submitted');
   assert.equal(first.notice_status, 'uncertain');
+  assert.deepEqual(first.notice_outcome, { delivered: true, retry: 'no', reason: 'settlement_failed' });
   assert.equal((await manualSend(fixture.args, fixture.context)).notice_status, 'uncertain');
   assert.equal(userFrames(fixture.claude).length, 1);
   assert.equal(fixture.notices.length, 1);
@@ -207,7 +209,7 @@ test('read-only supplementary history isolates owner records and reports abandon
 test('manual and automatic messages cannot relabel or reuse one another sending origin', windowsOnly, async t => {
   const fixture = await setup(t);
   await executeBridgeTool('send_to_claude', fixture.args, fixture.context);
-  await assert.rejects(manualSend(fixture.args, fixture.context), /outside the manual interface/);
+  await assert.rejects(manualSend(fixture.args, fixture.context), /already used by an automatic send \(status: submitted\)\. Check that delivery with list_deliveries/);
   const manualArgs = { ...fixture.args, message_id: 'different-manual-id' };
   await manualSend(manualArgs, fixture.context);
   await assert.rejects(executeBridgeTool('send_to_claude', manualArgs, fixture.context), /different sending origin/);
@@ -223,8 +225,8 @@ test('one verified owner can manually send the same ID independently to exact De
   await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   t.after(async () => { child.kill(); await exit; });
   const secondSessionId = randomUUID();
-  const start = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    `(Get-Process -Id ${child.pid}).StartTime.ToFileTimeUtc().ToString()`], { encoding: 'utf8', windowsHide: true }).stdout.trim();
+  const start = '133700000000000001';
+  fixture.starts.set(child.pid, start);
   const pidDomain = `win32:${os.hostname().toLowerCase()}`;
   fs.writeFileSync(path.join(fixture.registryDir, `${child.pid}.json`), JSON.stringify({
     pid: child.pid, sessionId: secondSessionId, name: 'Second manual recipient', cwd: fixture.cwd,

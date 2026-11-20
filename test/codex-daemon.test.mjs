@@ -120,7 +120,7 @@ test('a connection lost after a mutating request was written is delivery-unknown
   const connection = await openDaemon({ ...setup.daemon });
   t.after(() => connection.close());
   await assert.rejects(() => connection.request('turn/start', { threadId: 'x' }, { mutating: true }),
-    error => error.deliveryUnknown === true && /uncertain/.test(error.message));
+    error => error.deliveryUnknown === true && /may already have arrived/.test(error.message));
 });
 
 import { listTerminalThreads, normalizeCodexThreadId, readTerminalThread, sendToTerminalThread } from '../lib/codex-daemon.mjs';
@@ -284,7 +284,7 @@ test('error classification: proven pre-acceptance rejections fail cleanly, every
   const unknown = await fakeDaemon(t, { threads, errors: { 'turn/start': { code: -32603, message: 'internal error' } } });
   connection = await openDaemon({ ...unknown.daemon });
   await assert.rejects(() => sendToTerminalThread(connection, { threadId: 'term-1', text: 'x', messageId: 'm' }),
-    error => error.deliveryUnknown === true && /uncertain/.test(error.message));
+    error => error.deliveryUnknown === true && /may already have arrived/.test(error.message));
   connection.close();
   const dropped = await fakeDaemon(t, { threads, dropAfter: 'turn/start' });
   connection = await openDaemon({ ...dropped.daemon });
@@ -403,7 +403,7 @@ test('a stale steer cannot start a turn when the reread returns a different or u
       assert.fail(`Unexpected mutation: ${method}`);
     } };
     await assert.rejects(() => sendToTerminalThread(connection, { threadId: 'selected', text: 'x', messageId: 'm' }),
-      error => /different thread|changed turns/.test(error.message) && !error.deliveryUnknown);
+      error => /different thread|changed turns|unsupported thread read/.test(error.message) && !error.deliveryUnknown);
     assert.equal(reads, 2);
     assert.equal(calls.filter(entry => entry.method === 'turn/steer').length, 1);
     assert.equal(calls.some(entry => entry.method === 'turn/start'), false);
@@ -506,7 +506,7 @@ test('queueToTerminalThread classifies outcomes: clean failures versus uncertain
   for (const mode of ['fail', 'garbage', 'wrongthread']) {
     const setup = await fakeQueue(t, { mode });
     await assert.rejects(() => queueToTerminalThread({ threadId: QUEUE_TARGET_ID, text: 'x', ...setup.queue }),
-      error => error.deliveryUnknown === true && /Delivery is uncertain/.test(error.message), mode);
+      error => error.deliveryUnknown === true && /may already have arrived/.test(error.message), mode);
   }
 });
 

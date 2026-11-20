@@ -5,7 +5,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
-import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { canonicalClaudeSocket } from '../lib/claude-sessions.mjs';
 import { executeBridgeTool, shouldReportTerminalUnavailable } from '../lib/bridge-service.mjs';
@@ -94,18 +93,7 @@ const claudeTest = (name, run) => test(name,
   { skip: !nativeIdentitySupported && 'Verified native Claude process identity supports Windows and macOS.' }, run);
 const processDomain = process.platform === 'win32' ? `win32:${os.hostname().toLowerCase()}` : 'darwin';
 const keyStartField = process.platform === 'win32' ? 'procStartFt' : 'procStart';
-function readProcessStart() {
-  if (!nativeIdentitySupported) return 'unsupported-fixture-process';
-  const result = process.platform === 'win32'
-    ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-      `(Get-Process -Id ${process.pid}).StartTime.ToFileTimeUtc().ToString()`], { encoding: 'utf8', windowsHide: true })
-    : spawnSync('/bin/ps', ['-o', 'lstart=', '-p', String(process.pid)],
-      { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' } });
-  assert.equal(result.status, 0, `Cannot read fixture process creation time: ${result.error ?? result.stderr}`);
-  assert.ok(result.stdout.trim());
-  return result.stdout.trim();
-}
-const processStart = readProcessStart();
+const processStart = process.platform === 'win32' ? '133700000000000000' : 'Thu Oct  8 02:03:04 2026';
 
 async function claudeCallerSetup(t, scenario, { entrypoint = 'cli' } = {}) {
   const daemon = await fakeDaemon(t, scenario);
@@ -120,7 +108,8 @@ async function claudeCallerSetup(t, scenario, { entrypoint = 'cli' } = {}) {
   const hash = createHash('sha256').update(canonicalClaudeSocket(socketPath)).digest('hex');
   fs.writeFileSync(path.join(registryDir, `${record.pid}.${hash}.key`),
     JSON.stringify({ peerToken: '1'.repeat(32), [keyStartField]: processStart, pidDomain: record.pidDomain }));
-  const context = { env: { CLAUDE_CODEX_BRIDGE_STATE_DIR: daemon.stateDir, CLAUDE_CODEX_BRIDGE_REGISTRY_DIR: registryDir },
+  const processProbe = async pid => pid === process.pid ? { start: processStart } : { missing: true };
+  const context = { processProbe, env: { CLAUDE_CODEX_BRIDGE_STATE_DIR: daemon.stateDir, CLAUDE_CODEX_BRIDGE_REGISTRY_DIR: registryDir },
     stateDir: daemon.stateDir, registryDir, parentPid: process.pid, daemon: daemon.daemon };
   return { ...daemon, registryDir, record, context };
 }
@@ -204,13 +193,14 @@ claudeTest('a pre-aborted send contacts no daemon and records no message', async
 });
 
 /** A registered Codex Desktop app that lists `threads` and accepts sends. */
-async function desktopApp(t, setup, threads, { dropSend = false } = {}) {
+async function desktopApp(t, setup, threads, { dropSend = false, beforeListReply } = {}) {
   const listTool = { name: 'list_threads', namespace: 'codex_app', inputSchema: { type: 'object', properties: { limit: { type: 'integer' } } } };
   const sent = [];
   const answer = (socket, id, result) => socket.write(encodeFrame({ jsonrpc: '2.0', id, result }));
   const app = await mockPipe(t, { framed: true, onMessage(message, socket) {
     if (message.method === 'tools/list') return answer(socket, message.id, { tools: [messageTool, listTool] });
     if (message.params.tool === 'list_threads') {
+      beforeListReply?.();
       const listing = { threads: threads.map(thread => ({ kind: 'codex', ...thread })) };
       return answer(socket, message.id, { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(listing) }] });
     }
@@ -274,8 +264,12 @@ claudeTest('listing preserves Desktop entries on overlap and includes daemon-onl
   const setup = await claudeCallerSetup(t, { threads: [{ id: 'shared', originator: 'codex-tui', name: 'Shared' },
     { id: 'desk-a', originator: 'Codex Desktop' }, { id: 'term-b', originator: 'codex-tui', name: 'Terminal B' },
     { id: 'resumed-desktop', originator: 'Codex Desktop', name: 'Resumed from Desktop' }] });
-  await desktopApp(t, setup, [{ id: 'desk-a', title: 'Desktop A' }, { id: 'shared', title: 'Shared in Desktop' }]);
-  const result = await executeBridgeTool('list_codex_threads', {}, setup.context);
+  const order = [];
+  const daemon = { ...setup.daemon, get command() { order.push('daemon opened'); return setup.daemon.command; } };
+  await desktopApp(t, setup, [{ id: 'desk-a', title: 'Desktop A' }, { id: 'shared', title: 'Shared in Desktop' }],
+    { beforeListReply: () => order.push('Desktop answered') });
+  const result = await executeBridgeTool('list_codex_threads', {}, { ...setup.context, daemon });
+  assert.deepEqual(order, ['daemon opened', 'Desktop answered'], 'the daemon query starts without waiting for Desktop (O03)');
   assert.deepEqual(result.warnings, []);
   assert.deepEqual(result.threads.map(chat => [chat.thread_id, chat.source]), [['desk-a', 'desktop'], ['shared', 'desktop'], ['term-b', 'terminal'], ['resumed-desktop', 'terminal']]);
   assert.equal(result.threads.find(chat => chat.thread_id === 'shared').title, 'Shared in Desktop');
@@ -304,7 +298,7 @@ claudeTest('a terminal Codex caller can send to a Claude session and the notice 
   });
   await new Promise(resolve => server.listen(claude.record.messagingSocketPath, resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
-  const context = { env: claude.context.env, stateDir: claude.stateDir, registryDir: claude.registryDir, daemon: claude.daemon, metadata: terminalMeta(codexThread) };
+  const context = { ...claude.context, metadata: terminalMeta(codexThread) };
   const result = await executeBridgeTool('send_to_claude', { session_id: claude.record.sessionId, message: 'Hello from terminal.', message_id: 'm-6' }, context);
   assert.equal(result.delivery.status, 'submitted');
   await new Promise(resolve => setTimeout(resolve, 100));
@@ -560,6 +554,39 @@ claudeTest('auto routing never switches to queue when a loaded session unloads b
   assert.deepEqual(desktop.sent(), []);
   const status = await executeBridgeTool('list_deliveries', {}, setup.context);
   assert.equal(status.deliveries.find(message => message.message_id === 'unloaded-race').status, 'failed');
+});
+
+claudeTest('explicit terminal delivery still queues when the daemon stops between routing and the write (Q03)', async t => {
+  const threadId = randomUUID();
+  const setup = await claudeCallerSetup(t, { threads: [{ id: threadId, originator: 'codex-tui' }], reachableConnections: 1, exitAfterFirst: 'thread/read' });
+  const queue = await fakeQueue(t);
+  const result = await executeBridgeTool('send_to_codex', { thread_id: threadId, transport: 'terminal', message: 'hello', message_id: 'q03' },
+    { ...setup.context, queue: queue.queue });
+  assert.equal(result.delivery.status, 'submitted');
+  assert.equal(storedDelivery(setup.stateDir, result.delivery).receipt.method, 'queue');
+  assert.equal(setup.requests().some(entry => entry.method === 'turn/start' || entry.method === 'turn/steer'), false);
+  assert.equal(queue.queueCalls().length, 1);
+});
+
+claudeTest('a send to a loaded terminal session reuses its routing connection and still rereads the thread (O02)', async t => {
+  const threadId = randomUUID();
+  const setup = await claudeCallerSetup(t, { threads: [{ id: threadId, originator: 'codex-tui' }] });
+  const result = await executeBridgeTool('send_to_codex', { thread_id: threadId, message: 'hello', message_id: 'o02' }, setup.context);
+  assert.equal(result.delivery.status, 'submitted');
+  const methods = setup.requests().map(entry => entry.method);
+  assert.equal(methods.filter(method => method === 'initialize').length, 1, 'one proxy connection for routing and sending');
+  assert.equal(methods.filter(method => method === 'thread/read').length, 2);
+  assert.equal(methods.filter(method => method === 'turn/start').length, 1);
+});
+
+claudeTest('a routing connection lost before the send is replaced by a fresh one before anything is written (O02)', async t => {
+  const threadId = randomUUID();
+  const setup = await claudeCallerSetup(t, { threads: [{ id: threadId, originator: 'codex-tui' }], exitAfterFirst: 'thread/read' });
+  const result = await executeBridgeTool('send_to_codex', { thread_id: threadId, message: 'hello', message_id: 'o02-lost' }, setup.context);
+  assert.equal(result.delivery.status, 'submitted');
+  const methods = setup.requests().map(entry => entry.method);
+  assert.equal(methods.filter(method => method === 'initialize').length, 2);
+  assert.equal(methods.filter(method => method === 'turn/start').length, 1);
 });
 
 claudeTest('explicit terminal delivery uses queue when the daemon is unavailable without falling back to Desktop', async t => {

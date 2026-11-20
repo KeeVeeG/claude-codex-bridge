@@ -11,7 +11,9 @@ import test from 'node:test';
 import { runMcpServer, TOOLS } from '../scripts/mcp.mjs';
 import { createSession, getSession, readSession, updateSession, recordMessage, finishMessage } from '../lib/store.mjs';
 import { nativeFixture, mockPipe, encodeFrame, messageTool } from './native-helpers.mjs';
+import { CALL_DEADLINE_MS, WRITE_RESERVE_MS } from '../lib/call-time.mjs';
 
+const childWaitMs = CALL_DEADLINE_MS + WRITE_RESERVE_MS;
 const serverPath = fileURLToPath(new URL('../scripts/mcp.mjs', import.meta.url));
 const processStart = process.platform === 'win32'
   ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${process.pid}).StartTime.ToFileTimeUtc().ToString()`], { encoding: 'utf8', windowsHide: true }).stdout.trim()
@@ -20,8 +22,12 @@ const windowsOnly = { skip: process.platform !== 'win32' && 'Native Claude regis
 const metadata = threadId => ({ 'x-codex-turn-metadata': { thread_id: threadId } });
 
 function startMcp(t, env = {}, { parentProxy = false, server = serverPath } = {}) {
-  const childEnv = { ...process.env, CLAUDE_CODEX_BRIDGE_DAEMON: 'off' };
-  for (const name of ['CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CODEX_APP_TOOLS_PIPE_PATH', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN']) delete childEnv[name];
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-mcp-child-'));
+  const childEnv = { ...process.env, CLAUDE_CODEX_BRIDGE_DAEMON: 'off',
+    CLAUDE_CODEX_BRIDGE_STATE_DIR: path.join(temp, 'state'), CLAUDE_CODEX_BRIDGE_REGISTRY_DIR: path.join(temp, 'registry'),
+    CLAUDE_CONFIG_DIR: path.join(temp, 'claude'), CODEX_HOME: path.join(temp, 'codex') };
+  for (const name of ['CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CODEX_APP_TOOLS_PIPE_PATH', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN',
+    'CLAUDE_CODEX_BRIDGE_SSH_HOST', 'CLAUDE_CODEX_BRIDGE_CODEX_BIN']) delete childEnv[name];
   Object.assign(childEnv, env);
   const args = parentProxy
     ? ['-e', 'const {spawn}=require("node:child_process"); const child=spawn(process.execPath,[process.argv[1]],{stdio:"inherit",windowsHide:true}); child.on("exit",code=>process.exit(code??1));', serverPath]
@@ -64,7 +70,8 @@ function startMcp(t, env = {}, { parentProxy = false, server = serverPath } = {}
     pending.clear();
   }
   child.on('error', rejectPending);
-  child.on('exit', (code, signal) => rejectPending(new Error(`MCP exited (${code ?? signal}): ${stderr}`)));
+  child.on('close', (code, signal) => rejectPending(new Error(`MCP exited (${code ?? signal}): ${stderr}`)));
+  child.stdin.on('error', rejectPending);
   function notify(method, params = {}) {
     if (stopped) throw stopped;
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`);
@@ -76,7 +83,7 @@ function startMcp(t, env = {}, { parentProxy = false, server = serverPath } = {}
       const timer = setTimeout(() => {
         pending.delete(id);
         reject(new Error(`MCP ${method} timed out: ${stderr}`));
-      }, 15_000);
+      }, childWaitMs);
       pending.set(id, { resolve, reject, timer });
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
     });
@@ -84,12 +91,15 @@ function startMcp(t, env = {}, { parentProxy = false, server = serverPath } = {}
   const close = async () => {
     if (child.exitCode !== null || child.signalCode !== null) return;
     await new Promise(resolve => {
-      const timer = setTimeout(() => { child.kill(); resolve(); }, 2000);
-      child.once('exit', () => { clearTimeout(timer); resolve(); });
+      const timer = setTimeout(() => child.kill(), WRITE_RESERVE_MS);
+      child.once('close', () => { clearTimeout(timer); resolve(); });
       child.stdin.end();
     });
   };
-  t.after(close);
+  t.after(async () => {
+    await close();
+    fs.rmSync(temp, { recursive: true, force: true });
+  });
   t.after(() => assert.deepEqual(invalidLines, [], 'MCP stdout must contain protocol JSON only'));
   return { rpc, notify, close, messages, stderr: () => stderr, child };
 }
@@ -152,7 +162,7 @@ function memoryMcp(t, executor) {
       waiting.get(response.id)?.(response);
     }
   });
-  const done = runMcpServer({ input, output, executor, env: {} });
+  const done = runMcpServer({ input, output, executor, env: { CLAUDE_CONFIG_DIR: path.join(os.tmpdir(), randomUUID()) } });
   t.after(async () => {
     input.end();
     const timer = setTimeout(() => input.emit('error', new Error('Test teardown')), 2000);
@@ -257,7 +267,12 @@ test('list_codex_threads warnings reach text-only and structured clients in the 
   await initialize(failing);
   const failure = (await callTool(failing, 'list_codex_threads', {})).result;
   assert.equal(failure.isError, true);
-  assert.equal(failure.content.length, 1);
+  // D03: the first block keeps the 1.0 text; a second carries only the outcome JSON, mirrored in _meta.
+  assert.equal(failure.content.length, 2);
+  assert.equal(failure.content[0].text, 'Codex Desktop unavailable: x');
+  const machine = JSON.parse(failure.content[1].text);
+  assert.deepEqual(machine, { outcome: { delivered: false, retry: 'after_fix', reason: 'internal_error' } });
+  assert.deepEqual(failure._meta['bridge-claude-codex/outcome'], machine);
 });
 
 test('list_claude_sessions output schema accepts terminal Claude Code sessions and rejects unknown entrypoints', () => {
@@ -337,11 +352,12 @@ test('queued MCP cancellation never calls executor and keeps numeric and string 
   t.after(() => release());
   const client = memoryMcp(t, async (name, args, context) => {
     calls.push({ name, args, signal: context.signal });
-    if (name === 'list_claude_sessions') { started(); await held; return { sessions: [] }; }
+    if (name === 'send_to_codex') { started(); await held; }
     return {};
   });
   await initialize(client);
-  client.write({ id: 'held', method: 'tools/call', params: { name: 'list_claude_sessions' } });
+  client.write({ id: 'held', method: 'tools/call', params: { name: 'send_to_codex',
+    arguments: { thread_id: 'recipient', message: 'Hold the send queue.' } } });
   await firstStarted;
   for (const id of ['123', 123]) client.write({ id, method: 'tools/call', params: {
     name: 'send_to_claude', arguments: { session_id: 'recipient', message: String(id) },
@@ -377,6 +393,7 @@ test('running MCP cancellation aborts executor promptly and suppresses its respo
   assert.deepEqual((await client.rpc('ping')).result, {}, 'ping must respond while the executor is pending');
   assert.equal(signal.aborted, false);
   client.notify('notifications/cancelled', { requestId: 'running', reason: 'User cancelled.' });
+  assert.deepEqual((await client.rpc('ping')).result, {});
   assert.equal(signal.aborted, true);
   assert.deepEqual(toolValue(await callTool(client, 'list_claude_sessions')), { sessions: [] });
   assert.equal(client.messages.some(response => response.id === 'running'), false);
@@ -561,6 +578,7 @@ test('a server started through a folder link keeps the code it started with when
   fs.writeFileSync(manifest, JSON.stringify({ version: '99.0.0' }));
   const diagnostics = toolValue(await callTool(client, 'bridge_doctor'));
   assert.equal(diagnostics.plugin_version, running);
+  assert.deepEqual(diagnostics.issues.find(issue => issue.check === 'plugin_version'), { check: 'plugin_version', status: 'warning', reason: 'version_mismatch' });
   assert.match(diagnostics.checks.find(check => check.name === 'plugin_version').detail, /99\.0\.0 is installed, but this server still runs/);
 });
 
@@ -587,6 +605,32 @@ test('Codex MCP startup refreshes a previous host after restart without a startu
   assert.equal(host.threadId, 'previous-real-task');
   assert.equal(host.pid, client.child.pid);
 });
+
+for (const defect of ['unwritable state', 'malformed host registry']) {
+  test(`MCP child initializes despite ${defect} and reports it through the doctor`, async t => {
+    const fixture = await nativeFixture(t);
+    const pipe = await mockPipe(t, { framed: true, onMessage(message, socket) {
+      const result = message.method === 'tools/list' ? { tools: [{ name: 'list_threads', namespace: 'codex_app',
+        inputSchema: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 50 } } } }] }
+        : { success: true, contentItems: [{ type: 'inputText', text: '{"threads":[],"pinnedThreads":[]}' }] };
+      socket.write(encodeFrame({ jsonrpc: '2.0', id: message.id, result }));
+    } });
+    const stateDir = defect === 'unwritable state' ? path.join(fixture.root, 'not-a-directory') : fixture.stateDir;
+    if (defect === 'unwritable state') fs.writeFileSync(stateDir, 'Cannot publish beneath a regular file.');
+    else {
+      fs.mkdirSync(stateDir);
+      fs.writeFileSync(path.join(stateDir, 'codex-host.json'), '{bad json');
+    }
+    const client = startMcp(t, { CLAUDE_CODEX_BRIDGE_STATE_DIR: stateDir, CODEX_APP_TOOLS_PIPE_PATH: pipe.pipePath,
+      // No startup task in the malformed-registry case: even looking up an old context must not break init.
+      ...(defect === 'unwritable state' ? { CODEX_THREAD_ID: 'fixture-task' } : {}) });
+    await initialize(client);
+    assert.deepEqual((await client.rpc('ping')).result, {}, 'the child is still processing requests');
+    const doctor = toolValue(await callTool(client, 'bridge_doctor', {}, metadata('fixture-task')));
+    assert.equal(doctor.checks.find(check => check.name === 'codex_registration')?.status, 'fail');
+    assert.equal(client.stderr(), '');
+  });
+}
 
 test('Claude ignores inherited Codex routing variables and does not replace its host', windowsOnly, async t => {
   const setup = await setupMcp(t);
@@ -923,8 +967,7 @@ test('an unregistered parent cannot impersonate Claude by supplying its socket p
 test('an in-flight send from one Claude session does not block another session with the same message ID', windowsOnly, async t => {
   const setup = await setupMcp(t, { holdFirstNotification: true });
   const peerA = startMcp(t, claudeEnv(setup));
-  const peerATwin = startMcp(t, claudeEnv(setup));
-  await Promise.all([initialize(peerA), initialize(peerATwin)]);
+  await initialize(peerA);
   const claudeB = await mockPipe(t);
   const peerB = startMcp(t, claudeEnv(setup), { parentProxy: true });
   const sessionB = registerClaudeParent(setup, peerB.child.pid, claudeB.pipePath);
@@ -944,9 +987,8 @@ test('an in-flight send from one Claude session does not block another session w
   assert.match(setup.notifications[0].arguments.prompt, new RegExp(setup.sessionId));
   assert.match(setup.notifications[1].arguments.prompt, new RegExp(sessionB));
 
-  // MCP requests are serialized per process. A second process of the same
-  // verified caller can inspect the ledger while the first send is pending.
-  const statusAInFlight = toolValue(await callTool(peerATwin, 'list_deliveries'));
+  // The same MCP process can inspect its ledger while the first send is pending.
+  const statusAInFlight = toolValue(await callTool(peerA, 'list_deliveries'));
   const statusBDone = toolValue(await callTool(peerB, 'list_deliveries'));
   assert.equal(statusAInFlight.deliveries.length, 1);
   assert.equal(statusAInFlight.deliveries[0].status, 'sending');

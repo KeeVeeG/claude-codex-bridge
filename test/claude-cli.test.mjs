@@ -4,7 +4,6 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import test from 'node:test';
 import { canonicalClaudeSocket, discoverClaudeSessions, resolveClaudeCaller, resolveClaudeSession, sendToClaude } from '../lib/claude-sessions.mjs';
@@ -13,16 +12,8 @@ import { mockPipe, nativeFixture } from './native-helpers.mjs';
 const nativeIdentityOnly = { skip: !['win32', 'darwin'].includes(process.platform) && 'Verified native Claude process identity supports Windows and macOS.' };
 const processDomain = process.platform === 'win32' ? `win32:${os.hostname().toLowerCase()}` : 'darwin';
 const keyStartField = process.platform === 'win32' ? 'procStartFt' : 'procStart';
-function readProcessStart(pid) {
-  if (!['win32', 'darwin'].includes(process.platform)) return 'unsupported-fixture-process';
-  const result = process.platform === 'win32'
-    ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${pid}).StartTime.ToFileTimeUtc().ToString()`], { encoding: 'utf8', windowsHide: true })
-    : spawnSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' } });
-  assert.equal(result.status, 0, `Cannot read fixture process creation time: ${result.error ?? result.stderr}`);
-  assert.ok(result.stdout.trim());
-  return result.stdout.trim();
-}
-const processStart = readProcessStart(process.pid);
+const processStart = process.platform === 'win32' ? '133700000000000000' : 'Thu Oct  8 02:03:04 2026';
+const otherStart = process.platform === 'win32' ? '133700000000000001' : 'Thu Oct  8 02:03:05 2026';
 const socketName = () => process.platform === 'win32'
   ? `\\\\.\\pipe\\LOCAL\\cc-msg-${randomUUID().replaceAll('-', '')}`
   : `/tmp/cc-msg-${randomUUID()}.sock`;
@@ -45,7 +36,11 @@ async function fixture(t, { entrypoint = 'cli', socketPath } = {}) {
     Object.assign(record, values);
     fs.writeFileSync(recordPath, JSON.stringify(record));
   };
-  return { ...setup, registryDir, record, recordPath, socketPath, keyPath, key, rewrite };
+  const starts = new Map([[process.pid, processStart]]);
+  const probe = async pid => starts.has(pid) ? { start: starts.get(pid) } : { missing: true };
+  const resolve = (sessionId = record.sessionId) => resolveClaudeSession(sessionId, { registryDir, probe });
+  const caller = options => resolveClaudeCaller({ registryDir, parentPid: process.pid, probe, ...options });
+  return { ...setup, registryDir, record, recordPath, socketPath, keyPath, key, rewrite, starts, probe, resolve, caller };
 }
 
 function onOpen(t, callback) {
@@ -78,8 +73,8 @@ test('Claude discovery rejects unknown entrypoints even with a live parent and v
   for (const entrypoint of ['sdk', 'CLI', 'claude-desktop-other', '', null]) {
     setup.rewrite({ entrypoint });
     assert.deepEqual(discoverClaudeSessions({ registryDir: setup.registryDir }), []);
-    assert.throws(() => resolveClaudeSession(setup.record.sessionId, { registryDir: setup.registryDir }), /unavailable/);
-    assert.throws(() => resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid }), /Cannot identify/);
+    await assert.rejects(async () => setup.resolve(), /unavailable/);
+    await assert.rejects(async () => setup.caller(), /not registered as a supported Claude Code client/);
   }
 });
 
@@ -87,17 +82,15 @@ test('Claude CLI and SDK CLI callers require their exact direct parent and match
   for (const entrypoint of ['cli', 'sdk-cli']) {
     await t.test(entrypoint, async sub => {
       const setup = await fixture(sub, { entrypoint });
-      const caller = resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid, socketPath: setup.socketPath });
+      const caller = await setup.caller({ socketPath: setup.socketPath });
       assert.equal(caller.entrypoint, entrypoint);
       assert.equal(caller.sessionId, setup.record.sessionId);
       assert.equal(caller.token, setup.key.peerToken);
-      assert.throws(() => resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.ppid,
-        socketPath: setup.socketPath }), /Cannot identify/);
-      assert.throws(() => resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid,
-        socketPath: socketName() }), /Cannot identify/);
+      await assert.rejects(async () => setup.caller({ parentPid: process.ppid, socketPath: setup.socketPath }), /Cannot identify/);
+      await assert.rejects(async () => setup.caller({ socketPath: socketName() }), /exported to this bridge does not match/);
       setup.key[keyStartField] = '1';
       fs.writeFileSync(setup.keyPath, JSON.stringify(setup.key));
-      assert.throws(() => resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid }), /key does not match/);
+      await assert.rejects(async () => setup.caller(), /key does not match/);
     });
   }
 });
@@ -105,42 +98,50 @@ test('Claude CLI and SDK CLI callers require their exact direct parent and match
 test('CLI clear and resume follow the current exact session ID without retaining an old destination', nativeIdentityOnly, async t => {
   const setup = await fixture(t);
   const originalId = setup.record.sessionId;
-  assert.equal(resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid }).sessionId, originalId);
+  assert.equal((await setup.caller()).sessionId, originalId);
   const nextId = randomUUID();
   setup.rewrite({ sessionId: nextId });
-  assert.throws(() => resolveClaudeSession(originalId, { registryDir: setup.registryDir }), /unavailable/);
-  assert.equal(resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid }).sessionId, nextId);
+  await assert.rejects(async () => setup.resolve(originalId), /unavailable/);
+  assert.equal((await setup.caller()).sessionId, nextId);
   setup.rewrite({ sessionId: originalId });
-  assert.throws(() => resolveClaudeSession(nextId, { registryDir: setup.registryDir }), /unavailable/);
-  assert.equal(resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid }).sessionId, originalId);
+  await assert.rejects(async () => setup.resolve(nextId), /unavailable/);
+  assert.equal((await setup.caller()).sessionId, originalId);
 });
 
 test('a conversation open in two windows takes messages in the one used last, and each window can call the bridge', nativeIdentityOnly, async t => {
   const pipe = await mockPipe(t);
   const setup = await fixture(t, { socketPath: pipe.pipePath });
-  const other = { ...setup.record, pid: process.ppid, entrypoint: 'claude-desktop', procStart: readProcessStart(process.ppid),
+  const other = { ...setup.record, pid: process.ppid, entrypoint: 'claude-desktop', procStart: otherStart,
     messagingSocketPath: socketName(), name: 'Older window' };
+  setup.starts.set(other.pid, otherStart);
   const otherKey = `${other.pid}.${createHash('sha256').update(canonicalClaudeSocket(other.messagingSocketPath)).digest('hex')}.key`;
   fs.writeFileSync(path.join(setup.registryDir, otherKey), JSON.stringify({ ...setup.key, peerToken: '2'.repeat(32), [keyStartField]: other.procStart }));
   const writeOther = values => fs.writeFileSync(path.join(setup.registryDir, `${other.pid}.json`), JSON.stringify(Object.assign(other, values)));
-  const resolve = () => resolveClaudeSession(setup.record.sessionId, { registryDir: setup.registryDir });
   writeOther({ updatedAt: 1000 });
   setup.rewrite({ updatedAt: 2000 });
-  const endpoint = resolve();
+  const endpoint = await setup.resolve();
   assert.equal(endpoint.pid, process.pid);
   assert.deepEqual(discoverClaudeSessions({ registryDir: setup.registryDir }).map(session => session.pid), [process.pid]);
   writeOther({ updatedAt: 3000 });
-  assert.equal(resolve().token, '2'.repeat(32));
+  assert.equal((await setup.resolve()).token, '2'.repeat(32));
   for (const pid of [process.pid, process.ppid]) {
-    assert.equal(resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: pid }).pid, pid);
+    assert.equal((await setup.caller({ parentPid: pid })).pid, pid);
   }
-  const receipt = await sendToClaude({ ...endpoint, message: 'Stays with the window it was sent to' });
+  const receipt = await sendToClaude({ ...endpoint, probe: setup.probe, message: 'Stays with the window it was sent to' });
   assert.equal(receipt.status, 'written', 'the other window becoming active does not redirect a send under way');
 });
 
-test('resolving a CLI inbox revalidates entrypoint and session changes during the key read', nativeIdentityOnly, async t => {
-  for (const replacement of [{ entrypoint: 'sdk' }, { entrypoint: 'claude-desktop' }, { sessionId: randomUUID() }]) {
-    await t.test(JSON.stringify(replacement), async sub => {
+test('resolving a CLI inbox revalidates registry identity changes during the key read', nativeIdentityOnly, async t => {
+  const cases = {
+    'unsupported entrypoint': { entrypoint: 'sdk' },
+    'different supported entrypoint': { entrypoint: 'claude-desktop' },
+    'session ID': { sessionId: randomUUID() },
+    'process start': { procStart: otherStart },
+    'process domain': { pidDomain: `${processDomain}-other` },
+    'canonical socket': { messagingSocketPath: socketName() },
+  };
+  for (const [name, replacement] of Object.entries(cases)) {
+    await t.test(name, async sub => {
       const setup = await fixture(sub);
       const selectedId = setup.record.sessionId;
       let changed = false;
@@ -150,8 +151,48 @@ test('resolving a CLI inbox revalidates entrypoint and session changes during th
           setup.rewrite(replacement);
         }
       });
-      assert.throws(() => resolveClaudeSession(selectedId, { registryDir: setup.registryDir }), /session changed/);
+      await assert.rejects(setup.resolve(selectedId), /session changed while resolving/);
       assert.equal(changed, true);
+    });
+  }
+});
+
+test('a Windows socket case change during the key read still resolves the same inbox', { skip: process.platform !== 'win32' }, async t => {
+  const setup = await fixture(t);
+  const alternate = setup.socketPath.toLowerCase();
+  assert.notEqual(alternate, setup.socketPath);
+  let changed = false;
+  onOpen(t, file => {
+    if (file === setup.keyPath && !changed) {
+      changed = true;
+      setup.rewrite({ messagingSocketPath: alternate });
+    }
+  });
+  const endpoint = await setup.resolve();
+  assert.equal(changed, true);
+  assert.equal(endpoint.socketPath, canonicalClaudeSocket(setup.socketPath));
+  assert.equal(endpoint.token, setup.key.peerToken);
+});
+
+test('Claude caller and destination resolution require a 32-character lowercase hex inbox token', nativeIdentityOnly, async t => {
+  const setup = await fixture(t);
+  const valid = '0123456789abcdef'.repeat(2);
+  const writeToken = peerToken => fs.writeFileSync(setup.keyPath, JSON.stringify({ ...setup.key, peerToken }));
+  writeToken(valid);
+  assert.equal((await setup.caller()).token, valid);
+  assert.equal((await setup.resolve()).token, valid);
+
+  for (const [name, token] of [
+    ['short hex', valid.slice(1)],
+    ['nonhex', 'g'.repeat(32)],
+    ['uppercase hex', valid.toUpperCase()],
+  ]) {
+    await t.test(name, async () => {
+      writeToken(token);
+      await Promise.all([
+        assert.rejects(setup.caller(), /inbox key does not match/),
+        assert.rejects(setup.resolve(), /inbox key does not match/),
+      ]);
     });
   }
 });
@@ -162,7 +203,7 @@ test('caller rejects an entrypoint replacement between matching the parent and r
   onOpen(t, file => {
     if (file === setup.recordPath && ++reads === 2) setup.rewrite({ entrypoint: 'claude-desktop' });
   });
-  assert.throws(() => resolveClaudeCaller({ registryDir: setup.registryDir, parentPid: process.pid }), /caller changed/);
+  await assert.rejects(async () => setup.caller(), /caller changed/);
 });
 
 test('resolved Desktop and CLI endpoints preserve issue #1 and send only while the selected identity is current', nativeIdentityOnly, async t => {
@@ -170,15 +211,15 @@ test('resolved Desktop and CLI endpoints preserve issue #1 and send only while t
     await t.test(entrypoint, async sub => {
       const pipe = await mockPipe(sub);
       const setup = await fixture(sub, { entrypoint, socketPath: pipe.pipePath });
-      const endpoint = resolveClaudeSession(setup.record.sessionId, { registryDir: setup.registryDir });
-      const receipt = await sendToClaude({ ...endpoint, message: 'CLI transport fixture' });
+      const endpoint = await setup.resolve();
+      const receipt = await sendToClaude({ ...endpoint, probe: setup.probe, message: 'CLI transport fixture' });
       assert.equal(receipt.status, 'written');
       assert.equal(receipt.acknowledged, false);
       assert.equal(pipe.messages[1].message.session_id, setup.record.sessionId);
       assert.match(pipe.messages[1].message.message.content, /^<cross-session-message\b[^>]* from-mode="bypass">/);
       assert.equal(Object.hasOwn(pipe.messages[1].message, 'from-mode'), false, 'the classification belongs in the peer envelope, not the JSON frame');
       setup.rewrite({ sessionId: randomUUID() });
-      await assert.rejects(sendToClaude({ ...endpoint, message: 'Do not send to the replacement' }), error => {
+      await assert.rejects(sendToClaude({ ...endpoint, probe: setup.probe, message: 'Do not send to the replacement' }), error => {
         assert.equal(error.deliveryUnknown, false);
         return true;
       });
@@ -187,12 +228,28 @@ test('resolved Desktop and CLI endpoints preserve issue #1 and send only while t
   }
 });
 
+test('a supplied token cannot override the resolved Claude destination token', nativeIdentityOnly, async t => {
+  const pipe = await mockPipe(t);
+  const setup = await fixture(t, { socketPath: pipe.pipePath });
+  const endpoint = await setup.resolve();
+  const send = { ...endpoint, message: 'fixture', probe: setup.probe };
+  await assert.rejects(sendToClaude({ ...send, token: '2'.repeat(32) }), error => {
+    assert.match(error.message, /destination differs/);
+    assert.equal(error.deliveryUnknown, false);
+    return true;
+  });
+  assert.deepEqual(pipe.messages, []);
+  assert.equal((await sendToClaude(send)).status, 'written');
+  assert.deepEqual(pipe.messages.map(({ message }) => message.type), ['auth', 'user']);
+  assert.equal(pipe.messages[0].message.token, endpoint.token);
+});
+
 test('CLI destination changes after resolution fail before writing credentials or message bytes', nativeIdentityOnly, async t => {
   for (const change of ['session', 'entrypoint', 'process-start', 'domain', 'key-token', 'key-start', 'key-domain', 'socket']) {
     await t.test(change, async sub => {
       const pipe = await mockPipe(sub);
       const setup = await fixture(sub, { socketPath: pipe.pipePath });
-      const endpoint = resolveClaudeSession(setup.record.sessionId, { registryDir: setup.registryDir });
+      const endpoint = await setup.resolve();
       if (change === 'session') setup.rewrite({ sessionId: randomUUID() });
       else if (change === 'entrypoint') setup.rewrite({ entrypoint: 'claude-desktop' });
       else if (change === 'process-start') setup.rewrite({ procStart: '1' });
@@ -204,7 +261,7 @@ test('CLI destination changes after resolution fail before writing credentials o
         if (change === 'key-domain') setup.key.pidDomain = `${processDomain}:different-host`;
         fs.writeFileSync(setup.keyPath, JSON.stringify(setup.key));
       }
-      await assert.rejects(sendToClaude({ ...endpoint, message: 'Must not reach a replacement conversation' }), error => {
+      await assert.rejects(sendToClaude({ ...endpoint, probe: setup.probe, message: 'Must not reach a replacement conversation' }), error => {
         assert.equal(error.deliveryUnknown, false);
         assert.doesNotMatch(error.message, /11111111111111111111111111111111|22222222222222222222222222222222/);
         return true;
@@ -217,17 +274,17 @@ test('CLI destination changes after resolution fail before writing credentials o
 test('a session resumed in another valid process cannot replace a resolved destination', nativeIdentityOnly, async t => {
   const pipe = await mockPipe(t);
   const setup = await fixture(t, { socketPath: pipe.pipePath });
-  const endpoint = resolveClaudeSession(setup.record.sessionId, { registryDir: setup.registryDir });
-  const start = readProcessStart(process.ppid);
-  if (process.platform === 'win32') assert.match(start, /^[0-9]+$/);
+  const endpoint = await setup.resolve();
+  const start = otherStart;
+  setup.starts.set(process.ppid, start);
   const replacement = { ...setup.record, pid: process.ppid, procStart: start };
   fs.unlinkSync(setup.recordPath);
   fs.writeFileSync(path.join(setup.registryDir, `${replacement.pid}.json`), JSON.stringify(replacement));
   fs.writeFileSync(path.join(setup.registryDir,
     `${replacement.pid}.${createHash('sha256').update(endpoint.socketPath).digest('hex')}.key`),
   JSON.stringify({ ...setup.key, [keyStartField]: start }));
-  assert.equal(resolveClaudeSession(replacement.sessionId, { registryDir: setup.registryDir }).pid, process.ppid);
-  await assert.rejects(sendToClaude({ ...endpoint, message: 'Keep the original process identity' }), error => {
+  assert.equal((await setup.resolve(replacement.sessionId)).pid, process.ppid);
+  await assert.rejects(sendToClaude({ ...endpoint, probe: setup.probe, message: 'Keep the original process identity' }), error => {
     assert.match(error.message, /destination changed/);
     assert.equal(error.deliveryUnknown, false);
     return true;
@@ -238,7 +295,7 @@ test('a session resumed in another valid process cannot replace a resolved desti
 test('CLI switch during socket connection is rejected before the payload write', nativeIdentityOnly, async t => {
   const pipe = await mockPipe(t);
   const setup = await fixture(t, { socketPath: pipe.pipePath });
-  const endpoint = resolveClaudeSession(setup.record.sessionId, { registryDir: setup.registryDir });
+  const endpoint = await setup.resolve();
   const connect = net.connect;
   let switched = false;
   const mock = t.mock.method(net, 'connect', (...args) => {
@@ -251,7 +308,7 @@ test('CLI switch during socket connection is rejected before the payload write',
   });
   syncBuiltinESMExports();
   t.after(() => { mock.mock.restore(); syncBuiltinESMExports(); });
-  await assert.rejects(sendToClaude({ ...endpoint, message: 'Do not cross a clear/resume boundary' }), error => {
+  await assert.rejects(sendToClaude({ ...endpoint, probe: setup.probe, message: 'Do not cross a clear/resume boundary' }), error => {
     assert.equal(error.deliveryUnknown, false);
     return true;
   });

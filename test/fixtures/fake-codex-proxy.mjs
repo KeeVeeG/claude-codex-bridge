@@ -6,6 +6,13 @@ import { createHash } from 'node:crypto';
 import { FrameDecoder } from '../../lib/ws-jsonrpc.mjs';
 
 const scenario = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (scenario.reachableConnections !== undefined) {
+  // The daemon stops after this many proxy connections, for example between routing and sending.
+  const counter = `${scenario.logFile}.connections`;
+  const count = (fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0) + 1;
+  fs.writeFileSync(counter, String(count));
+  if (count > scenario.reachableConnections) scenario.unreachable = true;
+}
 if (scenario.unreachable) {
   process.stderr.write(scenario.unreachableStderr ?? 'failed to connect to socket (os error 10061)\n');
   process.exit(1);
@@ -74,7 +81,9 @@ function answer(request) {
 const decoder = new FrameDecoder({ upgraded: true });
 let handshake = Buffer.alloc(0);
 let upgraded = false;
+let leaving = false;
 process.stdin.on('data', chunk => {
+  if (leaving) return;
   let data = chunk;
   if (!upgraded) {
     handshake = Buffer.concat([handshake, chunk]);
@@ -98,6 +107,16 @@ process.stdin.on('data', chunk => {
     }
     if (scenario.silent === request.method) { log({ method: request.method, params: request.params }); continue; }
     answer(request);
+    if (scenario.exitAfterFirst === request.method) {
+      // The proxy goes away right after its first answer to this method, for example after routing.
+      const seen = fs.readFileSync(scenario.logFile, 'utf8').trim().split('\n')
+        .filter(line => JSON.parse(line).method === request.method).length;
+      if (seen === 1) {
+        leaving = true;
+        process.stdout.write('', () => process.exit(0));
+        return;
+      }
+    }
   }
 });
 process.stdin.on('end', () => process.exit(0));
