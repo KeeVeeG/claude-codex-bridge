@@ -5,7 +5,8 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { main, migrateLegacyInstallation, CLAUDE_SEND_PERMISSION } from '../scripts/install.mjs';
 import { defaultStateDir, createSession, recordMessage, getSession, getMessages } from '../lib/store.mjs';
-import { defaultStatePath, stateDirectoryWarning } from '../lib/state-directory.mjs';
+import { defaultStatePath, resolveStateDirectory, stateDirectoryPrivacyWarning, stateDirectoryWarning } from '../lib/state-directory.mjs';
+import { getBridgeConversation } from '../lib/bridge-history.mjs';
 import { executeBridgeTool } from '../lib/bridge-service.mjs';
 import { publicDelivery } from '../lib/delivery.mjs';
 
@@ -32,7 +33,9 @@ function snapshot(home) {
 }
 
 function oldInstallation(t) {
-  const setup = fixture(t); const { homeDir } = setup;
+  const setup = fixture(t); const { homeDir, oldState } = setup;
+  // Installer scenarios begin after the operator's offline state cutover.
+  fs.renameSync(oldState, defaultStatePath(homeDir));
   const staging = path.join(homeDir, 'plugins', oldPlugin);
   const backup = path.join(homeDir, 'plugins', `.${oldPlugin}.backup-previous`);
   put(path.join(staging, 'old.json'), { previous: true }); put(path.join(backup, 'old.json'), { previous: true });
@@ -87,7 +90,6 @@ test('installer migrates every released artifact through fake CLIs, preserving c
   assert.deepEqual(fs.readFileSync(f.codexConfig, 'utf8').match(/^\[.+\]$/gm),
     ['[marketplaces.keep]', '[plugins."unrelated@keep"]', '[plugins."bridge-claude-codex@personal"]']);
   assert.match(fs.readFileSync(f.codexConfig, 'utf8'), /^model = "kept"/);
-  assert.ok(f.logs.some(line => line.includes('Moved bridge state')));
   assert.ok(f.logs.some(line => line.includes('Removed old bridge entry')));
   const before = snapshot(f.homeDir); const callCount = cli.calls.length; f.logs.length = 0;
   migrateLegacyInstallation(f.options);
@@ -125,12 +127,21 @@ for (const field of ['ask', 'deny']) test(`legacy ${field} blocks the renamed se
   assert.deepEqual(JSON.parse(fs.readFileSync(f.settingsPath)).permissions, { [field]: [newPrefix, CLAUDE_SEND_PERMISSION, `${newPrefix}__*`] });
 });
 
-for (const pin of [false, true]) test(`runtime resolves and migrates default records${pin ? ' with an installer pin' : ''}`, t => {
-  const f = fixture(t); const env = pin ? { CLAUDE_CODEX_BRIDGE_STATE_DIR: defaultStatePath(f.homeDir) } : {};
-  const directory = defaultStateDir({ homeDir: f.homeDir, env });
-  assert.equal(directory, defaultStatePath(f.homeDir)); assert.equal(fs.existsSync(f.oldState), false);
+for (const pin of [false, true]) test(`legacy default blocks until offline cutover${pin ? ' with an installer pin' : ''}`, t => {
+  const f = fixture(t);
+  const destination = defaultStatePath(f.homeDir);
+  const env = pin ? { CLAUDE_CODEX_BRIDGE_STATE_DIR: destination } : {};
+  assert.throws(() => defaultStateDir({ homeDir: f.homeDir, env }), {
+    reason: 'state_unavailable', message: /stop bridge servers and installers/,
+  });
+  assert.equal(fs.existsSync(destination), false);
+  const directory = defaultStateDir({ homeDir: f.homeDir, env: { CLAUDE_CODEX_BRIDGE_STATE_DIR: f.oldState } });
+  assert.equal(directory, f.oldState);
+  assert.match(stateDirectoryWarning(directory, { homeDir: f.homeDir }), /unpinned 1\.0\.x/);
   assert.equal(getMessages(getSession({ stateDir: directory, threadId: 'record-owner' }))[0].id, 'preserved');
-  assert.equal(defaultStateDir({ homeDir: f.homeDir, env }), directory);
+  fs.renameSync(f.oldState, destination); // Operator cutover, with no writers.
+  assert.equal(defaultStateDir({ homeDir: f.homeDir, env }), destination);
+  assert.equal(getMessages(getSession({ stateDir: destination, threadId: 'record-owner' }))[0].id, 'preserved');
 });
 
 test('an explicit nondefault state path never triggers migration', t => {
@@ -139,48 +150,143 @@ test('an explicit nondefault state path never triggers migration', t => {
   assert.ok(fs.existsSync(f.oldState)); assert.equal(fs.existsSync(defaultStatePath(f.homeDir)), false);
 });
 
-test('state migration leaves an existing destination and a symlink source untouched', t => {
+test('a case-only explicit override on case-sensitive NTFS does not select the legacy default', { skip: process.platform !== 'win32' }, t => {
+  const f = fixture(t);
+  const destination = defaultStatePath(f.homeDir);
+  const share = path.dirname(destination);
+  const result = spawnSync('fsutil.exe', ['file', 'SetCaseSensitiveInfo', share, 'enable'], { windowsHide: true });
+  if (result.status !== 0) return t.skip('Cannot enable per-directory case sensitivity on this test volume');
+  const configured = path.join(share, 'Claude-Codex-Bridge');
+  fs.mkdirSync(configured);
+  // Some Windows/volume combinations treat Win32 opens as case insensitive even
+  // with the directory flag set. That is an alias, not two distinct paths.
+  if (fs.existsSync(destination)) return t.skip('Win32 still resolves the case-only path on this test volume');
+  const env = { CLAUDE_CODEX_BRIDGE_STATE_DIR: configured };
+  for (let call = 0; call < 2; call++) assert.equal(defaultStateDir({ homeDir: f.homeDir, env }), configured);
+  assert.ok(fs.existsSync(f.oldState));
+  assert.equal(fs.existsSync(destination), false);
+});
+
+test('an existing Windows case alias selects the exact same real default', { skip: process.platform !== 'win32' }, t => {
+  const f = fixture(t);
+  const destination = defaultStatePath(f.homeDir);
+  const configured = path.join(path.dirname(destination), 'Claude-Codex-Bridge');
+  fs.renameSync(f.oldState, destination);
+  if (!fs.existsSync(configured)) return t.skip('The test volume does not resolve a case alias');
+  const env = { CLAUDE_CODEX_BRIDGE_STATE_DIR: configured };
+  assert.equal(defaultStateDir({ homeDir: f.homeDir, env }), destination);
+  fs.mkdirSync(f.oldState);
+  assert.throws(() => defaultStateDir({ homeDir: f.homeDir, env }), /separate/);
+});
+
+test('Unicode case folding does not redirect a different explicit state directory', { skip: process.platform !== 'win32' }, t => {
+  const f = fixture(t);
+  const homeDir = path.join(f.homeDir, 'İ-home');
+  fs.mkdirSync(homeDir);
+  fs.renameSync(path.join(f.homeDir, '.local'), path.join(homeDir, '.local'));
+  const configured = defaultStatePath(path.join(f.homeDir, 'i̇-home'));
+  fs.mkdirSync(configured, { recursive: true });
+  const destination = defaultStatePath(homeDir);
+  assert.equal(configured.toLowerCase(), destination.toLowerCase());
+  assert.equal(fs.existsSync(destination), false);
+  const env = { CLAUDE_CODEX_BRIDGE_STATE_DIR: configured };
+  assert.equal(defaultStateDir({ homeDir, env }), configured);
+  fs.mkdirSync(destination);
+  assert.equal(defaultStateDir({ homeDir, env }), configured);
+});
+
+test('an explicit state junction resolves to one target for the writer and history reader', async t => {
+  const f = fixture(t);
+  const alias = path.join(f.homeDir, 'state-alias');
+  fs.symlinkSync(f.oldState, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const stateDir = defaultStateDir({ homeDir: f.homeDir, env: { CLAUDE_CODEX_BRIDGE_STATE_DIR: alias } });
+  assert.equal(stateDir, f.oldState);
+  assert.equal(resolveStateDirectory(alias), stateDir);
+  const sessionId = '57d26635-4071-4ce2-9d75-1c882e9534ea';
+  const session = getSession({ stateDir, threadId: 'record-owner' });
+  recordMessage(session, { id: 'through-alias', direction: 'to_claude', message: 'History is visible.',
+    route: { from: { kind: 'codex', id: 'record-owner' }, to: { kind: 'claude', id: sessionId } } });
+  const page = await getBridgeConversation({ stateDir, ownerThreadId: 'record-owner', sessionId });
+  assert.deepEqual(page.messages.map(message => message.id), ['through-alias']);
+  assert.deepEqual(page.warnings, []);
+});
+
+test('Windows privacy diagnostic warns on inherited read access without changing ACLs', { skip: process.platform !== 'win32' }, async t => {
+  const f = fixture(t);
+  const parent = path.join(f.homeDir, 'shared-parent');
+  fs.mkdirSync(parent);
+  const options = { encoding: 'utf8', windowsHide: true };
+  const grant = spawnSync('icacls.exe', [parent, '/grant', '*S-1-5-32-545:(OI)(CI)(RX)'], options);
+  assert.equal(grant.status, 0, grant.stderr);
+  const directory = path.join(parent, 'state');
+  assert.match(await stateDirectoryPrivacyWarning(directory), /may grant other accounts access.*private per-user/);
+  fs.mkdirSync(directory);
+  const before = spawnSync('icacls.exe', [directory], options);
+  assert.equal(before.status, 0, before.stderr);
+  const warning = await stateDirectoryPrivacyWarning(directory);
+  assert.match(warning, /may grant other accounts access.*private per-user/);
+  assert.ok(!warning.includes(f.homeDir));
+  assert.equal(spawnSync('icacls.exe', [directory], options).stdout, before.stdout);
+});
+
+test('separate default trees block selection, but two aliases of one directory share it', t => {
   const f = fixture(t); const destination = defaultStatePath(f.homeDir); fs.mkdirSync(destination);
-  assert.equal(defaultStateDir({ homeDir: f.homeDir, env: {} }), destination); assert.ok(fs.existsSync(f.oldState));
-  fs.rmSync(destination, { recursive: true });
-  const actual = path.join(f.homeDir, 'actual-state'); fs.renameSync(f.oldState, actual);
-  fs.symlinkSync(actual, f.oldState, process.platform === 'win32' ? 'junction' : 'dir');
+  assert.throws(() => defaultStateDir({ homeDir: f.homeDir, env: {} }), /Do not resend from either copy/);
+  fs.rmdirSync(destination);
+  fs.renameSync(f.oldState, destination);
+  fs.symlinkSync(destination, f.oldState, process.platform === 'win32' ? 'junction' : 'dir');
   assert.equal(defaultStateDir({ homeDir: f.homeDir, env: {} }), destination);
-  assert.ok(fs.lstatSync(f.oldState).isSymbolicLink()); assert.ok(fs.existsSync(actual));
+  assert.ok(fs.lstatSync(f.oldState).isSymbolicLink());
+  assert.equal(getMessages(getSession({ stateDir: destination, threadId: 'record-owner' }))[0].id, 'preserved');
 });
 
-test('a lost migration race uses the winner, while transient locks are retried', t => {
-  for (const race of [false, true]) {
-    const f = fixture(t); const rename = fs.renameSync; let calls = 0;
-    fs.renameSync = (from, to) => {
-      if (from === f.oldState && ++calls <= 2) {
-        if (race && calls === 1) rename(from, to);
-        throw Object.assign(new Error('held'), { code: race ? 'ENOENT' : 'EPERM' });
-      }
-      return rename(from, to);
-    };
-    try { assert.equal(defaultStateDir({ homeDir: f.homeDir, env: {} }), defaultStatePath(f.homeDir)); }
-    finally { fs.renameSync = rename; }
-    assert.equal(calls, race ? 1 : 3);
-  }
+test('two current selectors cannot escape a legacy-only root after a transient inspection fault', t => {
+  const f = fixture(t);
+  const stat = fs.lstatSync;
+  fs.lstatSync = (file, ...args) => {
+    if (file === f.oldState) throw Object.assign(new Error('held'), { code: 'EBUSY' });
+    return stat(file, ...args);
+  };
+  try { assert.throws(() => defaultStateDir({ homeDir: f.homeDir, env: {} }), /could not verify/); }
+  finally { fs.lstatSync = stat; }
+  const entry = new URL('../lib/state-directory.mjs', import.meta.url).href;
+  const script = `import { defaultStateDir } from ${JSON.stringify(entry)};
+    try { process.stdout.write(defaultStateDir({ homeDir: process.argv[1], env: {} })); }
+    catch (error) { process.stdout.write(error.reason ?? 'unexpected'); }`;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script, f.homeDir], { encoding: 'utf8', windowsHide: true });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, 'state_unavailable');
+  assert.equal(fs.existsSync(defaultStatePath(f.homeDir)), false);
+  assert.ok(fs.existsSync(f.oldState));
 });
 
-test('persistent contention keeps the old records for this process and doctor reports it', async t => {
-  const f = fixture(t); const rename = fs.renameSync; let calls = 0;
-  fs.renameSync = (from, to) => { if (from === f.oldState) { calls++; throw Object.assign(new Error('held'), { code: 'EBUSY' }); } return rename(from, to); };
-  let directory;
-  try { directory = defaultStateDir({ homeDir: f.homeDir, env: {} }); } finally { fs.renameSync = rename; }
-  assert.equal(directory, f.oldState); assert.ok(calls > 1); assert.ok(stateDirectoryWarning(directory));
-  assert.equal(defaultStateDir({ homeDir: f.homeDir, env: {} }), f.oldState);
-  assert.equal(getMessages(getSession({ stateDir: directory, threadId: 'record-owner' }))[0].id, 'preserved');
-  const doctor = await executeBridgeTool('bridge_doctor', {}, { stateDir: directory, registryDir: path.join(f.homeDir, 'absent'), parentPid: 2147483647,
-    env: { CLAUDE_CODEX_BRIDGE_DAEMON: 'off' }, daemonVersion: { spawnImpl: () => ({ status: 1 }) } });
-  assert.equal(doctor.checks.find(check => check.name === 'state_migration').status, 'warning');
+test('a legacy root moved between stat and realpath cannot cause a stale selection', t => {
+  const f = fixture(t); const destination = defaultStatePath(f.homeDir);
+  const realpath = fs.realpathSync.native;
+  fs.realpathSync.native = (file, ...args) => {
+    if (file === f.oldState) fs.renameSync(f.oldState, destination); // Released writer wins its rename.
+    return realpath(file, ...args);
+  };
+  try { assert.throws(() => defaultStateDir({ homeDir: f.homeDir, env: {} }), { reason: 'state_unavailable' }); }
+  finally { fs.realpathSync.native = realpath; }
+  assert.equal(defaultStateDir({ homeDir: f.homeDir, env: {} }), destination);
+  assert.equal(getMessages(getSession({ stateDir: destination, threadId: 'record-owner' }))[0].id, 'preserved');
+  assert.equal(fs.existsSync(f.oldState), false);
 });
 
-test('old environment names are ignored at runtime, diagnosed, and refused before installer changes', async t => {
+test('an obsolete state setting cannot silently select a different default', t => {
+  const f = fixture(t);
+  const destination = defaultStatePath(f.homeDir);
+  fs.renameSync(f.oldState, destination);
+  const chosen = path.join(f.homeDir, 'previous-custom');
+  const env = { CODEX_CLAUDE_BRIDGE_STATE_DIR: chosen };
+  assert.throws(() => defaultStateDir({ homeDir: f.homeDir, env }), /old state setting points away/);
+  assert.equal(defaultStateDir({ homeDir: f.homeDir, env: { ...env, CLAUDE_CODEX_BRIDGE_STATE_DIR: chosen } }), chosen);
+  assert.equal(fs.existsSync(chosen), false);
+});
+
+test('old environment names are diagnosed and refused before installer changes', async t => {
   const f = fixture(t); const env = { CODEX_CLAUDE_BRIDGE_STATE_DIR: path.join(f.homeDir, 'wrong'), CODEX_CLAUDE_BRIDGE_DAEMON: 'off', CLAUDE_CODEX_BRIDGE_DAEMON: 'off' };
-  assert.equal(defaultStateDir({ homeDir: f.homeDir, env }), defaultStatePath(f.homeDir));
   const doctor = await executeBridgeTool('bridge_doctor', {}, { stateDir: defaultStatePath(f.homeDir), registryDir: path.join(f.homeDir, 'absent'), parentPid: 2147483647, env,
     daemonVersion: { spawnImpl: () => ({ status: 1 }) } });
   const warnings = doctor.checks.filter(check => check.name === 'legacy_environment'); assert.equal(warnings.length, 2);

@@ -47,7 +47,13 @@ A visible bridge skill does not mean its MCP server connected; if the tools are 
 
 ### Updating from a version before 1.0.0
 
-Version 1.0.0 renamed the plugin from `codex-claude-desktop-bridge` to `bridge-claude-codex`. Run the installer once: it removes the old plugin and its catalogs from both applications, carries your Claude permission rules over to the new tool names with their allow, ask, or deny choice intact, and moves the state folder to `~/.local/share/claude-codex-bridge`. Codex may keep running: if it holds the old plugin's files, the installer turns that plugin off instead, and the next run after restarting Codex deletes it. The bridge also moves that folder itself on first start, so marketplace installs keep their history. Environment variables are now named `CLAUDE_CODEX_BRIDGE_*`; the old `CODEX_CLAUDE_BRIDGE_*` names are no longer read, the installer refuses to run while one is set, and `bridge_doctor` names the replacement.
+Version 1.0.0 renamed the plugin from `codex-claude-desktop-bridge` to `bridge-claude-codex`. The installer replaces the old registrations and preserves the allow, ask, or deny choices in your Claude permission rules. Current versions do **not** move the delivery ledger automatically: a running older server can recreate its former path and accept an ID a second time.
+
+1. Fully quit both apps and stop any other bridge servers or installers. Back up `~/.local/share/codex-claude-desktop-bridge` and `~/.local/share/claude-codex-bridge` if they exist.
+2. If only the old directory exists, either move it to the current name while everything is stopped or set `CLAUDE_CODEX_BRIDGE_STATE_DIR` to the old directory in both apps. If both directories exist and are separate, compare their records with the receiving conversations before choosing one ledger. Keep both backups; do not resend to reconcile them. Before restarting, archive the unused directory outside the two default locations or pin both apps to a separate reconciled directory.
+3. Update and restart both clients. Replace old `CODEX_CLAUDE_BRIDGE_*` settings with `CLAUDE_CODEX_BRIDGE_*` in the current clients. `bridge_doctor` reports state setup and legacy settings.
+
+For a mixed run or rollback, point every process at the **same real private directory** before starting it; pre-1.0 readers use `CODEX_CLAUDE_BRIDGE_STATE_DIR`. If keeping the old folder, explicitly pin 1.0.x too: an unpinned 1.0.x process can still move it. Sharing delivery records does not make older transport features compatible. In particular, v0.2.0 and earlier can overwrite a multi-host registry with one entry. Do not roll back to v0.1.0 and retry a delivery: that release uses pairing-based keys and cannot recognize routed receipts even on the same disk. Stop all writers and reconcile affected delivery IDs against the receiving conversations before any rollback sends; see [local records](docs/PRIVACY.md#local-records).
 
 ### macOS SSH host
 
@@ -99,7 +105,7 @@ Run `bridge_doctor` first; it sends nothing. From a verified Codex Desktop task 
   - *running but did not answer in time*: Codex Desktop is stuck; restart it.
   - *rejected saved task context*: the registered task was removed; call `bridge_doctor` once from an open Codex Desktop task.
   - *belongs to earlier Codex Desktop launches* only: open a Codex Desktop task with the bridge enabled.
-- **Each app sees different state.** Both must use `~/.local/share/claude-codex-bridge`. The installer pins it for both, which avoids Windows MSIX virtualization of `LOCALAPPDATA`; an explicit `CLAUDE_CODEX_BRIDGE_STATE_DIR` must be the same for both.
+- **Each app sees different state.** Both must resolve to one real directory, normally `~/.local/share/claude-codex-bridge`. The installer pins the local directory for both, avoiding Windows MSIX virtualization of `LOCALAPPDATA`. If old and new state both exist, follow the update steps above before retrying any delivery.
 - **Claude blocks `send_to_codex`.** Add the permission above, or switch the Code tab to **Manual** and approve the prompt. A `Bash` rule does not apply to MCP tools.
 - **Claude does not receive.** `/status` must show a `Peer address`; `--bare` sessions have no inbox. Claude's `crossSessionInbound` setting can hold or refuse messages after a successful write. The bridge marks its messages `from-mode="bypass"` so Bypass sessions do not hold them silently ([issue #1](https://github.com/KeeVeeG/claude-codex-bridge/issues/1)); it never changes your inbound settings.
 
