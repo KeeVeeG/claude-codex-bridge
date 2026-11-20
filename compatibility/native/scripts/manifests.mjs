@@ -271,8 +271,10 @@ export function syncManifests(sourceRoot = root) {
   }
   if (!bundle.native) refuseNativeEnvLiterals(bundle.source, `${NATIVE_DIRECTORY}/config/mcp-source.json`, bundle.mcp);
   for (const [relative, value] of Object.entries(files)) fs.writeFileSync(path.join(bundle.source, relative), json(value));
-  fs.writeFileSync(path.join(bundle.source, 'package.json'), json({ ...bundle.packageJson, name: PACKAGE_NAME, version: bundle.manifest.version }));
-  if (!bundle.native) syncNativeDeployment(bundle);
+  // The mirror is generated from the package metadata this pass writes, so one sync after a version bump aligns it.
+  const packageJson = { ...bundle.packageJson, name: PACKAGE_NAME, version: bundle.manifest.version };
+  fs.writeFileSync(path.join(bundle.source, 'package.json'), json(packageJson));
+  if (!bundle.native) syncNativeDeployment({ ...bundle, packageJson });
   return checkManifests(bundle.source);
 }
 

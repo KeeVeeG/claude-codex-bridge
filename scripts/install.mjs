@@ -76,6 +76,10 @@ const stageMarker = '.bridge-installed';
 const markerText = 'bridge-claude-codex installer v1\n';
 const stageStamp = /^\d+\.\d+\.\d+\+codex\.\d{17}$/;
 const backupSuffix = /^\d{17}-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+function namedBackup(name) {
+  const prefix = `.${PLUGIN_NAME}.backup-`;
+  return name.startsWith(prefix) && backupSuffix.test(name.slice(prefix.length));
+}
 function stageKind(directory) {
   // Permit only the closed runtime layout; preserve even a marked folder if it acquired a checkout, notes or links.
   const allowed = new Set([...runtimeFiles, '.mcp.json', '.claude-plugin/marketplace.json', stageMarker]);
@@ -126,9 +130,8 @@ function stageComparator(directory, version) {
 function pruneInstallationBackups(prepared, homeDir) {
   const directory = path.resolve(homeDir, 'plugins');
   refuseLink(directory);
-  const prefix = `.${PLUGIN_NAME}.backup-`;
   const backups = fs.readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isDirectory() && !entry.isSymbolicLink() &&
-    entry.name.startsWith(prefix) && backupSuffix.test(entry.name.slice(prefix.length))).map(entry => path.join(directory, entry.name)).sort().reverse();
+    namedBackup(entry.name)).map(entry => path.join(directory, entry.name)).sort().reverse();
   const owned = backups.filter(prepared.unchangedStage);
   const keep = owned.includes(prepared.backupDirectory) ? prepared.backupDirectory : owned[0];
   for (const file of owned) {
@@ -190,7 +193,7 @@ function restrictDirectory(dir, temporary, original) {
 export function writeJsonAtomic(filename, value, options) {
   return writeTextAtomic(filename, jsonText(value), options);
 }
-function writeTextAtomic(filename, next, { expectedPrevious, label = 'marketplace', saveBackup = true } = {}) {
+function writeTextAtomic(filename, next, { expectedPrevious, label = 'marketplace', saveBackup = true, onPublished } = {}) {
   refuseLink(filename);
   const previous = readRawIfPresent(filename);
   if (expectedPrevious !== undefined && previous !== expectedPrevious) {
@@ -212,10 +215,23 @@ function writeTextAtomic(filename, next, { expectedPrevious, label = 'marketplac
     }
     if (readRawIfPresent(filename) !== previous) throw new Error(`The ${label} changed before replacement. The newer file was preserved; retry installation.`);
     if (backup) fs.renameSync(temporaryBackup, backup);
-    if (previous === null) fs.linkSync(temporary, filename);
-    else fs.renameSync(temporary, filename);
+    const staged = onPublished && fs.statSync(temporary, { bigint: true });
+    try {
+      if (previous === null) fs.linkSync(temporary, filename);
+      else fs.renameSync(temporary, filename);
+    } catch (error) {
+      // If publication reported an error, only the staged file's identity proves it reached the destination.
+      // Identical JSON from a competing writer (e.g. EEXIST on first creation) is not ours to undo.
+      if (staged?.ino) {
+        const current = fs.lstatSync(filename, { bigint: true, throwIfNoEntry: false });
+        if (current?.ino === staged.ino && current.dev === staged.dev) onPublished();
+      }
+      throw error;
+    }
+    onPublished?.();
   } finally {
-    for (const file of [temporary, temporaryBackup]) { try { fs.unlinkSync(file); } catch (e) { if (e.code !== 'ENOENT') throw e; } }
+    // After publication a leftover name in the private folder is not a failed write; before it, the first error stands.
+    for (const file of [temporary, temporaryBackup]) { try { fs.unlinkSync(file); } catch {} }
   }
   return backup;
 }
@@ -302,38 +318,192 @@ const isLegacyPlugin = id => typeof id === 'string' && (id === LEGACY_PLUGIN || 
 
 const codexConfigPath = ({ homeDir, env }) => path.join(codexHome({ env, homeDir }), 'config.toml');
 
-/** The `[plugins.<id>]` or `[marketplaces.<name>]` table a Codex configuration line opens. */
-function codexTable(line) {
-  const match = line.trim().match(/^\[(plugins|marketplaces)\.(?:"([^"]+)"|'([^']+)'|([\w-]+))\]\s*(?:#.*)?$/);
-  return match && { kind: match[1], name: match[2] ?? match[3] ?? match[4] };
-}
-
-/** Plugin IDs and marketplace names recorded as tables in Codex's own configuration. */
-function codexConfigTables({ homeDir, env }) {
-  const tables = { plugins: [], marketplaces: [] };
-  for (const line of (readRawIfPresent(codexConfigPath({ homeDir, env })) ?? '').split(/\r?\n/)) {
-    const table = codexTable(line);
-    if (table) tables[table.kind].push(table.name);
+// A TOML 1.0 reader for Codex's config.toml. Registrations can be written as headers, dotted keys or inline
+// tables, so membership comes from the whole grammar and never from matching lines. It is stricter than TOML
+// where a lenient reading could misplace a key; anything it cannot read stops the installer before changes.
+const tomlTables = new WeakSet(), tomlSpans = new WeakMap();
+const tomlNumber = /^(?:[+-]?(?:0|[1-9](?:_?\d)*)(?:(?:\.\d(?:_?\d)*)?(?:[eE][+-]?\d(?:_?\d)*)?)|[+-]?(?:inf|nan)|0x[\dA-Fa-f](?:_?[\dA-Fa-f])*|0o[0-7](?:_?[0-7])*|0b[01](?:_?[01])*)$/;
+const tomlDate = /^(?:\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})?)?|\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/;
+export function parseToml(text) {
+  let i = text.charCodeAt(0) === 0xFEFF ? 1 : 0;
+  const fail = reason => { throw new Error(`line ${text.slice(0, i).split('\n').length}: ${reason}`); };
+  const fixed = new WeakSet(), defined = new WeakSet(), dotted = new WeakSet(), arrayTables = new WeakSet();
+  const table = () => { const t = Object.create(null); tomlTables.add(t); tomlSpans.set(t, Object.create(null)); return t; };
+  const freeze = value => {
+    if (Array.isArray(value)) value.forEach(freeze);
+    else if (tomlTables.has(value)) { fixed.add(value); Object.values(value).forEach(freeze); }
+  };
+  const control = c => (c < ' ' && c !== '\t') || c === '\x7F';
+  const space = () => { while (text[i] === ' ' || text[i] === '\t') i++; };
+  const newline = () => text[i] === '\n' ? 1 : text[i] === '\r' && text[i + 1] === '\n' ? 2 : 0;
+  const blank = () => {
+    for (;;) {
+      space();
+      if (text[i] === '#') while (i < text.length && !newline()) i++;
+      const n = newline(); if (!n) return; i += n;
+    }
+  };
+  const escape = () => {
+    const c = text[i + 1], simple = { b: '\b', t: '\t', n: '\n', f: '\f', r: '\r', '"': '"', '\\': '\\' };
+    if (Object.hasOwn(simple, c)) { i += 2; return simple[c]; }
+    const digits = c === 'u' ? 4 : c === 'U' ? 8 : 0, hex = text.slice(i + 2, i + 2 + digits);
+    const code = digits && hex.length === digits && /^[\dA-Fa-f]+$/.test(hex) ? parseInt(hex, 16) : -1;
+    if (code < 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) fail('invalid escape');
+    i += 2 + digits; return String.fromCodePoint(code);
+  };
+  const quoted = () => {
+    const quote = text[i]; let out = '';
+    if (text.startsWith(quote.repeat(3), i)) {
+      i += 3; i += newline();
+      for (;;) {
+        if (i >= text.length) fail('unterminated string');
+        if (text.startsWith(quote.repeat(3), i)) {
+          let n = 3; while (text[i + n] === quote) n++;
+          if (n > 5) fail('unterminated string');
+          i += n; return out + quote.repeat(n - 3);
+        }
+        if (quote === '"' && text[i] === '\\') {
+          let j = i + 1; while (text[j] === ' ' || text[j] === '\t') j++;
+          const before = i; i = j;
+          if (newline()) { while (text[i] === ' ' || text[i] === '\t' || newline()) i += newline() || 1; continue; }
+          i = before; out += escape(); continue;
+        }
+        const n = newline();
+        if (n) { out += text.slice(i, i + n); i += n; continue; }
+        if (control(text[i])) fail('control character in a string');
+        out += text[i++];
+      }
+    }
+    i++;
+    for (;;) {
+      const c = text[i];
+      if (c === undefined || c === '\n' || c === '\r') fail('unterminated string');
+      if (c === quote) { i++; return out; }
+      if (quote === '"' && c === '\\') { out += escape(); continue; }
+      if (control(c)) fail('control character in a string');
+      out += c; i++;
+    }
+  };
+  const simpleKey = () => {
+    if (text[i] === '"' || text[i] === "'") {
+      if (text.startsWith(text[i].repeat(3), i)) fail('a key cannot be a multi-line string');
+      return quoted();
+    }
+    const start = i; while (i < text.length && /[\w-]/.test(text[i])) i++;
+    if (start === i) fail('expected a key');
+    return text.slice(start, i);
+  };
+  const key = () => {
+    const parts = [simpleKey()];
+    for (;;) { space(); if (text[i] !== '.') return parts; i++; space(); parts.push(simpleKey()); }
+  };
+  const value = () => {
+    const c = text[i];
+    if (c === '"' || c === "'") return quoted();
+    if (c === '[') {
+      i++; const list = [];
+      for (;;) {
+        blank(); if (text[i] === ']') { i++; return list; }
+        list.push(value()); blank();
+        if (text[i] === ',') i++; else if (text[i] === ']') { i++; return list; } else fail('expected , or ] in an array');
+      }
+    }
+    if (c === '{') {
+      i++; const t = table(); space();
+      if (text[i] !== '}') for (;;) {
+        space(); assign(t); space();
+        if (text[i] === ',') { i++; continue; }
+        if (text[i] === '}') break;
+        fail('expected , or } in an inline table');
+      }
+      i++; freeze(t); return t;
+    }
+    const start = i, scalar = /[\w+\-.:]/;
+    while (i < text.length && scalar.test(text[i])) i++;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(text.slice(start, i)) && text[i] === ' ' && /^\d{2}:/.test(text.slice(i + 1, i + 4))) {
+      i++; while (i < text.length && scalar.test(text[i])) i++;
+    }
+    const token = text.slice(start, i);
+    if (token === 'true' || token === 'false') return token === 'true';
+    if (tomlNumber.test(token) || tomlDate.test(token)) return Object.freeze({ toml: token });
+    return fail('unsupported value');
+  };
+  const assign = target => {
+    const parts = key(); space();
+    if (text[i] !== '=') fail('expected =');
+    i++; space();
+    const start = i, result = value();
+    let t = target;
+    for (const part of parts.slice(0, -1)) {
+      if (!Object.hasOwn(t, part)) { const child = table(); dotted.add(child); t[part] = child; }
+      else if (!dotted.has(t[part]) || fixed.has(t[part])) fail(`cannot add keys to ${part}`);
+      t = t[part];
+    }
+    const name = parts.at(-1);
+    if (Object.hasOwn(t, name)) fail(`duplicate key ${name}`);
+    t[name] = result;
+    if (typeof result === 'boolean') tomlSpans.get(t)[name] = { start, end: i };
+  };
+  const header = list => {
+    const parts = key();
+    if (!text.startsWith(list ? ']]' : ']', i)) fail('expected ]');
+    i += list ? 2 : 1;
+    let t = root;
+    for (const [n, part] of parts.entries()) {
+      const last = n === parts.length - 1;
+      let child = Object.hasOwn(t, part) ? t[part] : undefined;
+      if (last && list) {
+        if (child === undefined) { child = []; arrayTables.add(child); t[part] = child; }
+        else if (!arrayTables.has(child)) fail(`cannot redefine ${part}`);
+        const entry = table(); child.push(entry); return entry;
+      }
+      if (child === undefined) { child = table(); t[part] = child; }
+      else if (arrayTables.has(child) && !last) child = child.at(-1);
+      else if (!tomlTables.has(child) || fixed.has(child) || (last && (dotted.has(child) || defined.has(child)))) fail(`cannot redefine ${part}`);
+      if (last) defined.add(child);
+      t = child;
+    }
+    return t;
+  };
+  const root = table();
+  let current = root;
+  for (;;) {
+    blank();
+    if (i >= text.length) return root;
+    if (text[i] === '[') { const list = text[i + 1] === '['; i += list ? 2 : 1; space(); current = header(list); }
+    else assign(current);
+    space();
+    if (text[i] === '#') while (i < text.length && !newline()) i++;
+    if (i < text.length && !newline()) fail('expected the end of the line');
   }
-  return tables;
 }
 
-/** Set `enabled = false` in one plugin's Codex table, keeping the previous file as a backup. */
-function disableCodexPlugin({ homeDir, env, id }) {
-  const filename = codexConfigPath({ homeDir, env });
-  const previous = readRawIfPresent(filename) ?? '';
-  const lines = previous.split(/(?<=\n)/);
-  const start = lines.findIndex(line => { const table = codexTable(line); return table?.kind === 'plugins' && table.name === id; });
-  if (start < 0) return null;
-  // Never synthesize a second enabled key or edit a string literal. Unsupported TOML is left intact.
-  if (previous.includes('"'.repeat(3)) || previous.includes("'".repeat(3))) throw new Error('Cannot safely edit this Codex configuration. Disable the old plugin in Codex.');
-  let end = lines.findIndex((line, index) => index > start && line.trimStart().startsWith('['));
-  if (end < 0) end = lines.length;
-  const enabled = /^(\s*(?:enabled|"enabled"|'enabled')\s*=\s*)(true|false)([^\S\r\n]*(?:#[^\r\n]*)?)(\r?\n)?$/;
-  const keys = lines.slice(start + 1, end).flatMap((line, index) => enabled.test(line) ? [index + start + 1] : []);
-  if (keys.length !== 1) throw new Error('Cannot safely locate the old plugin’s boolean enabled key. Disable it in Codex; the configuration was not changed.');
-  lines[keys[0]] = lines[keys[0]].replace(enabled, '$1false$3$4');
-  return writeTextAtomic(filename, lines.join(''), { expectedPrevious: previous, label: 'Codex configuration' });
+/** Codex's plugin registrations and marketplaces, read from its configuration with the TOML grammar. */
+function codexConfig({ homeDir, env }) {
+  const filename = codexConfigPath({ homeDir, env }), text = readRawIfPresent(filename) ?? '';
+  const refuse = reason => new Error(`Cannot read the Codex configuration ${filename} (${reason}). The installer cannot tell which bridge registrations Codex has, so it changed nothing. Correct the file so that Codex can read it, then run the installer again.`);
+  let doc; try { doc = parseToml(text); } catch (error) { throw refuse(error.message); }
+  const section = name => {
+    const value = doc[name] ?? parseToml('');
+    if (!tomlTables.has(value)) throw refuse(`${name} is not a table`);
+    return value;
+  };
+  const plugins = new Map(), marketplaces = section('marketplaces');
+  for (const [id, entry] of Object.entries(section('plugins'))) {
+    if (!tomlTables.has(entry) || !['boolean', 'undefined'].includes(typeof entry.enabled)) throw refuse(`plugins.${id} is not a plugin table with a boolean enabled`);
+    plugins.set(id, { enabled: entry.enabled, table: entry });
+  }
+  return { filename, text, plugins, marketplaces };
+}
+
+/** Rewrite only the boolean token of one plugin's `enabled` key. Returns null when the plugin is absent or already set. */
+function setCodexPluginEnabled({ homeDir, env, id, enabled, saveBackup = true }) {
+  const config = codexConfig({ homeDir, env }), plugin = config.plugins.get(id);
+  if (!plugin || plugin.enabled === enabled) return null;
+  const span = tomlSpans.get(plugin.table).enabled;
+  if (!span) throw new Error(`Cannot locate the boolean enabled key of ${id} in ${config.filename}. Turn it ${enabled ? 'on' : 'off'} in Codex; the configuration was not changed.`);
+  const next = config.text.slice(0, span.start) + String(enabled) + config.text.slice(span.end);
+  return writeTextAtomic(config.filename, next, { expectedPrevious: config.text, label: 'Codex configuration', saveBackup });
 }
 
 const legacyRepository = 'KeeVeeG/codex-claude-desktop-bridge';
@@ -356,22 +526,13 @@ function legacyLocalStage(homeDir) {
 function releasedPersonalRow(row) {
   return row?.name === LEGACY_PLUGIN && row.source?.source === 'local' && row.source.path === `./plugins/${LEGACY_PLUGIN}`;
 }
-function officialCodexMarket(config) {
-  // Do not infer a source from a marketplace name, partial table or unsupported TOML shape.
-  if (config.includes('"'.repeat(3)) || config.includes("'".repeat(3))) return false;
-  const lines = config.split(/\r?\n/);
-  const starts = lines.flatMap((line, i) => { const table = codexTable(line); return table?.kind === 'marketplaces' && table.name === LEGACY_MARKETPLACE ? [i] : []; });
-  if (starts.length !== 1) return false;
-  const fields = new Map();
-  for (const line of lines.slice(starts[0] + 1)) {
-    if (line.trimStart().startsWith('[')) break;
-    if (!line.trim() || line.trimStart().startsWith('#')) continue;
-    const m = /^\s*(source|source_type)\s*=\s*(["'])([^"']+)\2\s*(?:#.*)?$/.exec(line);
-    if (!m || fields.has(m[1])) return false;
-    fields.set(m[1], m[3]);
-  }
-  return fields.get('source_type') === 'git' && officialGit(fields.get('source'));
+function officialCodexMarket(marketplaces) {
+  // Do not infer a source from a marketplace name or a table with other settings.
+  const entry = marketplaces[LEGACY_MARKETPLACE];
+  return tomlTables.has(entry) && Object.keys(entry).every(key => ['source', 'source_type'].includes(key)) &&
+    entry.source_type === 'git' && officialGit(entry.source);
 }
+const pluginSelector = entry => entry.id || entry.pluginId || (entry.name?.includes('@') || !entry.marketplace ? entry.name : `${entry.name}@${entry.marketplace}`);
 
 /** Retire verified user registrations only. An unknown source, scope, or dependent keeps its registration. */
 export function migrateLegacyInstallation({ homeDir = os.homedir(), env = process.env,
@@ -395,7 +556,7 @@ export function migrateLegacyInstallation({ homeDir = os.homedir(), env = proces
     }
     const retainedMarkets = new Set();
     for (const entry of plugins) {
-      const selector = entry.id || entry.pluginId || (entry.name?.includes('@') || !entry.marketplace ? entry.name : `${entry.name}@${entry.marketplace}`);
+      const selector = pluginSelector(entry);
       const market = selector?.split('@')[1];
       if (isLegacyPlugin(selector) && verified.has(market) && entry.scope === 'user' && !entry.projectPath) {
         retired.add(selector); removals.push({ app: 'claude', args: ['plugin', 'uninstall', selector, '--scope', 'user', '--json'], done: `Removed claude plugin ${selector} (user)` });
@@ -406,23 +567,23 @@ export function migrateLegacyInstallation({ homeDir = os.homedir(), env = proces
     for (const market of verified) if (!retainedMarkets.has(market)) removals.push(marketplace('claude', market));
   }
   if (codex) {
-    const tables = codexConfigTables({ homeDir, env }), config = readRawIfPresent(codexConfigPath({ homeDir, env })) ?? '';
+    const config = codexConfig({ homeDir, env });
     const catalog = optionalJson(path.join(homeDir, '.agents', 'plugins', 'marketplace.json'));
     const personal = local && catalog?.plugins?.filter(row => row?.name === LEGACY_PLUGIN).length === 1 && catalog.plugins.some(releasedPersonalRow) ? catalog.name : null;
-    const official = officialCodexMarket(config); let retainMarket = false;
-    for (const id of tables.plugins) {
+    const official = officialCodexMarket(config.marketplaces); let retainMarket = false;
+    for (const id of config.plugins.keys()) {
       const market = id.split('@')[1];
       if (!isLegacyPlugin(id)) { if (market === LEGACY_MARKETPLACE) retainMarket = true; continue; }
       if (!(personal && market === personal || market === LEGACY_MARKETPLACE && official)) { pending = true; continue; }
       removals.push({ app: 'codex', args: ['plugin', 'remove', id, '--json'], done: `Removed codex plugin ${id}`,
         fallback(error) {
-          const backup = disableCodexPlugin({ homeDir, env, id }); pending = true;
+          const backup = setCodexPluginEnabled({ homeDir, env, id, enabled: false }); pending = true;
           if (market === LEGACY_MARKETPLACE) retainMarket = true;
           log(`Turned off codex plugin ${id}: Codex could not remove it now (${error.message.trim().split('\n').at(-1).trim()}). After restarting Codex, run the installer again to remove it.`);
           if (backup) log(`Previous Codex configuration backup: ${backup}`);
         } });
     }
-    if (tables.marketplaces.includes(LEGACY_MARKETPLACE)) {
+    if (Object.hasOwn(config.marketplaces, LEGACY_MARKETPLACE)) {
       if (official) removals.push({ ...marketplace('codex', LEGACY_MARKETPLACE), skip: () => retainMarket });
       else pending = true;
     }
@@ -513,10 +674,19 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
   }
   if (fs.existsSync(destination)) {
     if (!stageKind(destination)) throw new Error('The staging destination belongs to another directory or is not a verified installer stage. Preserve it elsewhere before installing.');
+  } else {
+    // An interrupted swap leaves its prepared stage next to the moved predecessor. A backup alone can also
+    // be left after a deliberate uninstall; the two swap names carry the same build stamp, including on 1.0.
+    const names = fs.readdirSync(pluginsDir), stagePrefix = `.${PLUGIN_NAME}.stage-`;
+    const pendingStamps = new Set(names.filter(name => name.startsWith(stagePrefix) && backupSuffix.test(name.slice(stagePrefix.length)))
+      .map(name => name.slice(stagePrefix.length, stagePrefix.length + 17)));
+    const predecessor = names.filter(name => namedBackup(name) && pendingStamps.has(name.slice(`.${PLUGIN_NAME}.backup-`.length).slice(0, 17)))
+      .sort().reverse().map(name => path.join(pluginsDir, name)).find(file => stageKind(file));
+    if (predecessor) throw new Error(`The installed stage is missing, but its backup ${predecessor} remains. An earlier update may have been interrupted. Inspect the backups and move the intended predecessor back to ${destination} before retrying.`);
   }
   const build = timestamp();
   const temporary = path.join(pluginsDir, `.${PLUGIN_NAME}.stage-${build}-${randomUUID()}`);
-  let backupDirectory = null, unchangedStage;
+  let backupDirectory = null, unchangedStage, preserveTemporary = false;
   try {
     fs.mkdirSync(temporary, { mode: 0o700 });
     restrictDirectory(temporary);
@@ -552,11 +722,19 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
       renameDirectoryWithRetry(destination, backupDirectory);
     }
     try { renameDirectoryWithRetry(temporary, destination); } catch (error) {
-      if (backupDirectory && !fs.existsSync(destination)) renameDirectoryWithRetry(backupDirectory, destination);
+      if (backupDirectory) {
+        try {
+          if (fs.existsSync(destination)) throw new Error('the installed path is occupied');
+          renameDirectoryWithRetry(backupDirectory, destination);
+        } catch (restoreError) {
+          preserveTemporary = true;
+          throw new Error(`${error.message} Rollback could not finish (${restoreError.message}). Inspect ${destination} and its preserved predecessor ${backupDirectory} before retrying.`);
+        }
+      }
       throw error;
     }
   } finally {
-    if (fs.existsSync(temporary)) {
+    if (!preserveTemporary && fs.existsSync(temporary)) {
       const resolved = fs.realpathSync(temporary);
       if (!contained(fs.realpathSync(pluginsDir), resolved) || path.basename(temporary).indexOf(`.${PLUGIN_NAME}.stage-`) !== 0) {
         throw new Error('Refusing cleanup outside the staging directory.');
@@ -564,34 +742,26 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
       fs.rmSync(temporary, { recursive: true, force: true });
     }
   }
-  let marketplaceBackup = null, priorCatalog = null;
+  let marketplaceBackup = null, priorCatalog = null, published = false;
+  const lockDirectory = path.join(path.dirname(marketplacePath), `.${PLUGIN_NAME}-marketplace-lock`);
   const undoStage = () => {
     if (!unchangedStage(destination) || readJson(path.join(destination, 'package.json')).version !== `${bundle.manifest.version.split('+')[0]}+codex.${build}`) throw new Error('The installed stage changed; it was not overwritten during rollback.');
     renameDirectoryWithRetry(destination, temporary);
     try { if (backupDirectory) renameDirectoryWithRetry(backupDirectory, destination); } catch (e) { renameDirectoryWithRetry(temporary, destination); throw e; }
     fs.rmSync(temporary, { recursive: true });
   };
-  try { if (codex) {
-    const lockDirectory = path.join(path.dirname(marketplacePath), `.${PLUGIN_NAME}-marketplace-lock`);
+  // Compensate only what was committed: this run's whole catalog, or its exact row inside a later writer's catalog.
+  const undoCatalog = () => {
+    if (!published) return;
     withStateLock(lockDirectory, () => {
-      // Staging may take time: merge into the latest catalog under a short lock.
-      // The final comparison also detects changes from non-cooperating writers
-      // before the replacement, rather than reusing the pre-staging snapshot.
-      const expectedPrevious = readRawIfPresent(marketplacePath);
-      priorCatalog = expectedPrevious;
-      marketplace = codexMarketplacePlan(marketplacePath, expectedPrevious);
-      marketplaceBackup = writeJsonAtomic(marketplacePath, marketplace, { expectedPrevious });
-    });
-  } } catch (error) { undoStage(); throw error; }
-  const undo = () => {
-    undoStage();
-    if (!codex || priorCatalog === jsonText(marketplace)) return;
-    withStateLock(path.join(path.dirname(marketplacePath), `.${PLUGIN_NAME}-marketplace-lock`), () => {
       const current = readRawIfPresent(marketplacePath);
+      if (current === priorCatalog) return;
       if (current === jsonText(marketplace)) {
         if (priorCatalog === null) fs.unlinkSync(marketplacePath);
         else writeTextAtomic(marketplacePath, priorCatalog, { expectedPrevious: current, saveBackup: false });
-      } else if (current !== null) {
+      } else if (current === null) {
+        if (priorCatalog !== null) throw new Error('The prior marketplace was removed externally and could not be restored.');
+      } else {
         const catalog = JSON.parse(current.replace(/^\uFEFF/, ''));
         const rows = catalog.plugins.filter(entry => entry?.name === PLUGIN_NAME);
         const before = priorCatalog && JSON.parse(priorCatalog.replace(/^\uFEFF/, '')).plugins.find(entry => entry?.name === PLUGIN_NAME);
@@ -602,6 +772,27 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
       }
     });
   };
+  const undo = () => {
+    const failures = [];
+    for (const step of [undoStage, undoCatalog]) { try { step(); } catch (error) { failures.push(error); } }
+    if (failures.length) throw failures[0];
+  };
+  try { if (codex) {
+    withStateLock(lockDirectory, () => {
+      // Staging may take time: merge into the latest catalog under a short lock.
+      // The final comparison also detects changes from non-cooperating writers
+      // before the replacement, rather than reusing the pre-staging snapshot.
+      const expectedPrevious = readRawIfPresent(marketplacePath);
+      priorCatalog = expectedPrevious;
+      marketplace = codexMarketplacePlan(marketplacePath, expectedPrevious);
+      marketplaceBackup = writeJsonAtomic(marketplacePath, marketplace, { expectedPrevious, onPublished: () => { published = true; } });
+    });
+  } } catch (error) {
+    try { undo(); } catch {
+      throw new Error(`${error.message} Rollback could not finish. Inspect ${destination}${backupDirectory ? ` and its preserved predecessor ${backupDirectory}` : ''} and ${marketplacePath} before retrying.`);
+    }
+    throw error;
+  }
   return { destination, stateDir, marketplacePath: marketplace ? marketplacePath : null,
     marketplaceName: marketplace?.name ?? null, undo,
     build, backupDirectory, marketplaceBackup, codex, claude, unchangedStage };
@@ -645,18 +836,102 @@ function samePath(left, right) {
   } catch { return path.resolve(left) === path.resolve(right); }
 }
 
+/** Equal trees of regular files; a link or any other entry is never equal. */
+function sameTree(left, right) {
+  const entries = dir => fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+  const a = entries(left), b = entries(right);
+  return a.length === b.length && a.every((entry, n) => {
+    const other = b[n], x = path.join(left, entry.name), y = path.join(right, other.name);
+    if (entry.name !== other.name || entry.isSymbolicLink() || other.isSymbolicLink()) return false;
+    if (entry.isDirectory()) return other.isDirectory() && sameTree(x, y);
+    return entry.isFile() && other.isFile() && fs.readFileSync(x).equals(fs.readFileSync(y));
+  });
+}
+
+/** Codex's add replaces its cached copy of a plugin. Hand it over only when a stage here holds the same bytes. */
+function checkCodexCache({ homeDir, env, marketplaceName, stagedCopy, preflight = true }) {
+  const cache = path.join(codexHome({ env, homeDir }), 'plugins', 'cache', marketplaceName, PLUGIN_NAME);
+  const directories = (dir, keep) => {
+    try { return fs.readdirSync(dir, { withFileTypes: true }).filter(keep).map(entry => path.join(dir, entry.name)); }
+    catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  };
+  const stages = directories(path.resolve(homeDir, 'plugins'), entry => entry.isDirectory() && !entry.isSymbolicLink() &&
+    (entry.name === PLUGIN_NAME || namedBackup(entry.name))).filter(stageKind);
+  for (const copy of directories(cache, () => true)) {
+    if (fs.lstatSync(copy).isDirectory() && (stagedCopy?.(copy) || stages.some(stage => { try { return sameTree(stage, copy); } catch { return false; } }))) continue;
+    throw new Error(`Codex keeps a copy of the bridge in ${copy} that differs from every installer stage, and updating replaces that folder. ${preflight ? 'Nothing was changed.' : 'The cache was left alone.'} To keep its contents, move the folder out of the Codex cache; otherwise delete it. Then run the installer again.`);
+  }
+}
+
+/** Before any change: Codex state must be readable, its cache must be ours to replace, and no other source may keep serving the bridge. */
+function disabledUpdate(id) {
+  return new Error(`Codex has ${id} turned off. Its update command would turn it on, so the installer did not update it. To keep it off, leave this Codex installation alone; use --claude to update Claude only. When you want to use it again, turn it on in Codex and rerun the installer.`);
+}
+function checkRegistrations({ homeDir, env, execute, selection }) {
+  const others = [];
+  if (selection.codex) {
+    const marketplaceName = codexMarketplacePlan(path.resolve(homeDir, '.agents', 'plugins', 'marketplace.json')).name;
+    const config = codexConfig({ homeDir, env });
+    // Let the native loader validate the full configuration (including scalar values and host-specific types)
+    // without loading marketplaces or changing registrations. Membership itself still comes from the table.
+    if (config.text) try { execute('codex', ['features', 'list']); } catch {
+      throw new Error(`Codex could not validate ${config.filename}. Nothing was changed. Run \`codex features list\` and resolve its configuration error before retrying.`);
+    }
+    const selector = `${PLUGIN_NAME}@${marketplaceName}`;
+    if (config.plugins.get(selector)?.enabled === false) throw disabledUpdate(selector);
+    for (const [id, { enabled }] of config.plugins) {
+      const market = id.slice(PLUGIN_NAME.length + 1);
+      if (!id.startsWith(`${PLUGIN_NAME}@`) || market === marketplaceName || enabled === false) continue;
+      others.push(`Codex has ${id} turned on. To switch to this installer, run \`codex plugin remove ${id}\` or turn it off in Codex. To stay on that source, update it from the ${market} marketplace instead.`);
+    }
+    checkCodexCache({ homeDir, env, marketplaceName });
+  }
+  if (selection.claude) {
+    for (const entry of readList(execute('claude', ['plugin', 'list', '--json']), 'plugins')) {
+      const id = pluginSelector(entry), scope = entry.scope ?? 'user';
+      if (typeof id !== 'string' || !id.startsWith(`${PLUGIN_NAME}@`) || id === `${PLUGIN_NAME}@${CLAUDE_MARKETPLACE}`) continue;
+      let status = 'turned on';
+      if (entry.enabled === false) {
+        if (!['local', 'project'].includes(scope) && !entry.projectPath) continue;
+        // Outside its project even an enabled project registration can be listed as disabled.
+        let scoped;
+        if (typeof entry.projectPath === 'string' && path.isAbsolute(entry.projectPath)) try {
+          scoped = readList(execute('claude', ['plugin', 'list', '--json'], { cwd: entry.projectPath }), 'plugins')
+            .filter(row => pluginSelector(row) === id && row.scope === scope && row.projectPath === entry.projectPath);
+        } catch { /* Inaccessible project: do not assume it is disabled. */ }
+        if (scoped?.length === 1 && scoped[0].enabled === false) continue;
+        if (scoped?.length !== 1 || scoped[0].enabled !== true) status = 'with an unverified enabled state';
+      }
+      const where = entry.projectPath ? ` in ${entry.projectPath}` : '';
+      others.push(`Claude has ${id} (${scope} scope) ${status}. To switch to this installer, run \`claude plugin uninstall ${id} --scope ${scope}\` or \`claude plugin disable ${id} --scope ${scope}\`${where}. To stay on that source, run \`claude plugin update ${id} --scope ${scope}\`${where} instead of this installer.`);
+    }
+  }
+  if (others.length) throw new Error([`Another enabled ${PLUGIN_NAME} registration would keep serving beside this installation, so nothing was changed.`, ...others.map(line => `- ${line}`), 'Then run the installer again.'].join('\n'));
+}
+
 export function installApplications(prepared, { execute = run, homeDir = os.homedir(), env = process.env,
   log = console.log, grantPermission = grantClaudeSendPermission, undoNew = [], restorePrior = [] } = {}) {
   if (prepared.codex) {
     const selector = `${PLUGIN_NAME}@${prepared.marketplaceName}`;
-    const installed = codexConfigTables({ homeDir, env }).plugins.includes(selector);
-    const add = () => execute('codex', ['plugin', 'add', selector, '--json']);
-    if (installed) restorePrior.push(add);
+    const registered = () => codexConfig({ homeDir, env }).plugins.get(selector);
+    // Read before any Codex change; an unreadable configuration stops here and the stage is restored.
+    const before = registered();
+    if (before?.enabled === false) throw disabledUpdate(selector);
+    // A later client can fail (or a user can edit the cache) after preflight. Check again at every
+    // destructive native call, including compensation after the newly staged directory was rolled back.
+    const verifyCache = () => checkCodexCache({ homeDir, env, marketplaceName: prepared.marketplaceName, stagedCopy: prepared.unchangedStage, preflight: false });
+    const remove = () => { verifyCache(); execute('codex', ['plugin', 'remove', selector, '--json']); };
+    const add = () => {
+      if (registered()?.enabled === false) throw disabledUpdate(selector);
+      verifyCache();
+      execute('codex', ['plugin', 'add', selector, '--json']);
+    };
+    if (before) restorePrior.push(add);
     try { add(); } catch (e) {
-      if (!installed && codexConfigTables({ homeDir, env }).plugins.includes(selector)) undoNew.push(() => execute('codex', ['plugin', 'remove', selector, '--json']));
+      if (!before) undoNew.push(() => { if (registered()) remove(); });
       throw e;
     }
-    if (!installed) undoNew.push(() => execute('codex', ['plugin', 'remove', selector, '--json']));
+    if (!before) undoNew.push(remove);
     log('Codex plugin installed or updated.');
   }
   if (prepared.claude) {
@@ -745,6 +1020,7 @@ function installSelected(args, { homeDir, env, execute, log, selection }) {
   if (!args.includes('--prepare-only')) {
     for (const app of ['claude', 'codex']) if (selection[app]) execute(app, ['--version']);
     if (selection.claude) grantClaudeSendPermission({ homeDir, env, preview: true });
+    checkRegistrations({ homeDir, env, execute, selection });
   }
   const prepared = prepareInstallation({ homeDir, env, log, ...selection });
   log(`Prepared ${PLUGIN_NAME} in ${prepared.destination}`);
@@ -762,7 +1038,7 @@ function installSelected(args, { homeDir, env, execute, log, selection }) {
     for (const undo of [...undoNew.reverse(), prepared.undo, ...restorePrior]) {
       try { undo(); } catch (e) { failures.push(e); }
     }
-    if (failures.length) throw new Error(`${error.message} Rollback could not finish. Inspect ${prepared.destination}${prepared.backupDirectory ? ` and its preserved predecessor ${prepared.backupDirectory}` : ''} and the selected registrations before retrying.`);
+    if (failures.length) throw new Error(`${error.message} Rollback could not finish. Inspect ${prepared.destination}${prepared.backupDirectory ? ` and its preserved predecessor ${prepared.backupDirectory}` : ''} and the selected registrations before retrying. ${failures.map(e => e.message).join(' ')}`);
     throw error;
   }
   // Cut over only after the replacement works. A cleanup failure is not a failed installation.
@@ -772,7 +1048,7 @@ function installSelected(args, { homeDir, env, execute, log, selection }) {
       const previous = readRawIfPresent(prepared.marketplacePath), catalog = JSON.parse(previous.replace(/^\uFEFF/, ''));
       const rows = catalog.plugins.filter(entry => entry?.name === LEGACY_PLUGIN);
       if (!rows.length) return;
-      if (rows.length !== 1 || !releasedPersonalRow(rows[0]) || !legacyLocalStage(homeDir) || codexConfigTables({ homeDir, env }).plugins.includes(`${LEGACY_PLUGIN}@${catalog.name}`)) {
+      if (rows.length !== 1 || !releasedPersonalRow(rows[0]) || !legacyLocalStage(homeDir) || codexConfig({ homeDir, env }).plugins.has(`${LEGACY_PLUGIN}@${catalog.name}`)) {
         prepared.cleanupPending = true; log('The old personal catalog entry was preserved. Review it in Codex before removing it.'); return;
       }
       const keep = catalog.plugins.filter(entry => entry !== rows[0]);

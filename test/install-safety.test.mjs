@@ -136,11 +136,12 @@ test('a failed install preserves an intervening edit inside the stage and identi
 });
 
 test('subsequent installations never prune backup files with locally edited runtime content', async t => {
-  const f = fixture(t); await main(['--prepare-only'], f.options);
-  fs.writeFileSync(path.join(f.stage, 'scripts/mcp.mjs'), 'local changes');
+  // A one-byte edit keeps the size, so only the byte comparison can tell the backup from installer output.
+  const f = fixture(t), module = path.join(f.stage, 'scripts/mcp.mjs'); await main(['--prepare-only'], f.options);
+  const edited = fs.readFileSync(module); edited[0] ^= 1; fs.writeFileSync(module, edited);
   const { backupDirectory } = await main(['--prepare-only'], f.options);
   await main(['--prepare-only'], f.options);
-  assert.equal(read(path.join(backupDirectory, 'scripts/mcp.mjs')), 'local changes');
+  assert.deepEqual(fs.readFileSync(path.join(backupDirectory, 'scripts/mcp.mjs')), edited);
 });
 
 for (const failed of ['marketplace', 'plugin']) test(`rollback inspects a Claude ${failed} registration written just before a CLI error`, async t => {

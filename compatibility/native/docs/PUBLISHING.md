@@ -2,7 +2,7 @@
 
 ## Prepare the source
 
-These steps require a Git source checkout, not an extracted plugin. Edit release identity, version, and presentation in root `plugin.json`, and the portable stdio entry in root `mcp.json`. Run `npm run manifests:sync` to update `package.json`, the native adapters, and `compatibility/native/`. Commit the generated tree with the source changes: the Git marketplaces install it. Keep the release MCP environment empty; check, sync and package reject local overrides. For a private install, set the local configuration at install time instead.
+These steps require a Git source checkout, not an extracted plugin. Edit release identity, version, and presentation in root `plugin.json`, and the portable stdio entry in root `mcp.json`. Run `npm run manifests:sync` once to update `package.json`, the native adapters, and `compatibility/native/`, including after a version change. Commit the generated tree with the source changes: the Git marketplaces install it. Keep the release MCP environment empty; check, sync and package reject local overrides. For a private install, set the local configuration at install time instead.
 
 The plugin identity and skill namespace are `bridge-claude-codex`; the npm package and archive identity remain `claude-codex-bridge`. The native deployment stores its portable inputs in `config/plugin-source.json` and `config/mcp-source.json` so portable discovery does not change what Codex loads. It retains Codex's native `env_vars`; Claude uses a plugin-only inline server definition with supported nonsecret environment references, not a project `.mcp.json`. The installer stamps the staged version in all manifests and in the Claude launch arguments so an applied interactive reload sees a configuration change.
 

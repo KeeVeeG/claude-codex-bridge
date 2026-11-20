@@ -36,7 +36,13 @@ codex plugin marketplace add https://github.com/KeeVeeG/claude-codex-bridge.git
 codex plugin add bridge-claude-codex@keeveeg
 ```
 
-To update, run the installer again from the updated checkout or native ZIP with the same route settings. For a marketplace installation, update the marketplace and plugin through each client's plugin manager. Then load the new server in each client:
+To update, run the installer again from the updated checkout or native ZIP with the same route settings. For a marketplace installation, update the marketplace and plugin through each client's plugin manager. Use one source per client: while another source's `bridge-claude-codex` is turned on in a client, the installer changes nothing and names the command that removes or turns off that registration.
+
+- **Before updating 1.0.0–1.0.2 with the installer**, fully quit Claude and Codex, including terminal sessions, before you run it: those servers load code from the staged folder the installer replaces, so a running one could mix versions. If you are not sure which version or source you have, quit them first as well.
+- **Turned-off plugins:** Codex has no update command that keeps a plugin turned off. If you turned the bridge off, the installer stops before updating either client. Use `--claude` to update Claude alone. When you want to use the Codex bridge again, turn it on and rerun the installer. Adding it from a Codex marketplace also turns it on; after a marketplace update, turn it off again in Codex to keep that choice. Claude keeps a disabled plugin disabled when it updates.
+- **Client caches:** keep local edits outside `plugins/cache` in the Codex home or Claude configuration directory. A Codex update replaces its cached copy; Claude can keep the old version, but the new version does not include your edits. If Codex's cached copy differs from every verified installer stage, the installer stops and names the folder to move. A marketplace update makes no such check.
+
+Then load the new server in each client:
 
 - **Interactive Claude Code CLI:** run `/reload-plugins`, then check `/mcp`. If it warns that the conversation would be re-read, run `/reload-plugins --force` to apply the pending reload. If it still shows the old server, restart the session.
 - **Claude Desktop:** fully quit it, including the background instance, and reopen. A non-interactive Claude Code session needs a new session to reconnect plugin MCP servers.

@@ -12,6 +12,9 @@ if (app === 'codex') {
   // Like Codex with an unreadable unrelated marketplace: listings fail, while adding and
   // removing still work and keep their record as tables in config.toml.
   // Synchronous writes: piped console output can be lost on an immediate exit on Windows.
+  // Core configuration validation doesn't enumerate marketplaces. This fixture's TOML is readable;
+  // only plugin/marketplace listings encounter its unavailable unrelated marketplace.
+  if (args[0] === 'features' && args[1] === 'list') process.exit(0);
   if (args[1] === 'list' || args[2] === 'list') {
     fs.writeSync(2, 'Error: failed to load configured marketplace snapshot(s)\n');
     process.exit(1);

@@ -140,6 +140,16 @@ test('packaging stops on manifest identity/version drift or generated native run
   });
 });
 
+test('one manifest sync after a version bump aligns the package and the native mirror', t => {
+  const { source } = copySource(t), manifest = path.join(source, 'plugin.json');
+  const value = JSON.parse(fs.readFileSync(manifest, 'utf8')); value.version = '9.8.7'; fs.writeFileSync(manifest, json(value));
+  syncManifests(source);
+  for (const relative of ['package.json', 'compatibility/native/package.json', 'compatibility/native/.codex-plugin/plugin.json']) {
+    assert.equal(JSON.parse(fs.readFileSync(path.join(source, relative), 'utf8')).version, '9.8.7', relative);
+  }
+  assert.equal(checkManifests(source).manifest.version, '9.8.7');
+});
+
 test('release ZIPs contain exactly the native or portable allowlist and reproducible bytes with verified checksums', t => {
   const { directory, source } = copySource(t);
   fs.writeFileSync(path.join(source, 'credentials.key'), 'not-a-real-secret');
