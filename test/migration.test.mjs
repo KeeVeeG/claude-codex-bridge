@@ -238,9 +238,14 @@ test('Windows privacy diagnostic warns on inherited read access without changing
   assert.equal(spawnSync('icacls.exe', [directory], options).stdout, before.stdout);
 
   // A real private DACL is clear; inability to inspect is not clear. Only the fixture changes the ACL.
-  const identity = spawnSync('whoami.exe', ['/user', '/fo', 'csv', '/nh'], options);
-  const sid = identity.stdout?.match(/"(S-1-[\d-]+)"\s*$/)?.[1];
-  assert.ok(identity.status === 0 && sid, 'could not identify the fixture owner');
+  // Read the token SID directly. PATH may select a Unix whoami, and account names are localized.
+  const powershell = path.join(process.env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
+  const identity = spawnSync(powershell, ['-NoProfile', '-NonInteractive', '-Command',
+    '[Console]::Write([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)'], options);
+  assert.ifError(identity.error);
+  assert.equal(identity.status, 0, 'could not read the fixture process token');
+  const sid = identity.stdout.trim();
+  assert.ok(/^S-1-\d+(?:-\d+)+$/.test(sid), 'the fixture process token did not return a SID');
   const protect = spawnSync('icacls.exe', [directory, '/inheritance:r', '/grant:r', `*${sid}:(OI)(CI)(F)`], options);
   assert.equal(protect.status, 0);
   assert.equal(await probe(), undefined);
