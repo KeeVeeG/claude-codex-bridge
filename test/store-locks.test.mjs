@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { createSession, processAlive, readSession, updateSession, readMacProcessStart, macLockOwnerAlive } from '../lib/store.mjs';
 import { nativeFixture as fixture } from './native-helpers.mjs';
@@ -20,10 +19,11 @@ function worker(t, script, args, { watchdogMs = 15_000 } = {}) {
   let readyReject;
   let isReady = false;
   const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
-  const exited = new Promise((resolve, reject) => {
-    child.on('error', error => { readyReject(error); reject(error); });
-    child.on('exit', (code, signal) => {
-      if (!isReady) readyReject(new Error(`Worker exited before ready (${code ?? signal}): ${stderr}`));
+  let spawnError;
+  child.on('error', error => { spawnError = error; });
+  const closed = new Promise(resolve => {
+    child.once('close', (code, signal) => {
+      if (!isReady) readyReject(spawnError ?? new Error(`Worker closed before ready (${code ?? signal}): ${stderr}`));
       resolve({ code, signal, stdout, stderr });
     });
   });
@@ -35,12 +35,12 @@ function worker(t, script, args, { watchdogMs = 15_000 } = {}) {
   });
   child.stderr.on('data', text => { stderr += text; });
   const watchdog = setTimeout(() => child.kill(), watchdogMs);
-  exited.finally(() => clearTimeout(watchdog));
+  closed.then(() => clearTimeout(watchdog));
   t.after(async () => {
     if (child.exitCode === null && child.signalCode === null) child.kill();
-    await exited;
+    await closed;
   });
-  return { child, ready, exited };
+  return { ready, closed };
 }
 
 test('simultaneous crash recovery never unlinks a replacement lock or loses updates', { timeout: 30_000 }, async t => {
@@ -53,21 +53,24 @@ test('simultaneous crash recovery never unlinks a replacement lock or loses upda
   fs.writeFileSync(lock, JSON.stringify({ pid: DEAD_PID, token: 'dead-owner' }));
   const script = `
     import fs from 'node:fs';
+    import { performance } from 'node:perf_hooks';
     import { loadSession, updateSession } from ${JSON.stringify(storeUrl)};
     const [stateDir, sessionKey, gate, sentinel, lock] = process.argv.slice(1);
     const session = loadSession({ stateDir, sessionKey });
     const sleeper = new Int32Array(new SharedArrayBuffer(4));
     const originalRead = fs.readFileSync;
+    let firstStaleRead = true;
     fs.readFileSync = function(file, ...args) {
       const result = originalRead.call(this, file, ...args);
-      // Hold a stale observation long enough for concurrent recovery attempts.
-      // A compare-then-unlink implementation can delete the next owner's lock.
-      if (file === lock && String(result).includes('dead-owner')) Atomics.wait(sleeper, 0, 0, 35);
+      // Every worker must have captured the stale bytes before any can recover.
+      if (firstStaleRead && file === lock && String(result).includes('dead-owner')) {
+        firstStaleRead = false;
+        fs.writeSync(1, 'ready\\n');
+        while (!fs.existsSync(gate)) Atomics.wait(sleeper, 0, 0, 5);
+      }
       return result;
     };
-    process.stdout.write('ready\\n');
-    while (!fs.existsSync(gate)) Atomics.wait(sleeper, 0, 0, 5);
-    const deadline = Date.now() + 20_000;
+    const deadline = performance.now() + 20_000;
     for (let count = 0; count < 25; count++) {
       for (;;) {
         let callbackStarted = false;
@@ -85,7 +88,7 @@ test('simultaneous crash recovery never unlinks a replacement lock or loses upda
           // The documented busy-acquisition rejection occurs before callback.
           // Retry that exact case under the overall stress budget; never replay
           // a callback, a state-write failure, or a broken critical section.
-          if (callbackStarted || error.message !== 'Bridge state is busy; retry with the same message ID' || Date.now() >= deadline) throw error;
+          if (callbackStarted || error.reason !== 'state_busy' || performance.now() >= deadline) throw error;
           Atomics.wait(sleeper, 0, 0, 10);
         }
       }
@@ -94,7 +97,7 @@ test('simultaneous crash recovery never unlinks a replacement lock or loses upda
   const workers = Array.from({ length: 8 }, () => worker(t, script, [setup.stateDir, session.key, gate, sentinel, lock], { watchdogMs: 25_000 }));
   await Promise.all(workers.map(item => item.ready));
   fs.writeFileSync(gate, 'go');
-  const results = await Promise.all(workers.map(item => item.exited));
+  const results = await Promise.all(workers.map(item => item.closed));
   for (const result of results) assert.equal(result.code, 0, result.stderr);
   assert.equal(readSession(session).counter, 200);
   assert.equal(fs.existsSync(lock), false);
@@ -119,11 +122,11 @@ test('a crash around atomic lock publication leaves either no lock or a recovera
           }
           return original(source, destination);
         };
-        process.stdout.write('ready\\n');
+        fs.writeSync(1, 'ready\\n');
         updateSession(loadSession({ stateDir, sessionKey }), state => { state.unexpected = true; });
       `, [setup.stateDir, session.key, lock, phase]);
       await child.ready;
-      const result = await child.exited;
+      const result = await child.closed;
       assert.equal(result.code, phase === 'after-link' ? 38 : 37, result.stderr);
       assert.equal(fs.existsSync(lock), phase === 'after-link');
       if (phase === 'after-link') assert.doesNotThrow(() => JSON.parse(fs.readFileSync(lock, 'utf8')));
@@ -195,15 +198,14 @@ test('macOS lock identity distinguishes PID reuse and conservatively retains an 
   assert.equal(macLockOwnerAlive(owner, changing), false, 'foreign PID identity must be reprobed before stale recovery');
 });
 
-test('legacy macOS locks recover only when the live process verifiably started after lock creation', () => {
+test('legacy macOS locks never disprove a live PID with a wall timestamp alone', () => {
   const started = '2026-10-15T07:08:09.000Z';
   const startMs = Date.parse(started);
   const options = { isAlive: () => true, readStart: () => started };
-  assert.equal(macLockOwnerAlive({ pid: 123, createdAt: startMs - 6000 }, options), false);
-  for (const createdAt of [startMs - 5000, startMs - 1000, startMs, startMs + 1000, undefined, null, 'earlier', -1]) {
-    assert.equal(macLockOwnerAlive({ pid: 123, createdAt }, options), true);
+  for (const createdAt of [startMs - 3_600_000, startMs - 6000, startMs, startMs + 3_600_000, undefined, null, 'earlier', -1]) {
+    assert.equal(macLockOwnerAlive({ pid: 123, createdAt }, options), true, `createdAt: ${createdAt}`);
   }
-  assert.equal(macLockOwnerAlive({ pid: 123, createdAt: startMs - 6000 }, { ...options, readStart: () => null }), true);
+  assert.equal(macLockOwnerAlive({ pid: 123, createdAt: startMs + 3_600_000 }, { ...options, isAlive: () => false }), false);
 });
 
 test('macOS locks persist actual creation identity and recover a prior incarnation of a live PID',
@@ -213,18 +215,14 @@ test('macOS locks persist actual creation identity and recover a prior incarnati
     const lock = path.join(session.dir, 'state.lock');
     const actual = readMacProcessStart(process.pid);
     assert.match(actual, /^\d{4}-\d{2}-\d{2}T/);
-    for (const prior of [
-      { procStartUtc: '1970-01-01T00:00:00.000Z', createdAt: Date.now() - 2000 },
-      { createdAt: Date.parse(actual) - 6000 },
-    ]) {
-      fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'earlier-process', ...prior }));
-      updateSession(session, state => {
-        assert.equal(JSON.parse(fs.readFileSync(lock, 'utf8')).procStartUtc, actual);
-        state.recovered = (state.recovered ?? 0) + 1;
-      });
-      assert.equal(fs.existsSync(lock), false);
-    }
-    assert.equal(readSession(session).recovered, 2);
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'earlier-process',
+      procStartUtc: '1970-01-01T00:00:00.000Z', createdAt: Date.now() - 2000 }));
+    updateSession(session, state => {
+      assert.equal(JSON.parse(fs.readFileSync(lock, 'utf8')).procStartUtc, actual);
+      state.recovered = true;
+    });
+    assert.equal(fs.existsSync(lock), false);
+    assert.equal(readSession(session).recovered, true);
   });
 
 test('transient Windows sharing errors retry linking and reading the main lock',
@@ -278,7 +276,7 @@ test('an old live owner is waited for and never stolen', { timeout: 15_000 }, as
     updateSession(loadSession({ stateDir, sessionKey }), state => {
       const old = new Date(Date.now() - 120_000);
       fs.utimesSync(lock, old, old);
-      process.stdout.write('ready\\n');
+      fs.writeSync(1, 'ready\\n');
       while (!fs.existsSync(gate)) Atomics.wait(sleeper, 0, 0, 5);
       state.counter = (state.counter ?? 0) + 1;
     });
@@ -286,19 +284,42 @@ test('an old live owner is waited for and never stolen', { timeout: 15_000 }, as
   await owner.ready;
   const originalLock = fs.readFileSync(lock, 'utf8');
   const contender = worker(t, `
+    import assert from 'node:assert/strict';
+    import fs from 'node:fs';
     import { loadSession, updateSession } from ${JSON.stringify(storeUrl)};
-    const [stateDir, sessionKey] = process.argv.slice(1);
-    process.stdout.write('ready\\n');
-    updateSession(loadSession({ stateDir, sessionKey }), state => { state.counter = (state.counter ?? 0) + 1; });
-  `, [setup.stateDir, session.key]);
+    const [stateDir, sessionKey, lock, expected] = process.argv.slice(1);
+    const read = fs.readFileSync;
+    let observations = 0;
+    fs.readFileSync = (file, ...args) => {
+      const result = read(file, ...args);
+      if (file === lock) {
+        assert.equal(String(result), expected);
+        observations++;
+      }
+      return result;
+    };
+    assert.throws(() => updateSession(loadSession({ stateDir, sessionKey }),
+      () => assert.fail('Contender entered a critical section held by the live owner'),
+      { waitMs: 1, now: () => observations >= 2 ? 1 : 0 }), { reason: 'state_busy' });
+    assert.ok(observations >= 2, 'Contender must retry against the known live lock');
+    fs.writeSync(1, 'ready\\n');
+  `, [setup.stateDir, session.key, lock, originalLock]);
   await contender.ready;
-  await delay(150);
+  const contended = await contender.closed;
+  assert.equal(contended.code, 0, contended.stderr);
   assert.equal(fs.readFileSync(lock, 'utf8'), originalLock);
-  assert.equal(contender.child.exitCode, null);
   fs.writeFileSync(gate, 'release');
-  for (const result of await Promise.all([owner.exited, contender.exited])) assert.equal(result.code, 0, result.stderr);
+  const released = await owner.closed;
+  assert.equal(released.code, 0, released.stderr);
+  updateSession(session, state => { state.counter = (state.counter ?? 0) + 1; });
   assert.equal(readSession(session).counter, 2);
 });
+
+function assertDoctorRecovery(error) {
+  assert.match(error.message, /\bbridge_doctor\b/);
+  assert.doesNotMatch(error.message, /state\.(?:lock|json)\b/);
+  return true;
+}
 
 test('a crashed recovery guard stops safely without removing either lock', async t => {
   assert.equal(processAlive(DEAD_PID), false);
@@ -310,10 +331,32 @@ test('a crashed recovery guard stops safely without removing either lock', async
   const staleRecovery = JSON.stringify({ pid: DEAD_PID, token: 'dead-recovery' });
   fs.writeFileSync(lock, staleLock);
   fs.writeFileSync(recovery, staleRecovery);
-  assert.throws(() => updateSession(session, state => { state.unexpected = true; }), /recovery was interrupted/);
+  assert.throws(() => updateSession(session, () => assert.fail('Crashed guard cannot grant ownership')), assertDoctorRecovery);
   assert.equal(fs.readFileSync(lock, 'utf8'), staleLock);
   assert.equal(fs.readFileSync(recovery, 'utf8'), staleRecovery);
   assert.equal(readSession(session).unexpected, undefined);
+});
+
+test('unverifiable lock metadata directs to doctor without changing locks or state', async t => {
+  for (const target of ['main', 'recovery']) {
+    for (const [format, invalid] of [['empty', ''], ['missing PID', '{"token":"unverified"}']]) {
+      await t.test(`${target}: ${format}`, async sub => {
+        const setup = await fixture(sub);
+        const session = createSession({ ...setup, threadId: `invalid-${target}-${format}` });
+        const lock = path.join(session.dir, 'state.lock');
+        const recovery = path.join(session.dir, 'state.lock.recovery');
+        const mainBytes = target === 'main' ? invalid : JSON.stringify({ pid: DEAD_PID, token: 'dead-owner' });
+        fs.writeFileSync(lock, mainBytes);
+        if (target === 'recovery') fs.writeFileSync(recovery, invalid);
+        const stateBefore = fs.readFileSync(session.stateFile, 'utf8');
+        assert.throws(() => updateSession(session, () => assert.fail('Invalid lock cannot grant ownership')), assertDoctorRecovery);
+        assert.equal(fs.readFileSync(lock, 'utf8'), mainBytes);
+        if (target === 'recovery') assert.equal(fs.readFileSync(recovery, 'utf8'), invalid);
+        else assert.equal(fs.existsSync(recovery), false);
+        assert.equal(fs.readFileSync(session.stateFile, 'utf8'), stateBefore);
+      });
+    }
+  }
 });
 
 test('Windows recovery-guard contention retries exclusive acquisition before removing a stale lock',
@@ -358,12 +401,14 @@ test('transient Windows sharing errors while reading another recovery guard do n
     const read = fs.readFileSync;
     let reads = 0;
     let callbacks = 0;
+    let otherGuardGone = false;
     t.mock.method(fs, 'readFileSync', (file, ...args) => {
-      if (file === recovery) {
+      if (file === recovery && !otherGuardGone) {
         reads++;
         assert.equal(fs.existsSync(lock), true, 'a failed guard read cannot remove the main lock');
         if (reads <= 2) throw Object.assign(new Error('Temporary guard read contention'), { code: 'EPERM' });
         fs.unlinkSync(recovery);
+        otherGuardGone = true;
         throw Object.assign(new Error('Other guard finished'), { code: 'ENOENT' });
       }
       return read(file, ...args);
@@ -499,18 +544,57 @@ test('persistent Windows recovery-guard contention stops at the existing deadlin
     const link = fs.linkSync;
     const expected = Object.assign(new Error('Recovery guard remains busy'), { code: 'EPERM' });
     let attempts = 0;
-    let now = 100_000;
-    t.mock.method(Date, 'now', () => { now += 1000; return now; });
+    let elapsed = 0;
     t.mock.method(fs, 'linkSync', (source, destination) => {
-      if (destination === recovery) { attempts++; throw expected; }
+      if (destination === recovery) {
+        attempts++;
+        elapsed += 1000;
+        throw expected;
+      }
       return link(source, destination);
     });
-    assert.throws(() => updateSession(session, state => { state.unexpected = true; }), error => error === expected);
+    assert.throws(() => updateSession(session, () => assert.fail('A failed guard cannot grant ownership'),
+      { now: () => elapsed, waitMs: 5000 }), error => error === expected);
     assert.equal(attempts, 5);
     assert.equal(fs.readFileSync(lock, 'utf8'), stale);
     assert.equal(fs.existsSync(recovery), false);
     assert.equal(readSession(session).unexpected, undefined);
   });
+
+test('recovery rechecks the main owner after acquiring the guard', async t => {
+  const setup = await fixture(t);
+  const session = createSession({ ...setup, threadId: 'guard-acquired-replacement' });
+  const lock = path.join(session.dir, 'state.lock');
+  const recovery = path.join(session.dir, 'state.lock.recovery');
+  fs.writeFileSync(lock, JSON.stringify({ pid: DEAD_PID, token: 'dead-owner' }));
+  const live = JSON.stringify({ pid: process.pid, token: 'live-replacement' });
+  const stateBefore = fs.readFileSync(session.stateFile, 'utf8');
+  const link = fs.linkSync;
+  const unlink = fs.unlinkSync;
+  let replacements = 0;
+  let lockUnlinks = 0;
+  let elapsed = 0;
+  t.mock.method(fs, 'linkSync', (source, destination) => {
+    link(source, destination);
+    if (destination === recovery) {
+      replacements++;
+      fs.writeFileSync(lock, live);
+    }
+  });
+  t.mock.method(fs, 'unlinkSync', file => {
+    if (file === lock) lockUnlinks++;
+    unlink(file);
+    // Leave enough budget to recheck ownership while the guard is held.
+    if (file === recovery) elapsed = 1;
+  });
+  assert.throws(() => updateSession(session, () => assert.fail('A live replacement cannot grant ownership'),
+    { now: () => elapsed, waitMs: 1 }), { reason: 'state_busy' });
+  assert.equal(replacements, 1, 'The replacement must occur after taking the recovery guard');
+  assert.equal(lockUnlinks, 0, 'The live replacement must never be unlinked');
+  assert.equal(fs.readFileSync(lock, 'utf8'), live);
+  assert.equal(fs.existsSync(recovery), false);
+  assert.equal(fs.readFileSync(session.stateFile, 'utf8'), stateBefore);
+});
 
 test('recovery retry rereads ownership and never removes a live replacement lock',
   { skip: process.platform !== 'win32' && 'Windows exclusive-create contention is platform-specific.' }, async t => {
@@ -521,18 +605,25 @@ test('recovery retry rereads ownership and never removes a live replacement lock
     fs.writeFileSync(lock, JSON.stringify({ pid: DEAD_PID, token: 'old-owner' }));
     const live = JSON.stringify({ pid: process.pid, token: 'live-replacement' });
     const link = fs.linkSync;
+    const read = fs.readFileSync;
     let attempts = 0;
-    let now = 100_000;
-    t.mock.method(Date, 'now', () => { now += 1000; return now; });
+    let elapsed = 0;
     t.mock.method(fs, 'linkSync', (source, destination) => {
       if (destination === recovery) {
         attempts++;
+        assert.equal(attempts, 1, 'Retry must reread the main lock before attempting recovery again');
         fs.writeFileSync(lock, live);
         throw Object.assign(new Error('Guard creation raced with another owner'), { code: 'EPERM' });
       }
       return link(source, destination);
     });
-    assert.throws(() => updateSession(session, state => { state.unexpected = true; }), /Bridge state is busy/);
+    t.mock.method(fs, 'readFileSync', (file, ...args) => {
+      const result = read(file, ...args);
+      if (file === lock && String(result) === live) elapsed = 1;
+      return result;
+    });
+    assert.throws(() => updateSession(session, () => assert.fail('A live replacement cannot grant ownership'),
+      { now: () => elapsed, waitMs: 1 }), { reason: 'state_busy' });
     assert.equal(attempts, 1);
     assert.equal(fs.readFileSync(lock, 'utf8'), live);
     assert.equal(fs.existsSync(recovery), false);
