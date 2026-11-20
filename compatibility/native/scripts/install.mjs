@@ -256,6 +256,7 @@ function withInstallerLock(directory, guarded, callback) {
     if (error.reason === 'state_busy') throw new Error(`Another bridge installer holds the lock ${directory}. Wait for it to finish, then retry. If no installer is running and this persists, ${clear}`);
     if (error.code === 'LOCK_INCOMPLETE') throw new Error(`The installer lock ${directory} has an owner record that cannot be verified. If another installer is just starting, retry after it finishes. Otherwise ${clear}`);
     if (error.code === 'LOCK_RECOVERY_INTERRUPTED') throw new Error(`The installer lock ${directory} was left by an installer that stopped, and the next installer's recovery of it was interrupted. To clear it, ${clear}`);
+    if (error.code === 'LOCK_LINKS_UNSUPPORTED') throw new Error(`The installer cannot lock ${directory}: its volume does not support hard links, which the installer's locks need. Run the installer with your home folder, and CLAUDE_CONFIG_DIR if you set it, on a local volume that supports hard links.`);
     throw new Error(`The installer could not use its lock folder ${directory}: ${error.message}`);
   }
 }
@@ -688,18 +689,18 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
   if (!contained(pluginsDir, destination) || samePath(destination, root) || (fs.existsSync(destination) && contained(fs.realpathSync(destination), root))) {
     throw new Error('The staging destination must be separate from the source repository.');
   }
+  // An interrupted swap or rollback leaves its prepared stage next to the moved predecessor. A backup alone can also
+  // be left after a deliberate uninstall; the two swap names carry the same build stamp, including on 1.0.
+  const names = fs.readdirSync(pluginsDir), stagePrefix = `.${PLUGIN_NAME}.stage-`;
+  const pendingStamps = new Set(names.filter(name => name.startsWith(stagePrefix) && backupSuffix.test(name.slice(stagePrefix.length)))
+    .map(name => name.slice(stagePrefix.length, stagePrefix.length + 17)));
+  const predecessor = names.filter(name => namedBackup(name) && pendingStamps.has(name.slice(`.${PLUGIN_NAME}.backup-`.length).slice(0, 17)))
+    .sort().reverse().map(name => path.join(pluginsDir, name)).find(file => stageKind(file));
   if (fs.existsSync(destination)) {
     if (!stageKind(destination)) throw new Error('The staging destination belongs to another directory or is not a verified installer stage. Preserve it elsewhere before installing.');
-  } else {
-    // An interrupted swap leaves its prepared stage next to the moved predecessor. A backup alone can also
-    // be left after a deliberate uninstall; the two swap names carry the same build stamp, including on 1.0.
-    const names = fs.readdirSync(pluginsDir), stagePrefix = `.${PLUGIN_NAME}.stage-`;
-    const pendingStamps = new Set(names.filter(name => name.startsWith(stagePrefix) && backupSuffix.test(name.slice(stagePrefix.length)))
-      .map(name => name.slice(stagePrefix.length, stagePrefix.length + 17)));
-    const predecessor = names.filter(name => namedBackup(name) && pendingStamps.has(name.slice(`.${PLUGIN_NAME}.backup-`.length).slice(0, 17)))
-      .sort().reverse().map(name => path.join(pluginsDir, name)).find(file => stageKind(file));
-    if (predecessor) throw new Error(`The installed stage is missing, but its backup ${predecessor} remains. An earlier update may have been interrupted. Inspect the backups and move the intended predecessor back to ${destination} before retrying.`);
-  }
+    // A rollback that stopped while it served an older retained build from the installed path leaves that build there.
+    if (predecessor) throw new Error(`An earlier update stopped during its rollback: the stage installed before it remains in ${predecessor}, and ${destination} may hold an older build that the rollback served only for a moment. Move ${destination} aside (keep it if a client still runs it), move ${predecessor} back to ${destination}, then retry.`);
+  } else if (predecessor) throw new Error(`The installed stage is missing, but its backup ${predecessor} remains. An earlier update may have been interrupted. Inspect the backups and move the intended predecessor back to ${destination} before retrying.`);
   const build = timestamp();
   const temporary = path.join(pluginsDir, `.${PLUGIN_NAME}.stage-${build}-${randomUUID()}`);
   let backupDirectory = null, unchangedStage, preserveTemporary = false;
@@ -913,9 +914,12 @@ function disabledUpdate(id) {
 const CLAUDE_SELECTOR = `${PLUGIN_NAME}@${CLAUDE_MARKETPLACE}`;
 const ownClaudeEntry = entry => (entry.id === CLAUDE_SELECTOR || entry.name === CLAUDE_SELECTOR ||
   (entry.name === PLUGIN_NAME && entry.marketplace === CLAUDE_MARKETPLACE)) && (entry.scope === undefined || entry.scope === 'user');
-/** What a client runs, from the folder it loads: its version and the installer stage holding exactly those files. */
+// Claude loads a plugin from a local-path marketplace in place and lists that folder and the version it loads there;
+// otherwise it loads its cached copy at installPath.
+const claudeLoads = entry => typeof entry.readFromFolder === 'string' ? { version: entry.folderVersion, folder: entry.readFromFolder } : { version: entry.version, folder: entry.installPath };
+/** What a client loads, from the folder it loads: its version and the installer stage holding exactly those files. */
 function inUse(version, copy, stages) {
-  return { version: typeof version === 'string' ? version : null, ...(copy && stageHolding(treeFiles(copy), stages)) };
+  return { version: typeof version === 'string' ? version : null, ...(typeof copy === 'string' && path.isAbsolute(copy) && stageHolding(treeFiles(copy), stages)) };
 }
 
 /** Before any change: Codex state must be readable, its cache must be ours to replace, and no other source may keep serving the bridge.
@@ -943,8 +947,7 @@ function checkRegistrations({ homeDir, env, execute, selection }) {
   }
   if (selection.claude) {
     const listed = readList(execute('claude', ['plugin', 'list', '--json']), 'plugins'), own = listed.filter(ownClaudeEntry);
-    if (own.length) prior.claude = own.length === 1 && typeof own[0].installPath === 'string' && path.isAbsolute(own[0].installPath)
-      ? inUse(own[0].version, own[0].installPath, stages) : inUse(own.length === 1 ? own[0].version : null);
+    if (own.length) prior.claude = own.length === 1 ? inUse(claudeLoads(own[0]).version, claudeLoads(own[0]).folder, stages) : inUse(null);
     for (const entry of listed) {
       const id = pluginSelector(entry), scope = entry.scope ?? 'user';
       if (typeof id !== 'string' || !id.startsWith(`${PLUGIN_NAME}@`) || id === CLAUDE_SELECTOR) continue;
@@ -1069,26 +1072,31 @@ function finishCleanup(prepared, homeDir, log) {
   try { pruneInstallationBackups(prepared, homeDir); } catch { prepared.cleanupPending = true; log('Bridge installed; an older installer backup could not be pruned. Leave it until the file is no longer in use.'); }
 }
 
-/** After a rollback, name each client whose version is not, or cannot be shown to be, the one it ran before this run, and its recovery source. */
+/** After a rollback, name each client whose version is not, or cannot be shown to be, the one it loaded before this run, and its recovery source. */
 function rollbackVersions({ prior, restorePrior, prepared, homeDir, env, execute }) {
   const notes = restorePrior.map(({ app }) => {
     const before = prior[app] ?? { version: null };
-    let now = null;
+    let now = null, off = false;
     try {
       if (app === 'codex') {
         const copies = directories(codexCacheDirectory({ homeDir, env, marketplaceName: prepared.marketplaceName }));
         if (copies.length === 1) now = path.basename(copies[0]);
+        off = codexConfig({ homeDir, env }).plugins.get(`${PLUGIN_NAME}@${prepared.marketplaceName}`)?.enabled === false;
       } else {
         const own = readList(execute('claude', ['plugin', 'list', '--json']), 'plugins').filter(ownClaudeEntry);
-        if (own.length === 1 && typeof own[0].version === 'string') now = own[0].version;
+        if (own.length === 1 && typeof claudeLoads(own[0]).version === 'string') now = claudeLoads(own[0]).version;
+        off = own.length === 1 && own[0].enabled === false;
       }
     } catch { /* An unreadable state is reported as unverified. */ }
     if (before.version && now === before.version) return null;
     const name = app === 'codex' ? 'Codex' : 'Claude';
-    const recovery = before.holder && sameFiles(treeFiles(before.holder), before.files) ? ` Its previous files remain in ${before.holder}.`
+    // The previous files may sit in another verified stage after an incomplete rollback, not only where they were found.
+    const kept = before.files && stageHolding(before.files, stageFiles(homeDir))?.holder;
+    const recovery = kept ? ` Its previous files remain in ${kept}.`
       : before.version ? ` The installer kept no verified copy of ${before.version}; its recovery source is the ${before.version.split('+')[0]} release package.` : '';
-    if (before.version && now) return `Version rollback did not complete for ${name}: it ran ${before.version} before this run and now runs ${now}.${recovery}`;
-    return `${name}'s version after rollback is unverified: ${before.version ? `it ran ${before.version} before this run` : 'its version before this run could not be identified'}, and ${now ? `it now runs ${now}` : 'its current version could not be read'}.${recovery}`;
+    const state = off ? `it is turned off with ${now} installed` : `it now loads ${now} at its next start`;
+    if (before.version && now) return `Version rollback did not complete for ${name}: before this run it loaded ${before.version}, and ${state}.${recovery}`;
+    return `${name}'s version after rollback is unverified: ${before.version ? `before this run it loaded ${before.version}` : 'its version before this run could not be identified'}, and ${now ? state : 'its current version could not be read'}.${recovery}`;
   }).filter(Boolean);
   return notes.length ? ` ${notes.join(' ')}` : '';
 }

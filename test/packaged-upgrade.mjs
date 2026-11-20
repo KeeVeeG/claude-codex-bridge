@@ -8,6 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { parseToml } from '../scripts/install.mjs';
 
 const PLUGIN = 'bridge-claude-codex', PLACEHOLDER = '__BRIDGE_CALL_WAIT_MS__';
 const [zipArgument, exportArgument] = process.argv.slice(2);
@@ -84,11 +85,17 @@ try {
   const after = readJson(path.join(stage, 'package.json')).version;
   assert.ok(after.startsWith(`${version}+codex.`) && after !== before, `the stage holds ${after}`);
 
-  // The folders the clients load: Claude's listed install path and Codex's single cached copy.
+  // What each client starts: Claude loads a local-path marketplace plugin in place (readFromFolder, folderVersion),
+  // otherwise its cached copy, and lists the server it resolved; Codex loads its single cached copy. Both must be on.
   const own = JSON.parse(run('claude.exe', ['plugin', 'list', '--json'], 'claude plugin list')).filter(entry => (entry.id ?? entry.name) === `${PLUGIN}@claude-codex-local`);
   assert.equal(own.length, 1, 'Claude lists one installer registration');
-  assert.equal(own[0].version, after);
-  const codexCache = path.join(env.CODEX_HOME, 'plugins', 'cache', readJson(path.join(home, '.agents', 'plugins', 'marketplace.json')).name, PLUGIN);
+  assert.equal(own[0].enabled, true, 'Claude has the bridge turned on');
+  const inPlace = typeof own[0].readFromFolder === 'string', claudeRoot = inPlace ? own[0].readFromFolder : own[0].installPath;
+  assert.equal(inPlace ? own[0].folderVersion : own[0].version, after, 'Claude loads the upgraded version');
+  assert.ok(own[0].mcpServers?.[PLUGIN], 'Claude lists the server it resolved');
+  const market = readJson(path.join(home, '.agents', 'plugins', 'marketplace.json')).name;
+  assert.equal(parseToml(fs.readFileSync(path.join(env.CODEX_HOME, 'config.toml'), 'utf8')).plugins?.[`${PLUGIN}@${market}`]?.enabled, true, 'Codex has the bridge turned on');
+  const codexCache = path.join(env.CODEX_HOME, 'plugins', 'cache', market, PLUGIN), codexRoot = path.join(codexCache, after);
   assert.deepEqual(fs.readdirSync(codexCache), [after], 'Codex keeps one copy of the upgraded version');
 
   const panel = fs.readFileSync(path.join(packaged, 'ui', 'bridge.html'), 'utf8');
@@ -103,13 +110,14 @@ try {
     return at === text.length;
   };
   assert.equal(servesPackagedPanel(fs.readFileSync(path.join(released, 'ui', 'bridge.html'), 'utf8')), false, 'the 1.0.6 panel differs from the packaged one');
-  for (const [client, root, manifest] of [['Claude', own[0].installPath, '.claude-plugin'], ['Codex', path.join(codexCache, after), '.codex-plugin']]) {
-    const replies = await startServer(readJson(path.join(root, manifest, 'plugin.json')).mcpServers[PLUGIN], root, env);
+  for (const [client, root, server] of [['Claude', claudeRoot, own[0].mcpServers[PLUGIN]],
+    ['Codex', codexRoot, readJson(path.join(codexRoot, '.codex-plugin', 'plugin.json')).mcpServers[PLUGIN]]]) {
+    const replies = await startServer(server, root, env);
     for (const reply of replies.values()) assert.equal(reply.error, undefined, `${client}: ${JSON.stringify(reply.error)}`);
     assert.equal(replies.get(1).result.serverInfo.version, after, `${client} starts the packaged server`);
     const [content] = replies.get(3).result.contents;
     assert.ok(servesPackagedPanel(content.text), `${client} serves the packaged panel`);
-    console.log(`${client}: ${root} starts ${after} and serves the packaged ${content.uri}`);
+    console.log(`${client}: ${root}${client === 'Claude' ? (inPlace ? ' (in place)' : ' (cached copy)') : ''} starts ${after} and serves the packaged ${content.uri}`);
   }
   console.log(`Packaged upgrade from ${before} to ${after} passed.`);
 } finally { fs.rmSync(home, { recursive: true, force: true, maxRetries: 5 }); }

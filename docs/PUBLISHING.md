@@ -38,7 +38,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Claude marketplace validation failed' }
 Then run the two Windows checks against the released 1.0.6. Export the pinned Git tag `v1.0.6` into an empty disposable directory (`git archive v1.0.6 --output=bridge-106.tar`, then extract that archive there).
 
 - **Released writer:** `node test/released-writer.mjs <export-directory>`. It requires the real-writer test to pass and rejects a skipped test or the wrong version. The ordinary suite without the export does not cover the released writer.
-- **Packaged upgrade:** `node test/packaged-upgrade.mjs "dist/claude-codex-bridge-$version.zip" <export-directory>`. In a disposable profile it installs 1.0.6 into both clients with the real `claude.exe` and Codex CLIs, upgrades with the packaged ZIP's installer, then starts the server the way each client starts it from the folder that client loads. It requires the packaged version at `initialize` and the packaged panel resource. It does not use or change your own profile.
+- **Packaged upgrade:** `node test/packaged-upgrade.mjs "dist/claude-codex-bridge-$version.zip" <export-directory>`. In a disposable profile it installs 1.0.6 into both clients with the real `claude.exe` and Codex CLIs, upgrades with the packaged ZIP's installer, and requires both clients to have the bridge turned on. It then starts the server each client resolves (Claude's listed definition, in place from the stage folder or from its cached copy as Claude reports; Codex's cached copy) and requires the packaged version at `initialize` and the packaged panel resource. It does not use or change your own profile.
 
 The packager writes these artifacts under `dist/`:
 
@@ -52,13 +52,17 @@ The archives include runtime code, documentation, and the MIT license. They excl
 
 ## Publish the validated commit
 
-Only after every gate passes, move `main` to the candidate, then tag it. If `main` cannot fast-forward to the candidate, stop: a merge commit is a commit the gates did not test.
+Only after every gate passes, move `main` to the candidate, then tag it. If `main` cannot fast-forward to the candidate, stop: a merge commit is a commit the gates did not test. An existing tag is never reused: if `$tag` exists locally or on `origin`, stop and inspect it.
 
 ```powershell
+if ((git tag --list $tag) -or (git ls-remote --tags origin "refs/tags/$tag")) { throw "Tag $tag already exists: inspect it before publishing" }
 git push origin "$($candidate):refs/heads/main"
 if ($LASTEXITCODE -ne 0) { throw 'main did not fast-forward to the candidate' }
 git tag -a $tag $candidate -m $tag
-git push origin $tag
+if ($LASTEXITCODE -ne 0) { throw 'Could not create the tag' }
+git push origin "refs/tags/$tag"
+if ($LASTEXITCODE -ne 0) { throw 'Could not push the tag' }
+if (((git ls-remote origin "refs/tags/$tag^{}") -split "`t")[0] -ne $candidate) { throw 'The remote tag does not point to the candidate' }
 ```
 
 From the same verified checkout, upload the three ZIPs and checksum file from the build the gates checked. Use the reviewed release notes, not an automatically generated account of the commit history.

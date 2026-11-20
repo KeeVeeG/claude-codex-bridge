@@ -56,7 +56,7 @@ function publish(file, owner) {
   try {
     fs.writeFileSync(tmp, JSON.stringify(owner), { mode: 0o600, flag: 'wx' });
     try { fs.linkSync(tmp, file); } catch (e) {
-      if (['ENOSYS', 'ENOTSUP', 'EOPNOTSUPP'].includes(e.code)) throw failure('Bridge storage requires a writable local volume that supports hard links. Move the state directory with all bridge sessions stopped, then run bridge_doctor.', 'state_unavailable');
+      if (['ENOSYS', 'ENOTSUP', 'EOPNOTSUPP'].includes(e.code)) throw failure('Bridge storage requires a writable local volume that supports hard links. Move the state directory with all bridge sessions stopped, then run bridge_doctor.', 'state_unavailable', { code: 'LOCK_LINKS_UNSUPPORTED' });
       throw e;
     }
   } finally { try { fs.unlinkSync(tmp); } catch {} }

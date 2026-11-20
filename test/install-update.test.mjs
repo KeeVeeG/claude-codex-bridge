@@ -213,13 +213,14 @@ test('IU06: update steps stop 1.0.0-1.0.2 and unknown-source servers before the 
   }
 });
 
-// Clients that load copies of the stage as the native ones do: Codex keeps one cached copy named by its version and
-// replaces it on add; Claude copies each version it installs and lists the version and folder it runs.
+// Clients that load the stage as the native ones do: Codex keeps one cached copy named by its version and replaces it
+// on add. Claude copies each version it installs and lists the version and the copy; with inPlace it loads the stage
+// folder itself and also lists that folder and the version it finds there, as Claude Code does for a local-path marketplace.
 function clientFixture(t) {
   const f = fixture(t), market = 'claude-codex-local', selector = `${PLUGIN_NAME}@${market}`;
   const codexCache = path.join(f.homeDir, '.codex', 'plugins', 'cache', 'personal', PLUGIN_NAME);
   const claudeCache = path.join(f.homeDir, '.claude', 'plugins', 'cache', market, PLUGIN_NAME);
-  const c = { claude: null, refuse: false, onRefuse: null };
+  const c = { claude: null, refuse: false, onRefuse: null, inPlace: false };
   const staged = () => JSON.parse(read(path.join(f.stage, 'package.json'))).version;
   const execute = (app, args) => {
     f.calls.push([app, ...args]);
@@ -232,7 +233,8 @@ function clientFixture(t) {
       return '{}';
     }
     if (action === 'marketplace') return verb === 'list' ? JSON.stringify(c.claude ? [{ name: market, source: { source: 'directory', path: f.stage } }] : []) : '{}';
-    if (action === 'list') return JSON.stringify(c.claude ? [{ id: selector, scope: 'user', enabled: true, ...c.claude }] : []);
+    if (action === 'list') return JSON.stringify(c.claude ? [{ id: selector, scope: 'user', enabled: true, ...c.claude,
+      ...(c.inPlace && fs.existsSync(f.stage) ? { readFromFolder: f.stage, folderVersion: staged() } : {}) }] : []);
     if (action === 'install' || action === 'update') {
       const version = staged(), installPath = path.join(claudeCache, version.replace('+', '-'));
       if (!fs.existsSync(installPath)) copyTree(f.stage, installPath);
@@ -294,13 +296,47 @@ for (const [label, args] of [['changed during the run', []], ['removed before a 
     assert.match(error.message, /already matches the outbound bridge tool/); assert.doesNotMatch(error.message, /Rollback could not finish/);
     const changed = args.length ? ['Claude'] : ['Codex', 'Claude'];
     for (const app of ['Codex', 'Claude']) {
-      const note = new RegExp(`Version rollback did not complete for ${app}: it ran ${literal(older)} before this run and now runs ${literal(prepared)}\\. The installer kept no verified copy of ${literal(older)}; its recovery source is the \\d+\\.\\d+\\.\\d+ release package\\.`);
+      const note = new RegExp(`Version rollback did not complete for ${app}: before this run it loaded ${literal(older)}, and it now loads ${literal(prepared)} at its next start\\. The installer kept no verified copy of ${literal(older)}; its recovery source is the \\d+\\.\\d+\\.\\d+ release package\\.`);
       if (changed.includes(app)) assert.match(error.message, note); else assert.doesNotMatch(error.message, new RegExp(`for ${app}:|${app}'s version`));
     }
     assert.equal(f.c.claude.version, prepared); assert.equal(f.staged(), prepared);
     assert.deepEqual(f.codexRuns(), [args.length ? older : prepared]);
   });
 }
+
+test('R3I01: Claude loading the stage in place keeps the stage it loaded, and Codex returns to its own build', async t => {
+  const f = clientFixture(t); f.c.inPlace = true;
+  const older = await f.installOlder();
+  await main(['--prepare-only'], f.options);
+  const prepared = f.staged();
+  f.c.refuse = true;
+  await assert.rejects(main([], f.options), plainFailure);
+  assert.deepEqual(f.codexRuns(), [older]); assert.equal(f.staged(), prepared);
+  assert.equal(f.c.claude.version, prepared, 'Claude is refreshed from the stage it loads, not from its older cached copy');
+});
+
+test('R3I01: a rollback that cannot return a retained build to its folder names both paths, and the next run refuses until they are restored', async t => {
+  const f = clientFixture(t), older = await f.installOlder();
+  await main(['--prepare-only'], f.options);
+  const prepared = f.staged(), backup = f.retained(older);
+  f.c.refuse = true;
+  hook(t, 'renameSync', original => (from, to) => { if (from === f.stage && to === backup) throw new Error('rename denied'); return original(from, to); });
+  const error = await main([], f.options).then(() => assert.fail('the run must fail'), e => e);
+  assert.match(error.message, /Rollback could not finish.*could not return.*rename denied.*This run's stage remains in .* and the previous stage in /s);
+  assert.equal(f.staged(), older, 'the retained build still occupies the installed path');
+  const predecessor = fs.readdirSync(path.dirname(f.stage)).map(name => path.join(path.dirname(f.stage), name)).find(dir => dir !== f.stage && fs.existsSync(path.join(dir, 'package.json')) && JSON.parse(read(path.join(dir, 'package.json'))).version === prepared);
+  await assert.rejects(main(['--prepare-only'], f.options), new RegExp(`stopped during its rollback: the stage installed before it remains in ${literal(predecessor)}.*move ${literal(predecessor)} back to ${literal(f.stage)}`));
+  assert.equal(f.staged(), older);
+});
+
+test('R3I02: an installer lock on a volume without hard links names its folder and the volume requirement, not state recovery', async t => {
+  const f = fixture(t), lock = path.join(f.homeDir, 'plugins', `.${PLUGIN_NAME}-install-lock`);
+  hook(t, 'linkSync', original => (from, to) => { if (path.dirname(String(to)) === lock) throw Object.assign(new Error('ENOTSUP fixture'), { code: 'ENOTSUP' }); return original(from, to); });
+  const error = await main(['--prepare-only'], f.options).then(() => assert.fail('the lock must refuse'), e => e);
+  assert.ok(error.message.startsWith(`The installer cannot lock ${lock}: its volume does not support hard links`), error.message);
+  assert.doesNotMatch(error.message, /bridge_doctor|state directory/);
+  assert.equal(fs.existsSync(f.stage), false);
+});
 
 test('R3I02: installer and catalog locks left by a dead owner and a dead recovery owner name their folder and the installer recovery', async t => {
   const dead = 2_147_483_647;
