@@ -224,11 +224,14 @@ test('Windows privacy diagnostic warns on inherited read access without changing
   const grant = spawnSync('icacls.exe', [parent, '/grant', '*S-1-5-32-545:(OI)(CI)(RX)'], options);
   assert.equal(grant.status, 0, grant.stderr);
   const directory = path.join(parent, 'state');
-  assert.match(await stateDirectoryPrivacyWarning(directory), /may grant other accounts access.*private per-user/);
+  // Exercise the real ACL result independently of the doctor's shorter interactive budget:
+  // on a loaded host, an honest timeout is inconclusive, not evidence of a missing grant.
+  const probe = () => stateDirectoryPrivacyWarning(directory, { timeoutMs: 15_000 });
+  assert.match(await probe(), /may grant other accounts access.*private per-user/);
   fs.mkdirSync(directory);
   const before = spawnSync('icacls.exe', [directory], options);
   assert.equal(before.status, 0, before.stderr);
-  const warning = await stateDirectoryPrivacyWarning(directory);
+  const warning = await probe();
   assert.match(warning, /may grant other accounts access.*private per-user/);
   assert.ok(!warning.includes(f.homeDir));
   assert.equal(spawnSync('icacls.exe', [directory], options).stdout, before.stdout);
