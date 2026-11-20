@@ -244,6 +244,22 @@ function permissionRuleMatches(rule, toolName) {
   return new RegExp(`^${pattern}$`).test(toolName);
 }
 
+// The installer's own locks use the shared lock protocol but guard installer files, not the message ledger, so the
+// ledger's offline copy-and-pin recovery cannot clear them. Name the exact folder and the installer's own step instead.
+// A failure inside the callback is not a lock failure and passes through unchanged. The guard is never broken here.
+function withInstallerLock(directory, guarded, callback) {
+  let entered = false;
+  try { return withStateLock(directory, () => { entered = true; return callback(); }); }
+  catch (error) {
+    if (entered) throw error;
+    const clear = `stop every bridge installer, check ${guarded}, then delete the folder ${directory} and run the installer again. Never delete it while an installer runs. This lock is not part of the bridge's message state: copying or re-pinning state does not clear it.`;
+    if (error.reason === 'state_busy') throw new Error(`Another bridge installer holds the lock ${directory}. Wait for it to finish, then retry. If no installer is running and this persists, ${clear}`);
+    if (error.code === 'LOCK_INCOMPLETE') throw new Error(`The installer lock ${directory} has an owner record that cannot be verified. If another installer is just starting, retry after it finishes. Otherwise ${clear}`);
+    if (error.code === 'LOCK_RECOVERY_INTERRUPTED') throw new Error(`The installer lock ${directory} was left by an installer that stopped, and the next installer's recovery of it was interrupted. To clear it, ${clear}`);
+    throw new Error(`The installer could not use its lock folder ${directory}: ${error.message}`);
+  }
+}
+
 /** Explicit, narrow user-level grant for Claude's outbound bridge tool. */
 export function grantClaudeSendPermission({ homeDir = os.homedir(), env = process.env, preview = false } = {}) {
   const configDir = path.resolve(env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude'));
@@ -276,7 +292,7 @@ export function grantClaudeSendPermission({ homeDir = os.homedir(), env = proces
     const backup = writeJsonAtomic(settingsPath, settings, { expectedPrevious: previous, label: 'Claude settings' });
     return { settingsPath, rule: CLAUDE_SEND_PERMISSION, added: true, backup };
   };
-  return preview ? plan() : withStateLock(lockDirectory, plan);
+  return preview ? plan() : withInstallerLock(lockDirectory, settingsPath, plan);
 }
 
 /** Migrate user choices before applying the normal narrow send grant. */
@@ -284,7 +300,7 @@ function migrateClaudeSettings({ homeDir, env, log, retired, keepLegacyRules }) 
   const configDir = path.resolve(env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude'));
   const filename = path.join(configDir, 'settings.json');
   if (!fs.existsSync(filename)) return;
-  withStateLock(path.join(configDir, `.${PLUGIN_NAME}-permissions-lock`), () => {
+  withInstallerLock(path.join(configDir, `.${PLUGIN_NAME}-permissions-lock`), filename, () => {
     const previous = readRawIfPresent(filename);
     const settings = JSON.parse(previous.replace(/^\uFEFF/, ''));
     if (!object(settings)) throw new Error('Claude settings.json must contain an object. No migration was made.');
@@ -744,16 +760,22 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
   }
   let marketplaceBackup = null, priorCatalog = null, published = false;
   const lockDirectory = path.join(path.dirname(marketplacePath), `.${PLUGIN_NAME}-marketplace-lock`);
-  const undoStage = () => {
+  // `whileVacant` runs while neither this run's stage nor its predecessor occupies the installed path. An interruption
+  // there leaves this run's stamp on both the moved stage and the predecessor, which the next run reports.
+  const undoStage = whileVacant => {
     if (!unchangedStage(destination) || readJson(path.join(destination, 'package.json')).version !== `${bundle.manifest.version.split('+')[0]}+codex.${build}`) throw new Error('The installed stage changed; it was not overwritten during rollback.');
     renameDirectoryWithRetry(destination, temporary);
+    let vacancyError = null;
+    try { whileVacant?.(); } catch (error) { vacancyError = error; }
+    if (fs.existsSync(destination)) throw new Error(`${vacancyError?.message ?? 'The installed path was occupied during rollback.'} This run's stage remains in ${temporary}${backupDirectory ? ` and the previous stage in ${backupDirectory}` : ''}.`);
     try { if (backupDirectory) renameDirectoryWithRetry(backupDirectory, destination); } catch (e) { renameDirectoryWithRetry(temporary, destination); throw e; }
     fs.rmSync(temporary, { recursive: true });
+    if (vacancyError) throw vacancyError;
   };
   // Compensate only what was committed: this run's whole catalog, or its exact row inside a later writer's catalog.
   const undoCatalog = () => {
     if (!published) return;
-    withStateLock(lockDirectory, () => {
+    withInstallerLock(lockDirectory, marketplacePath, () => {
       const current = readRawIfPresent(marketplacePath);
       if (current === priorCatalog) return;
       if (current === jsonText(marketplace)) {
@@ -772,13 +794,14 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
       }
     });
   };
-  const undo = () => {
+  // The catalog goes first, so a client refreshed during the stage step reads the catalog it had before this run.
+  const undo = whileVacant => {
     const failures = [];
-    for (const step of [undoStage, undoCatalog]) { try { step(); } catch (error) { failures.push(error); } }
+    for (const step of [undoCatalog, () => undoStage(whileVacant)]) { try { step(); } catch (error) { failures.push(error); } }
     if (failures.length) throw failures[0];
   };
   try { if (codex) {
-    withStateLock(lockDirectory, () => {
+    withInstallerLock(lockDirectory, marketplacePath, () => {
       // Staging may take time: merge into the latest catalog under a short lock.
       // The final comparison also detects changes from non-cooperating writers
       // before the replacement, rather than reusing the pre-staging snapshot.
@@ -836,39 +859,69 @@ function samePath(left, right) {
   } catch { return path.resolve(left) === path.resolve(right); }
 }
 
-/** Equal trees of regular files; a link or any other entry is never equal. */
-function sameTree(left, right) {
-  const entries = dir => fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-  const a = entries(left), b = entries(right);
-  return a.length === b.length && a.every((entry, n) => {
-    const other = b[n], x = path.join(left, entry.name), y = path.join(right, other.name);
-    if (entry.name !== other.name || entry.isSymbolicLink() || other.isSymbolicLink()) return false;
-    if (entry.isDirectory()) return other.isDirectory() && sameTree(x, y);
-    return entry.isFile() && other.isFile() && fs.readFileSync(x).equals(fs.readFileSync(y));
+/** A tree's directories and regular files in a fixed order with their bytes; null when it holds a link, another entry or cannot be read. */
+function treeFiles(dir) {
+  const files = [];
+  const walk = (folder, prefix) => fs.readdirSync(folder, { withFileTypes: true }).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0).every(entry => {
+    const name = prefix + entry.name, file = path.join(folder, entry.name);
+    if (entry.isSymbolicLink()) return false;
+    if (entry.isDirectory()) { files.push([`${name}/`, null]); return walk(file, `${name}/`); }
+    if (entry.isFile()) { files.push([name, fs.readFileSync(file)]); return true; }
+    return false;
+  });
+  try { return fs.lstatSync(dir).isDirectory() && walk(dir, '') ? files : null; } catch { return null; }
+}
+const sameFiles = (a, b) => Boolean(a && b) && a.length === b.length &&
+  a.every(([name, data], n) => name === b[n][0] && (data === null ? b[n][1] === null : b[n][1] !== null && data.equals(b[n][1])));
+
+function directories(dir, keep = () => true) {
+  try { return fs.readdirSync(dir, { withFileTypes: true }).filter(keep).map(entry => path.join(dir, entry.name)); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+}
+/** Verified installer stages on disk: the installed one first, then retained backups from newest to oldest. */
+function installerStages(homeDir) {
+  return directories(path.resolve(homeDir, 'plugins'), entry => entry.isDirectory() && !entry.isSymbolicLink() &&
+    (entry.name === PLUGIN_NAME || namedBackup(entry.name))).sort((a, b) => path.basename(a) === PLUGIN_NAME ? -1 :
+    path.basename(b) === PLUGIN_NAME ? 1 : a < b ? 1 : -1).filter(stageKind);
+}
+/** The installer stage that holds exactly the files a client runs, with those files kept to recheck later. */
+function stageHolding(copyFiles, stages) {
+  if (!copyFiles) return null;
+  for (const [stage, files] of stages) if (sameFiles(files(), copyFiles)) return { holder: stage, files: copyFiles };
+  return null;
+}
+function stageFiles(homeDir) {
+  return installerStages(homeDir).map(stage => { let files; return [stage, () => files === undefined ? (files = treeFiles(stage)) : files]; });
+}
+const codexCacheDirectory = ({ homeDir, env, marketplaceName }) => path.join(codexHome({ env, homeDir }), 'plugins', 'cache', marketplaceName, PLUGIN_NAME);
+
+/** Codex's add replaces its cached copy of a plugin. Hand it over only when a stage here holds the same bytes. Returns each copy with the stage holding it. */
+function checkCodexCache({ homeDir, env, marketplaceName, stagedCopy, preflight = true, stages = stageFiles(homeDir) }) {
+  return directories(codexCacheDirectory({ homeDir, env, marketplaceName })).map(copy => {
+    if (fs.lstatSync(copy).isDirectory()) {
+      if (stagedCopy?.(copy)) return { copy, held: null };
+      const held = stageHolding(treeFiles(copy), stages);
+      if (held) return { copy, held };
+    }
+    throw new Error(`Codex keeps a copy of the bridge in ${copy} that differs from every installer stage, and updating replaces that folder. ${preflight ? 'Nothing was changed.' : 'The cache was left alone.'} To keep its contents, move the folder out of the Codex cache; otherwise delete it. Then run the installer again.`);
   });
 }
 
-/** Codex's add replaces its cached copy of a plugin. Hand it over only when a stage here holds the same bytes. */
-function checkCodexCache({ homeDir, env, marketplaceName, stagedCopy, preflight = true }) {
-  const cache = path.join(codexHome({ env, homeDir }), 'plugins', 'cache', marketplaceName, PLUGIN_NAME);
-  const directories = (dir, keep) => {
-    try { return fs.readdirSync(dir, { withFileTypes: true }).filter(keep).map(entry => path.join(dir, entry.name)); }
-    catch (error) { if (error.code === 'ENOENT') return []; throw error; }
-  };
-  const stages = directories(path.resolve(homeDir, 'plugins'), entry => entry.isDirectory() && !entry.isSymbolicLink() &&
-    (entry.name === PLUGIN_NAME || namedBackup(entry.name))).filter(stageKind);
-  for (const copy of directories(cache, () => true)) {
-    if (fs.lstatSync(copy).isDirectory() && (stagedCopy?.(copy) || stages.some(stage => { try { return sameTree(stage, copy); } catch { return false; } }))) continue;
-    throw new Error(`Codex keeps a copy of the bridge in ${copy} that differs from every installer stage, and updating replaces that folder. ${preflight ? 'Nothing was changed.' : 'The cache was left alone.'} To keep its contents, move the folder out of the Codex cache; otherwise delete it. Then run the installer again.`);
-  }
-}
-
-/** Before any change: Codex state must be readable, its cache must be ours to replace, and no other source may keep serving the bridge. */
 function disabledUpdate(id) {
   return new Error(`Codex has ${id} turned off. Its update command would turn it on, so the installer did not update it. To keep it off, leave this Codex installation alone; use --claude to update Claude only. When you want to use it again, turn it on in Codex and rerun the installer.`);
 }
+const CLAUDE_SELECTOR = `${PLUGIN_NAME}@${CLAUDE_MARKETPLACE}`;
+const ownClaudeEntry = entry => (entry.id === CLAUDE_SELECTOR || entry.name === CLAUDE_SELECTOR ||
+  (entry.name === PLUGIN_NAME && entry.marketplace === CLAUDE_MARKETPLACE)) && (entry.scope === undefined || entry.scope === 'user');
+/** What a client runs, from the folder it loads: its version and the installer stage holding exactly those files. */
+function inUse(version, copy, stages) {
+  return { version: typeof version === 'string' ? version : null, ...(copy && stageHolding(treeFiles(copy), stages)) };
+}
+
+/** Before any change: Codex state must be readable, its cache must be ours to replace, and no other source may keep serving the bridge.
+ * Returns what each selected, registered client runs now, which a failed run restores. */
 function checkRegistrations({ homeDir, env, execute, selection }) {
-  const others = [];
+  const others = [], prior = {}, stages = stageFiles(homeDir);
   if (selection.codex) {
     const marketplaceName = codexMarketplacePlan(path.resolve(homeDir, '.agents', 'plugins', 'marketplace.json')).name;
     const config = codexConfig({ homeDir, env });
@@ -884,12 +937,17 @@ function checkRegistrations({ homeDir, env, execute, selection }) {
       if (!id.startsWith(`${PLUGIN_NAME}@`) || market === marketplaceName || enabled === false) continue;
       others.push(`Codex has ${id} turned on. To switch to this installer, run \`codex plugin remove ${id}\` or turn it off in Codex. To stay on that source, update it from the ${market} marketplace instead.`);
     }
-    checkCodexCache({ homeDir, env, marketplaceName });
+    // Codex names its single cached copy by version. Several copies or none leave the version in use unknown.
+    const copies = checkCodexCache({ homeDir, env, marketplaceName, stages });
+    if (config.plugins.has(selector)) prior.codex = copies.length === 1 ? { version: path.basename(copies[0].copy), ...copies[0].held } : inUse(null);
   }
   if (selection.claude) {
-    for (const entry of readList(execute('claude', ['plugin', 'list', '--json']), 'plugins')) {
+    const listed = readList(execute('claude', ['plugin', 'list', '--json']), 'plugins'), own = listed.filter(ownClaudeEntry);
+    if (own.length) prior.claude = own.length === 1 && typeof own[0].installPath === 'string' && path.isAbsolute(own[0].installPath)
+      ? inUse(own[0].version, own[0].installPath, stages) : inUse(own.length === 1 ? own[0].version : null);
+    for (const entry of listed) {
       const id = pluginSelector(entry), scope = entry.scope ?? 'user';
-      if (typeof id !== 'string' || !id.startsWith(`${PLUGIN_NAME}@`) || id === `${PLUGIN_NAME}@${CLAUDE_MARKETPLACE}`) continue;
+      if (typeof id !== 'string' || !id.startsWith(`${PLUGIN_NAME}@`) || id === CLAUDE_SELECTOR) continue;
       let status = 'turned on';
       if (entry.enabled === false) {
         if (!['local', 'project'].includes(scope) && !entry.projectPath) continue;
@@ -907,6 +965,7 @@ function checkRegistrations({ homeDir, env, execute, selection }) {
     }
   }
   if (others.length) throw new Error([`Another enabled ${PLUGIN_NAME} registration would keep serving beside this installation, so nothing was changed.`, ...others.map(line => `- ${line}`), 'Then run the installer again.'].join('\n'));
+  return prior;
 }
 
 export function installApplications(prepared, { execute = run, homeDir = os.homedir(), env = process.env,
@@ -926,7 +985,7 @@ export function installApplications(prepared, { execute = run, homeDir = os.home
       verifyCache();
       execute('codex', ['plugin', 'add', selector, '--json']);
     };
-    if (before) restorePrior.push(add);
+    if (before) restorePrior.push({ app: 'codex', refresh: add });
     try { add(); } catch (e) {
       if (!before) undoNew.push(() => { if (registered()) remove(); });
       throw e;
@@ -962,17 +1021,13 @@ export function installApplications(prepared, { execute = run, homeDir = os.home
       }
       undoNew.push(remove);
     }
-    const selector = `${PLUGIN_NAME}@${CLAUDE_MARKETPLACE}`;
-    const plugins = readList(execute('claude', ['plugin', 'list', '--json']), 'plugins');
-    const matches = entry => (entry.id === selector || entry.name === selector ||
-      (entry.name === PLUGIN_NAME && entry.marketplace === CLAUDE_MARKETPLACE)) &&
-      (entry.scope === undefined || entry.scope === 'user');
-    const installed = plugins.some(matches);
+    const selector = CLAUDE_SELECTOR;
+    const installed = readList(execute('claude', ['plugin', 'list', '--json']), 'plugins').some(ownClaudeEntry);
     const apply = () => execute('claude', ['plugin', installed ? 'update' : 'install', selector, '--scope', 'user', '--json']);
-    if (installed) restorePrior.push(apply);
+    if (installed) restorePrior.push({ app: 'claude', refresh: apply });
     const remove = () => execute('claude', ['plugin', 'uninstall', selector, '--scope', 'user', '--json']);
     try { apply(); } catch (error) {
-      if (!installed) undoNew.push(() => { if (readList(execute('claude', ['plugin', 'list', '--json']), 'plugins').some(matches)) remove(); });
+      if (!installed) undoNew.push(() => { if (readList(execute('claude', ['plugin', 'list', '--json']), 'plugins').some(ownClaudeEntry)) remove(); });
       throw error;
     }
     if (!installed) undoNew.push(remove);
@@ -996,7 +1051,8 @@ export async function main(args = process.argv.slice(2), { homeDir = os.homedir(
   const target = selected[0] ?? '--all';
   const selection = { codex: target !== '--claude', claude: target !== '--codex' };
   const pluginsDir = path.resolve(homeDir, 'plugins'); refuseLink(pluginsDir);
-  const prepared = withStateLock(path.join(pluginsDir, `.${PLUGIN_NAME}-install-lock`),
+  const prepared = withInstallerLock(path.join(pluginsDir, `.${PLUGIN_NAME}-install-lock`),
+    `the staged files in ${pluginsDir} and the personal catalog ${path.resolve(homeDir, '.agents', 'plugins', 'marketplace.json')}`,
     () => installSelected(args, { homeDir, env, execute, log, selection }));
   if (!args.includes('--prepare-only') && env.CODEX_APP_TOOLS_PIPE_PATH && env.CODEX_THREAD_ID && !env.CLAUDE_CODE_MESSAGING_SOCKET) {
     try {
@@ -1013,14 +1069,39 @@ function finishCleanup(prepared, homeDir, log) {
   try { pruneInstallationBackups(prepared, homeDir); } catch { prepared.cleanupPending = true; log('Bridge installed; an older installer backup could not be pruned. Leave it until the file is no longer in use.'); }
 }
 
+/** After a rollback, name each client whose version is not, or cannot be shown to be, the one it ran before this run, and its recovery source. */
+function rollbackVersions({ prior, restorePrior, prepared, homeDir, env, execute }) {
+  const notes = restorePrior.map(({ app }) => {
+    const before = prior[app] ?? { version: null };
+    let now = null;
+    try {
+      if (app === 'codex') {
+        const copies = directories(codexCacheDirectory({ homeDir, env, marketplaceName: prepared.marketplaceName }));
+        if (copies.length === 1) now = path.basename(copies[0]);
+      } else {
+        const own = readList(execute('claude', ['plugin', 'list', '--json']), 'plugins').filter(ownClaudeEntry);
+        if (own.length === 1 && typeof own[0].version === 'string') now = own[0].version;
+      }
+    } catch { /* An unreadable state is reported as unverified. */ }
+    if (before.version && now === before.version) return null;
+    const name = app === 'codex' ? 'Codex' : 'Claude';
+    const recovery = before.holder && sameFiles(treeFiles(before.holder), before.files) ? ` Its previous files remain in ${before.holder}.`
+      : before.version ? ` The installer kept no verified copy of ${before.version}; its recovery source is the ${before.version.split('+')[0]} release package.` : '';
+    if (before.version && now) return `Version rollback did not complete for ${name}: it ran ${before.version} before this run and now runs ${now}.${recovery}`;
+    return `${name}'s version after rollback is unverified: ${before.version ? `it ran ${before.version} before this run` : 'its version before this run could not be identified'}, and ${now ? `it now runs ${now}` : 'its current version could not be read'}.${recovery}`;
+  }).filter(Boolean);
+  return notes.length ? ` ${notes.join(' ')}` : '';
+}
+
 function installSelected(args, { homeDir, env, execute, log, selection }) {
+  let prior = {};
   // Refuse an invalid source or route before removing a working legacy install.
   checkManifests(projectRoot, { checkNative: false, allowConfiguredSource: true });
   if (env.CLAUDE_CODEX_BRIDGE_SSH_HOST !== undefined) validateSshHostAlias(env.CLAUDE_CODEX_BRIDGE_SSH_HOST);
   if (!args.includes('--prepare-only')) {
     for (const app of ['claude', 'codex']) if (selection[app]) execute(app, ['--version']);
     if (selection.claude) grantClaudeSendPermission({ homeDir, env, preview: true });
-    checkRegistrations({ homeDir, env, execute, selection });
+    prior = checkRegistrations({ homeDir, env, execute, selection });
   }
   const prepared = prepareInstallation({ homeDir, env, log, ...selection });
   log(`Prepared ${PLUGIN_NAME} in ${prepared.destination}`);
@@ -1034,17 +1115,31 @@ function installSelected(args, { homeDir, env, execute, log, selection }) {
   const undoNew = [], restorePrior = [];
   try { installApplications(prepared, { homeDir, env, execute, log, undoNew, restorePrior }); }
   catch (error) {
-    const failures = [];
-    for (const undo of [...undoNew.reverse(), prepared.undo, ...restorePrior]) {
-      try { undo(); } catch (e) { failures.push(e); }
-    }
-    if (failures.length) throw new Error(`${error.message} Rollback could not finish. Inspect ${prepared.destination}${prepared.backupDirectory ? ` and its preserved predecessor ${prepared.backupDirectory}` : ''} and the selected registrations before retrying. ${failures.map(e => e.message).join(' ')}`);
+    const failures = [], pending = new Set(restorePrior);
+    for (const undo of undoNew.reverse()) { try { undo(); } catch (e) { failures.push(e); } }
+    // Return each client to the files it ran before this run. A retained older stage holding them is served from
+    // the installed path while that path is vacant; the other clients refresh from the restored previous stage.
+    const serveRetained = () => {
+      for (const holder of new Set(restorePrior.map(({ app }) => prior[app]?.holder))) {
+        const group = restorePrior.filter(({ app }) => prior[app]?.holder === holder);
+        if (!holder || holder === prepared.destination || !sameFiles(treeFiles(holder), prior[group[0].app].files)) continue;
+        renameDirectoryWithRetry(holder, prepared.destination);
+        for (const restore of group) { pending.delete(restore); try { restore.refresh(); } catch (e) { failures.push(e); } }
+        try { renameDirectoryWithRetry(prepared.destination, holder); }
+        catch (e) { throw new Error(`The retained stage ${holder} could not return from ${prepared.destination} (${e.message}).`); }
+      }
+    };
+    try { prepared.undo(serveRetained); } catch (e) { failures.push(e); }
+    for (const { refresh } of pending) { try { refresh(); } catch (e) { failures.push(e); } }
+    const versions = rollbackVersions({ prior, restorePrior, prepared, homeDir, env, execute });
+    if (failures.length) throw new Error(`${error.message} Rollback could not finish. Inspect ${prepared.destination}${prepared.backupDirectory ? ` and its preserved predecessor ${prepared.backupDirectory}` : ''} and the selected registrations before retrying. ${failures.map(e => e.message).join(' ')}${versions}`);
+    if (versions) throw new Error(`${error.message}${versions}`);
     throw error;
   }
   // Cut over only after the replacement works. A cleanup failure is not a failed installation.
   try {
     migrateLegacyInstallation({ homeDir, env, execute, log, ...selection, onPending: () => { prepared.cleanupPending = true; } });
-    if (prepared.codex) withStateLock(path.join(path.dirname(prepared.marketplacePath), `.${PLUGIN_NAME}-marketplace-lock`), () => {
+    if (prepared.codex) withInstallerLock(path.join(path.dirname(prepared.marketplacePath), `.${PLUGIN_NAME}-marketplace-lock`), prepared.marketplacePath, () => {
       const previous = readRawIfPresent(prepared.marketplacePath), catalog = JSON.parse(previous.replace(/^\uFEFF/, ''));
       const rows = catalog.plugins.filter(entry => entry?.name === LEGACY_PLUGIN);
       if (!rows.length) return;

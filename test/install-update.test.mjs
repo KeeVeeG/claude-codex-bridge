@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { main, parseToml, PLUGIN_NAME } from '../scripts/install.mjs';
+import { main, parseToml, CLAUDE_SEND_PERMISSION, PLUGIN_NAME } from '../scripts/install.mjs';
 
 // Updates over an existing installation: fake application CLIs in a temporary home, never a real profile.
 const root = path.resolve(import.meta.dirname, '..');
@@ -210,5 +210,113 @@ test('IU06: update steps stop 1.0.0-1.0.2 and unknown-source servers before the 
     const text = read(path.join(root, file));
     assert.match(text, /1\.0\.0[–-]1\.0\.2[^\n]*(?:quit|stop)[^\n]*before/i, file);
     assert.match(text, /(?:not sure|unknown|don't know)[^\n]*(?:quit|stop)/i, file);
+  }
+});
+
+// Clients that load copies of the stage as the native ones do: Codex keeps one cached copy named by its version and
+// replaces it on add; Claude copies each version it installs and lists the version and folder it runs.
+function clientFixture(t) {
+  const f = fixture(t), market = 'claude-codex-local', selector = `${PLUGIN_NAME}@${market}`;
+  const codexCache = path.join(f.homeDir, '.codex', 'plugins', 'cache', 'personal', PLUGIN_NAME);
+  const claudeCache = path.join(f.homeDir, '.claude', 'plugins', 'cache', market, PLUGIN_NAME);
+  const c = { claude: null, refuse: false, onRefuse: null };
+  const staged = () => JSON.parse(read(path.join(f.stage, 'package.json'))).version;
+  const execute = (app, args) => {
+    f.calls.push([app, ...args]);
+    if (args[0] !== 'plugin') return '1';
+    const [, action, verb] = args;
+    if (app === 'codex') {
+      fs.rmSync(codexCache, { recursive: true, force: true });
+      if (action === 'add') { copyTree(f.stage, path.join(codexCache, staged())); write(f.config, `[plugins."${id}"]\nenabled = true\n`); }
+      else write(f.config, '');
+      return '{}';
+    }
+    if (action === 'marketplace') return verb === 'list' ? JSON.stringify(c.claude ? [{ name: market, source: { source: 'directory', path: f.stage } }] : []) : '{}';
+    if (action === 'list') return JSON.stringify(c.claude ? [{ id: selector, scope: 'user', enabled: true, ...c.claude }] : []);
+    if (action === 'install' || action === 'update') {
+      const version = staged(), installPath = path.join(claudeCache, version.replace('+', '-'));
+      if (!fs.existsSync(installPath)) copyTree(f.stage, installPath);
+      c.claude = { version, installPath };
+      // A permission conflict that appears after Claude took the new build: the installer's last step refuses.
+      if (c.refuse) { c.refuse = false; c.onRefuse?.(); write(path.join(f.homeDir, '.claude', 'settings.json'), JSON.stringify({ permissions: { deny: [CLAUDE_SEND_PERMISSION] } })); }
+    }
+    return '{}';
+  };
+  const options = { ...f.options, execute };
+  // Both clients run an older build: an installer stage whose files differ from this source, as a released version's do.
+  const installOlder = async () => {
+    await main(['--prepare-only'], options);
+    fs.appendFileSync(path.join(f.stage, 'scripts', 'mcp.mjs'), '\n// older build\n');
+    execute('codex', ['plugin', 'add', id, '--json']); execute('claude', ['plugin', 'install', selector, '--scope', 'user', '--json']);
+    return staged();
+  };
+  const retained = version => fs.readdirSync(path.dirname(f.stage)).filter(name => name.startsWith(`.${PLUGIN_NAME}.backup-`))
+    .map(name => path.join(path.dirname(f.stage), name)).find(dir => JSON.parse(read(path.join(dir, 'package.json'))).version === version);
+  return { ...f, c, options, codexCache, staged, installOlder, retained, codexRuns: () => fs.readdirSync(codexCache) };
+}
+const plainFailure = error => /already matches the outbound bridge tool/.test(error.message) && !/Version rollback|unverified|Rollback could not finish/.test(error.message);
+const literal = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+test('R3I01: a late refusal after --prepare-only returns both clients to the build they ran, not to the prepared stage', async t => {
+  const f = clientFixture(t), older = await f.installOlder();
+  await main(['--prepare-only'], f.options);
+  const prepared = f.staged(), backup = f.retained(older);
+  assert.notEqual(prepared, older); assert.deepEqual(f.codexRuns(), [older]);
+  f.c.refuse = true;
+  await assert.rejects(main([], f.options), plainFailure);
+  assert.deepEqual(f.codexRuns(), [older]); assert.equal(f.c.claude.version, older);
+  assert.equal(f.staged(), prepared, 'the installed stage is the one this run found');
+  assert.equal(f.retained(older), backup, 'the older build is back in its own backup folder');
+  assert.equal(f.calls.some(([app, , action]) => app === 'codex' && action === 'remove'), false);
+});
+
+test('R3I01: after a Claude-only update, a late refusal returns each client to its own build', async t => {
+  const f = clientFixture(t), older = await f.installOlder();
+  write(f.config, read(f.config).replace('enabled = true', 'enabled = false'));
+  await main(['--claude'], f.options);
+  const claudeBuild = f.staged();
+  assert.equal(f.c.claude.version, claudeBuild); assert.deepEqual(f.codexRuns(), [older]);
+  write(f.config, read(f.config).replace('enabled = false', 'enabled = true'));
+  f.c.refuse = true;
+  await assert.rejects(main([], f.options), plainFailure);
+  assert.deepEqual(f.codexRuns(), [older]); assert.equal(f.c.claude.version, claudeBuild); assert.equal(f.staged(), claudeBuild);
+});
+
+for (const [label, args] of [['changed during the run', []], ['removed before a Claude-only run', ['--claude']]]) {
+  test(`R3I01: when the build a client ran has no verified copy left (${label}), the failure names each version and the recovery source`, async t => {
+    const f = clientFixture(t), older = await f.installOlder();
+    await main(['--prepare-only'], f.options);
+    const prepared = f.staged(), backup = f.retained(older);
+    if (args.length) fs.rmSync(backup, { recursive: true });
+    else f.c.onRefuse = () => fs.appendFileSync(path.join(backup, 'scripts', 'mcp.mjs'), '// edited\n');
+    f.c.refuse = true;
+    const error = await main(args, f.options).then(() => assert.fail('the run must fail'), e => e);
+    assert.match(error.message, /already matches the outbound bridge tool/); assert.doesNotMatch(error.message, /Rollback could not finish/);
+    const changed = args.length ? ['Claude'] : ['Codex', 'Claude'];
+    for (const app of ['Codex', 'Claude']) {
+      const note = new RegExp(`Version rollback did not complete for ${app}: it ran ${literal(older)} before this run and now runs ${literal(prepared)}\\. The installer kept no verified copy of ${literal(older)}; its recovery source is the \\d+\\.\\d+\\.\\d+ release package\\.`);
+      if (changed.includes(app)) assert.match(error.message, note); else assert.doesNotMatch(error.message, new RegExp(`for ${app}:|${app}'s version`));
+    }
+    assert.equal(f.c.claude.version, prepared); assert.equal(f.staged(), prepared);
+    assert.deepEqual(f.codexRuns(), [args.length ? older : prepared]);
+  });
+}
+
+test('R3I02: installer and catalog locks left by a dead owner and a dead recovery owner name their folder and the installer recovery', async t => {
+  const dead = 2_147_483_647;
+  for (const [args, folder, guarded] of [
+    [['--prepare-only'], home => path.join(home, 'plugins', `.${PLUGIN_NAME}-install-lock`), /check the staged files in .* and the personal catalog /],
+    [['--codex', '--prepare-only'], home => path.join(home, '.agents', 'plugins', `.${PLUGIN_NAME}-marketplace-lock`), /check .*marketplace\.json, then/],
+  ]) {
+    const f = fixture(t), lock = folder(f.homeDir);
+    write(path.join(lock, 'state.lock'), JSON.stringify({ pid: dead, token: 'dead-installer' }));
+    write(path.join(lock, 'state.lock.recovery'), JSON.stringify({ pid: dead, token: 'dead-recovery' }));
+    const error = await main(args, f.options).then(() => assert.fail('the lock must refuse'), e => e);
+    assert.ok(error.message.startsWith(`The installer lock ${lock} was left by an installer that stopped`), error.message);
+    assert.match(error.message, guarded);
+    assert.ok(error.message.includes(`stop every bridge installer`) && error.message.includes(`then delete the folder ${lock} and run the installer again`), error.message);
+    assert.doesNotMatch(error.message, /offline lock recovery steps|back up the complete state|Pin both apps|bridge_doctor/);
+    assert.ok(fs.existsSync(path.join(lock, 'state.lock')) && fs.existsSync(path.join(lock, 'state.lock.recovery')), 'the guard is never broken automatically');
+    assert.equal(fs.existsSync(f.stage), false); assert.deepEqual(mutations(f.calls), []);
   }
 });
