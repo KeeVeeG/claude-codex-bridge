@@ -228,6 +228,15 @@ test('missing manual primary is a body-free omission; exact text and fingerprint
   const shadow = await getBridgeConversation(args(fixture));
   assert.deepEqual(shadow.warnings, []); assert.equal(shadow.messages.length, 1);
   assert.equal(shadow.messages[0].message, message); assert.equal(shadow.messages[0].notice_status, 'submitted');
+  writeLedger(fixture, ownerThreadId, [outgoing('newest', 9), outgoing('oldest', 3)]);
+  const first = await getBridgeConversation({ ...args(fixture), limit: 1 });
+  assert.deepEqual(ids(first), ['newest']);
+  const folder = path.join(fixture.stateDir, 'manual'), backup = path.join(fixture.root, 'manual-backup');
+  fs.renameSync(folder, backup); fs.writeFileSync(folder, 'not a directory');
+  const interrupted = await getBridgeConversation({ ...args(fixture), cursor: first.next_cursor });
+  assert.deepEqual(ids(interrupted), []); assert.equal(interrupted.next_cursor, first.next_cursor);
+  fs.unlinkSync(folder); fs.renameSync(backup, folder);
+  assert.deepEqual(ids(await getBridgeConversation({ ...args(fixture), cursor: interrupted.next_cursor })), ['oldest', 'manual']);
 });
 
 test('history distinguishes unverifiable, invalid and unassignable history without printing file paths', async t => {

@@ -173,6 +173,30 @@ test('a manual send whose primary record cannot be saved stays submitted and pos
   assert.deepEqual(result.notice_outcome, { delivered: true, retry: 'no', reason: 'submitted' });
   assert.equal(setup.notices.length, 1);
   assert.equal(setup.userFrames().length, 2);
+  const replay = await manualSend({ session_id: setup.record.sessionId, message: 'Manual fixture text', message_id: 'q02' }, setup.context);
+  assert.equal(replay.outcome.reason, 'already_submitted');
+  assert.equal(Object.values(JSON.parse(fs.readFileSync(file)).messages).find(row => row.id === 'q02').status, 'submitted');
+  assert.equal(setup.userFrames().length, 2); assert.equal(setup.notices.length, 1);
+});
+
+test('panel replay repairs a known pre-write rejection before rearming the manual ID', nativeOnly, async t => {
+  const setup = await codexToClaude(t), live = setup.record.messagingSocketPath;
+  setup.writeRecord({ messagingSocketPath: missingSocket() });
+  const args = { session_id: setup.record.sessionId, message: 'Manual fixture', message_id: 'recover-rejection' };
+  const primary = path.join(setup.stateDir, hash(setup.owner), 'state.json');
+  const rename = fs.renameSync, fault = t.mock.method(fs, 'renameSync', (a, b) => {
+    if (b === primary && Object.values(JSON.parse(fs.readFileSync(a)).messages).some(row => row.status === 'failed')) {
+      throw Object.assign(new Error('full fixture disk'), { code: 'ENOSPC' });
+    }
+    return rename(a, b);
+  });
+  const first = await manualSend(args, setup.context);
+  assert.equal(first.outcome.delivered, false); assert.equal(setup.userFrames().length, 0);
+  assert.equal(Object.values(JSON.parse(fs.readFileSync(primary)).messages)[0].status, 'sending');
+  fault.mock.restore(); setup.writeRecord({ messagingSocketPath: live });
+  const replay = await manualSend(args, setup.context);
+  assert.equal(replay.delivery.status, 'submitted'); assert.equal(setup.userFrames().length, 1);
+  assert.equal(setup.notices.length, 1);
 });
 
 test('a send reads its ledger once to look up, once to reserve and once to settle; a listing once (O04)', nativeOnly, async t => {

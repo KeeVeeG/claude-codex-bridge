@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { Worker } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
 import { createSession, ledgerAt, lookupMessage, recordMessage, getMessages, readSession, finishMessage, updateSession, withStateLockAsync } from '../lib/store.mjs';
 import * as calls from '../lib/call-store.mjs';
@@ -52,8 +53,10 @@ test('an invalid row cannot free a key, impersonate a different message, or hide
   recordMessage(session, draft); recordMessage(session, { ...draft, id: 'healthy' });
   updateSession(session, s => { Object.values(s.messages).find(r => r.id === draft.id).id = 'wrong-id'; s.messages.broken = null; });
   const before = fs.readFileSync(session.stateFile);
-  assert.throws(() => lookupMessage(owner, draft), { reason: 'state_unavailable' });
-  assert.throws(() => recordMessage(session, draft), { reason: 'state_unavailable' });
+  const invalid = { reason: 'state_unavailable', outcome: { delivered: 'unknown', retry: 'inspect', reason: 'state_unavailable' } };
+  assert.throws(() => lookupMessage(owner, draft), invalid);
+  assert.throws(() => recordMessage(session, draft), invalid);
+  assert.throws(() => finishMessage(session, draft.id, { route: draft.route, status: 'submitted' }), invalid);
   const { rows, issues } = await calls.listMessages(session, 20, draft.route.from);
   assert.deepEqual(rows.map(r => r.id), ['healthy']); assert.deepEqual(issues, [{ source: 'ledger', reason: 'state_unavailable' }]);
   assert.deepEqual(fs.readFileSync(session.stateFile), before);
@@ -109,6 +112,18 @@ test('an exact Windows start token mismatch under five seconds is rechecked befo
   assert.ok(!fs.existsSync(lock));
 });
 
+test('a cancelled reservation queued to the storage worker cannot commit its key', async t => {
+  const { session, draft } = await setup(t), controller = new AbortController();
+  updateSession(session, state => { state.legacyPadding = 'x'.repeat(600_000); });
+  const original = Worker.prototype.postMessage;
+  t.mock.method(Worker.prototype, 'postMessage', function(message, ...rest) {
+    if (message.method === 'record') controller.abort(); // after cross-version lock and parent preflight
+    return original.call(this, message, ...rest);
+  });
+  await assert.rejects(calls.recordMessage(session, draft, { signal: controller.signal }), { code: 'ABORT_ERR' });
+  assert.deepEqual(readSession(session).messages, {});
+});
+
 test('a released-writer replacement invalidates a warm large-ledger snapshot', async t => {
   const { owner, session, draft } = await setup(t);
   recordMessage(session, draft); updateSession(session, state => { state.legacyPadding = 'x'.repeat(600_000); });
@@ -138,6 +153,9 @@ test('rollback preserves bidirectional page boundaries and catalog recency while
   assert.deepEqual(page.messages.map(m => [m.direction, m.created_at]), [['to_codex', wall]]);
   const older = await getBridgeConversation({ ...opts, sessionId, cursor: page.next_cursor });
   assert.deepEqual(older.messages.map(m => m.id), [sessionId]);
+  const legacyBoundary = JSON.parse(Buffer.from(page.next_cursor, 'base64url')); delete legacyBoundary.order;
+  const oldCursor = Buffer.from(JSON.stringify(legacyBoundary)).toString('base64url');
+  assert.deepEqual((await getBridgeConversation({ ...opts, sessionId, cursor: oldCursor })).messages.map(m => m.id), [sessionId]);
   const catalog = await listClaudeConversations(opts);
   assert.deepEqual(catalog.conversations.map(c => c.session_id), [sessionId, other]);
   assert.equal(catalog.conversations[0].last_contact_at, wall);
@@ -155,4 +173,32 @@ test('doctor distinguishes unsupported hard links from an unusable state selecto
   const invalid = await executeBridgeTool('bridge_doctor', {}, { env: { CLAUDE_CODEX_BRIDGE_STATE_DIR: notDirectory } });
   assert.equal(invalid.ready, false); assert.equal(invalid.issues[0].reason, 'state_unavailable');
   assert.ok(!JSON.stringify(invalid).includes(notDirectory));
+});
+
+test('rearming an older failed delivery does not jump across an issued page cursor', async t => {
+  const { owner, session, draft } = await setup(t);
+  const sessionId = randomUUID(), route = { ...draft.route, to: { kind: 'claude', id: sessionId } };
+  const { getBridgeConversation } = await import('../lib/bridge-history.mjs');
+  const options = { stateDir: owner.stateDir, ownerThreadId: owner.threadId, sessionId, limit: 1 };
+  recordMessage(session, { ...draft, route });
+  finishMessage(session, draft.id, { route, status: 'failed', reason: 'target_unavailable' });
+  recordMessage(session, { ...draft, route, id: 'latest' });
+  const first = await getBridgeConversation(options);
+  assert.equal(first.messages[0].id, 'latest');
+  const retry = recordMessage(session, { ...draft, route });
+  assert.equal(retry.retried, true);
+  assert.deepEqual((await getBridgeConversation({ ...options, cursor: first.next_cursor })).messages.map(r => r.id), [draft.id]);
+});
+
+test('doctor reports dead sender and manual recovery owners without changing locks', async t => {
+  const { owner, session } = await setup(t);
+  const manual = path.join(owner.stateDir, 'manual', session.key); fs.mkdirSync(manual, { recursive: true });
+  const contents = JSON.stringify({ pid: 2147483647, token: 'fixture-only' });
+  for (const dir of [session.dir, manual]) for (const lock of ['state.lock', 'state.lock.recovery']) fs.writeFileSync(path.join(dir, lock), contents);
+  const report = await executeBridgeTool('bridge_doctor', {}, { stateDir: owner.stateDir, env: { CLAUDE_CODEX_BRIDGE_DAEMON: 'off' },
+    metadata: { 'openai/threadId': owner.threadId }, registryDir: path.join(owner.root, 'absent') });
+  for (const name of ['sender_lock', 'manual_lock']) {
+    const finding = report.checks.find(c => c.name === name); assert.equal(finding.status, 'fail'); assert.match(finding.detail, /back up.*offline lock recovery/i);
+  }
+  for (const dir of [session.dir, manual]) for (const lock of ['state.lock', 'state.lock.recovery']) assert.equal(fs.readFileSync(path.join(dir, lock), 'utf8'), contents);
 });

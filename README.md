@@ -75,7 +75,7 @@ For a mixed run or rollback, point every process at the **same real private dire
 | `bridge_doctor` | Check transports, caller identity, and state without sending anything. From a Codex Desktop task it also registers that task for discovery from Claude. |
 | `bridge_panel` | Codex Desktop only: open a panel beside the current chat to browse Claude conversations and message them by hand. |
 
-`panel_history`, `panel_send`, and `panel_retry_notice` serve the panel.
+`panel_history`, `panel_send`, and `panel_retry_notice` serve the panel. If the compatible manual notice ledger fills, a new send can still reach Claude and appear in history. Its owner notice is skipped rather than risk posting it twice from different bridge versions. Do not resend the Claude message to create that notice.
 
 From Claude, find a thread with `list_codex_threads` and call `send_to_codex`; from Codex, find a session with `list_claude_sessions` and call `send_to_claude`. A known exact ID can be used directly. One conversation can message several others. Claude lists terminal (`cli`), print-mode (`sdk-cli`), Desktop (`claude-desktop`), and VS Code (`claude-vscode`) sessions; choose by exact ID, and list again after `/clear` or `/resume`. A session is reachable only while its process runs; print-mode sessions only until they exit. A session open in two windows, for example resumed in a new terminal while the old one still runs, gets messages in the window used last.
 
@@ -108,6 +108,10 @@ Run `bridge_doctor` first; it sends nothing. From a verified Codex Desktop task 
 - **Each app sees different state.** Both must resolve to one real directory, normally `~/.local/share/claude-codex-bridge`. The installer pins the local directory for both, avoiding Windows MSIX virtualization of `LOCALAPPDATA`. If old and new state both exist, follow the update steps above before retrying any delivery.
 - **Claude blocks `send_to_codex`.** Add the permission above, or switch the Code tab to **Manual** and approve the prompt. A `Bash` rule does not apply to MCP tools.
 - **Claude does not receive.** `/status` must show a `Peer address`; `--bare` sessions have no inbox. Claude's `crossSessionInbound` setting can hold or refuse messages after a successful write. The bridge marks its messages `from-mode="bypass"` so Bypass sessions do not hold them silently ([issue #1](https://github.com/KeeVeeG/claude-codex-bridge/issues/1)); it never changes your inbound settings.
+
+### Offline lock recovery
+
+If `bridge_doctor` reports interrupted recovery or an unverifiable lock that persists after an ordinary operation finishes, do not delete a lock from a running installation. Quit both apps, stop every bridge server and installer using that directory, and back up the entire state tree. Make a separate private copy on a volume that supports hard links. In the **copy only**, omit `state.lock` and `state.lock.recovery`; keep all ledger, manual, clock and other data files. Pin both apps (and any older writers) to that one copy before restarting. Run doctor and inspect saved deliveries and receiving conversations. A `sending` or `uncertain` row is not proof that nothing arrived. If you cannot establish that all writers are stopped or which state tree is authoritative, leave the originals untouched.
 
 ## Compatibility
 
