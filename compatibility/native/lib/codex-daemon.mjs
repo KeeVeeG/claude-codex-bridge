@@ -6,7 +6,7 @@ import { execFile, spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { FrameDecoder, encodeClose, encodePong, encodeText, upgradeRequest } from './ws-jsonrpc.mjs';
 import { resolveCodexExecutable } from './codex-binary.mjs';
-import { beforeWrite } from './call-time.mjs';
+import { beforeWrite, monotonicNow } from './call-time.mjs';
 import { failure, tagged } from './outcome.mjs';
 
 const runtimeVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -279,11 +279,11 @@ const summarize = thread => ({
 export async function listTerminalThreads(connection, { limit = 30, signal, timeoutMs, budgetMs = 5000 } = {}) {
   const found = [];
   let cursor = null;
-  const until = Date.now() + budgetMs;
+  const until = monotonicNow() + budgetMs;
   // Bounded: at most 40 pages of 50 stored threads, and no new page once the time budget is spent,
   // so discovery cannot stall every listing. An exact ID is still resolved by thread/read.
   // The originator is immutable creation metadata; a resumed thread may use any client.
-  for (let page = 0; page < 40 && found.length < limit && (page === 0 || Date.now() < until); page++) {
+  for (let page = 0; page < 40 && found.length < limit && (page === 0 || monotonicNow() < until); page++) {
     const result = await connection.request('thread/list', { limit: 50, sortKey: 'updated_at', ...(cursor ? { cursor } : {}) }, { signal, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
     if (!Array.isArray(result.data) || (result.nextCursor != null && typeof result.nextCursor !== 'string')) {
       throw failure('Codex daemon returned an unsupported thread list.', 'protocol_incompatible');

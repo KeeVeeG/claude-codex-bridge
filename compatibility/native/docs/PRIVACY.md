@@ -12,7 +12,7 @@ The optional macOS SSH route launches `/usr/bin/ssh` with the configured alias, 
 
 ## Local records
 
-By default, state is stored under `~/.local/share/claude-codex-bridge` in the user's profile, shared by both applications. The local installer writes that absolute location into the staged MCP configuration; the source configuration contains no personal path. `CLAUDE_CODEX_BRIDGE_STATE_DIR` can explicitly select another shared directory. This avoids app-specific MSIX virtualization of `LOCALAPPDATA` and does not depend on the project working directory. Records include:
+By default, state is stored under `~/.local/share/claude-codex-bridge` in the user's profile, shared by both applications. The local installer writes that absolute location into the staged MCP configuration; the source configuration contains no personal path. `CLAUDE_CODEX_BRIDGE_STATE_DIR` can explicitly select another shared directory. This avoids app-specific MSIX virtualization of `LOCALAPPDATA` and does not depend on the project working directory. The state volume must support local hard links (for example NTFS or APFS, not FAT or exFAT). Doctor tests this in an existing state directory with empty temporary files; it does not create a missing directory. Records include:
 
 - Outgoing message text, IDs, sender and destination identifiers, timestamps, fingerprints, delivery status, and available transport receipts/errors.
 - Conversation names, registry paths, and local routing addresses.
@@ -22,7 +22,9 @@ The local installer also saves a configured SSH alias in the staged MCP configur
 
 These are ordinary local JSON files, not application-level encrypted storage. The bridge does not implement automatic retention expiry or a message recall operation. Local delivery records remain until the bridge state is removed; messages already delivered to either application remain under that application's controls. Releases before 0.2.0 also stored one-to-one routing metadata; upgrading does not automatically erase those older local records.
 
-The prior profile-default state directory is renamed automatically when the new default does not exist; a deferred move keeps using the previous directory and is reported by `bridge_doctor`. Other explicitly chosen state paths are not migrated.
+The bridge never renames a live ledger. If the previous profile-default directory still exists, follow the [offline migration or explicit pinning instructions](../README.md#updating-from-a-version-before-100). An existing explicit junction or symlink is resolved to its real target; do not retarget it while the bridge is running. Use the real target path when co-running older versions.
+
+Use a private per-user directory, not a shared drive or a folder readable by other accounts. On Windows, Node's file modes do not isolate the JSON files: new files can inherit their parent’s DACL. `bridge_doctor` checks the selected root (or its nearest existing parent) for potentially broad grants; it does not audit every child, calculate effective access for every account, or change permissions. Check the directory and existing delivery files under **Properties > Security > Advanced**.
 
 Earlier versions used `LOCALAPPDATA` and may have records in separate application-specific locations. Changing the default does not automatically migrate or erase those older records.
 

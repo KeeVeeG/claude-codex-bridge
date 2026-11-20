@@ -576,6 +576,10 @@ test('a server started through a folder link keeps the code it started with when
   // A module read after start would now load without its exports.
   for (const file of fs.readdirSync(path.join(root, 'lib'))) fs.writeFileSync(path.join(root, 'lib', file), 'export {};\n');
   fs.writeFileSync(manifest, JSON.stringify({ version: '99.0.0' }));
+  const large = createSession({ stateDir: path.join(temp, 'state'), threadId: 'pinned-worker', cwd: temp });
+  updateSession(large, state => { state.legacyPadding = 'x'.repeat(600_000); });
+  const deliveries = toolValue(await callTool(client, 'list_deliveries', {}, metadata('pinned-worker')));
+  assert.deepEqual(deliveries.deliveries, [], 'the already-loaded worker still reads a large ledger');
   const diagnostics = toolValue(await callTool(client, 'bridge_doctor'));
   assert.equal(diagnostics.plugin_version, running);
   assert.deepEqual(diagnostics.issues.find(issue => issue.check === 'plugin_version'), { check: 'plugin_version', status: 'warning', reason: 'version_mismatch' });
@@ -627,7 +631,8 @@ for (const defect of ['unwritable state', 'malformed host registry']) {
     await initialize(client);
     assert.deepEqual((await client.rpc('ping')).result, {}, 'the child is still processing requests');
     const doctor = toolValue(await callTool(client, 'bridge_doctor', {}, metadata('fixture-task')));
-    assert.equal(doctor.checks.find(check => check.name === 'codex_registration')?.status, 'fail');
+    const check = defect === 'unwritable state' ? 'state_directory' : 'codex_registration';
+    assert.equal(doctor.checks.find(entry => entry.name === check)?.status, 'fail');
     assert.equal(client.stderr(), '');
   });
 }

@@ -162,7 +162,8 @@ for (const ledger of ['sender', 'manual', 'host']) for (const mode of ['cancel',
         assert.deepEqual(JSON.parse(result.content[1].text), machine);
         assert.deepEqual(result._meta['bridge-claude-codex/outcome'], machine);
         assert.match(result.content[0].text, /message not sent|no message was sent/i);
-        assert.equal((await client.event('settled')).stop, 'BRIDGE_DEADLINE');
+        const settled = await client.event('settled');
+        assert.ok(settled.stop === 'BRIDGE_DEADLINE' || settled.remainingMs <= 0, 'the deadline timer or monotonic check stopped the call');
       }
       assert.deepEqual(bytes, { claude: 0, codex: 0 });
       assert.deepEqual(fs.readFileSync(lock), held, 'the fixture owner still holds the original lock');

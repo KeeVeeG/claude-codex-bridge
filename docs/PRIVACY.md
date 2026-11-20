@@ -12,7 +12,7 @@ The optional macOS SSH route launches `/usr/bin/ssh` with the configured alias, 
 
 ## Local records
 
-By default, state is stored under `~/.local/share/claude-codex-bridge` in the user's profile, shared by both applications. The local installer writes that absolute location into the staged MCP configuration; the source configuration contains no personal path. `CLAUDE_CODEX_BRIDGE_STATE_DIR` can explicitly select another shared directory. This avoids app-specific MSIX virtualization of `LOCALAPPDATA` and does not depend on the project working directory. Records include:
+By default, state is stored under `~/.local/share/claude-codex-bridge` in the user's profile, shared by both applications. The local installer writes that absolute location into the staged MCP configuration; the source configuration contains no personal path. `CLAUDE_CODEX_BRIDGE_STATE_DIR` can explicitly select another shared directory. This avoids app-specific MSIX virtualization of `LOCALAPPDATA` and does not depend on the project working directory. The state volume must support local hard links (for example NTFS or APFS, not FAT or exFAT). Doctor tests this in an existing state directory with empty temporary files; it does not create a missing directory. Records include:
 
 - Outgoing message text, IDs, sender and destination identifiers, timestamps, fingerprints, delivery status, and available transport receipts/errors.
 - Conversation names, registry paths, and local routing addresses.

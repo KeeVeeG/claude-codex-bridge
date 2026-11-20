@@ -23,7 +23,7 @@ function fixture(t) {
   const oldState = path.join(homeDir, '.local', 'share', oldPlugin);
   const session = createSession({ stateDir: oldState, threadId: 'record-owner', cwd: homeDir });
   const record = recordMessage(session, { id: 'preserved', direction: 'to_claude', message: 'Keep this record.',
-    route: { from: { kind: 'codex', id: 'record-owner' }, to: { kind: 'claude', id: 'recipient' } } }).message;
+    route: { from: { kind: 'codex', id: 'record-owner' }, to: { kind: 'claude', id: 'ae83616c-17ad-427f-8665-bb6e03569c8c' } } }).message;
   return { homeDir, oldState, record };
 }
 function put(filename, value) { fs.mkdirSync(path.dirname(filename), { recursive: true }); fs.writeFileSync(filename, JSON.stringify(value)); }

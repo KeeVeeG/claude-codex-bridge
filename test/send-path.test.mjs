@@ -150,6 +150,10 @@ test('a submitted message whose record cannot be saved is reported delivered, ne
   assert.match(error.message, /^The message was submitted, but its delivery record could not be saved\. Do not send it again/);
   assert.deepEqual(error.outcome, { delivered: true, retry: 'no', reason: 'settlement_failed', record: { message_id: 'r01', status: 'sending' } });
   assert.equal(setup.userFrames().length, 2);
+  const replay = await setup.send({ message_id: 'r01' });
+  assert.equal(replay.outcome.reason, 'already_submitted');
+  assert.equal(Object.values(JSON.parse(fs.readFileSync(file)).messages).find(row => row.id === 'r01').status, 'submitted');
+  assert.equal(setup.userFrames().length, 2, 'repair must not write another recipient frame');
 });
 
 test('a manual send whose primary record cannot be saved stays submitted and posts its notice (Q02)', windowsOnly, async t => {

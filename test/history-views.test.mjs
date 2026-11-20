@@ -221,6 +221,13 @@ test('missing manual primary is a body-free omission; exact text and fingerprint
   assert.deepEqual(joined.warnings, []);
   assert.equal(joined.messages[0].message, 'Body from primary only.');
   assert.equal(joined.messages[0].notice_status, 'submitted');
+  writeLedger(fixture, ownerThreadId, []);
+  const message = 'Verified manual body without a primary copy.';
+  const route = outgoing('manual', 7).route;
+  writeManual(fixture, [{ ...row, message, fingerprint: hash(JSON.stringify({ direction: 'to_claude', message, route })) }]);
+  const shadow = await getBridgeConversation(args(fixture));
+  assert.deepEqual(shadow.warnings, []); assert.equal(shadow.messages.length, 1);
+  assert.equal(shadow.messages[0].message, message); assert.equal(shadow.messages[0].notice_status, 'submitted');
 });
 
 test('history distinguishes unverifiable, invalid and unassignable history without printing file paths', async t => {

@@ -76,7 +76,7 @@ test('history pagination reaches every message once even when timestamps and IDs
     message(incoming, { kind: 'claude', id: sessionId }, { kind: 'codex', id: 'pagination-owner' }, id, `in ${index}`);
   }
   for (const session of [outgoing, incoming]) updateSession(session, state => {
-    for (const value of Object.values(state.messages)) value.createdAt = 123456;
+    for (const value of Object.values(state.messages)) { delete value.orderAt; value.createdAt = 123456; } // old-format timestamps
   });
   const complete = await getBridgeConversation({ stateDir: fixture.stateDir, ownerThreadId: 'pagination-owner', sessionId, limit: 200 });
   let cursor;

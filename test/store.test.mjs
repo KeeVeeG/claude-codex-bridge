@@ -69,7 +69,7 @@ test('both directions allow multiple messages without deadlines or a required re
   }
   updateSession(session, state => { state.messages.one.createdAt = 1; });
   assert.equal(getMessages(session).length, 4);
-  assert.equal(getMessages(session).find(item => item.id === 'one').status, 'uncertain');
+  assert.equal(getMessages(session).find(item => item.id === 'one').status, 'sending', 'a wall-clock timestamp does not prove a live attempt was abandoned');
   assert.equal('activeRequestId' in readSession(session), false);
 });
 
@@ -163,7 +163,7 @@ test('validation uses UTF-8 bytes and preserves arbitrary Unicode text unchanged
   const unicode = recordMessage(session, { direction: 'to_claude', message });
   assert.equal(unicode.message.message, message);
   assert.equal(getMessages(session)[0].message, message);
-  assert.deepEqual(Object.keys(unicode.message).sort(), ['id', 'direction', 'message', 'createdAt', 'senderPid', 'status', 'fingerprint'].sort());
+  assert.deepEqual(Object.keys(unicode.message).sort(), ['id', 'direction', 'message', 'createdAt', 'orderAt', 'startedTick', 'attemptId', 'senderPid', 'status', 'fingerprint'].sort());
   const result = recordMessage(session, { direction: 'to_claude', message: 'é'.repeat(32_768) });
   assert.equal(Buffer.byteLength(result.message.message), 65_536);
   assert.equal(recordMessage(session, { direction: 'to_codex', message: 'x'.repeat(65_536) }).created, true);
@@ -439,13 +439,13 @@ test('persistent Windows replacement contention stops at the retry deadline and 
     const expected = Object.assign(new Error('Replacement remains busy'), { code: 'EPERM' });
     let attempts = 0;
     let now = 100_000;
-    t.mock.method(Date, 'now', () => { now += 250; return now; });
+    const clock = () => { now += 250; return now; };
     t.mock.method(fs, 'renameSync', (source, destination) => {
       if (destination === session.stateFile) { attempts++; throw expected; }
       return rename(source, destination);
     });
     let callbacks = 0;
-    assert.throws(() => updateSession(session, state => { callbacks++; state.changed = true; }), error => error === expected);
+    assert.throws(() => updateSession(session, state => { callbacks++; state.changed = true; }, { now: clock }), error => error === expected);
     assert.equal(attempts, 4);
     assert.equal(callbacks, 1, 'retry must never invoke the state mutation twice');
     assert.equal(readSession(session).changed, undefined);

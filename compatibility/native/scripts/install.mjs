@@ -39,11 +39,11 @@ const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
 // plugin files. Keep each move atomic and retry the same source/destination;
 // never restage files or repeat application installation after sharing errors.
 function renameDirectoryWithRetry(source, destination) {
-  const until = Date.now() + 1000;
+  const until = performance.now() + 1000;
   for (;;) {
     try { fs.renameSync(source, destination); return; }
     catch (error) {
-      const remaining = until - Date.now();
+      const remaining = until - performance.now();
       if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || remaining <= 0) throw error;
       Atomics.wait(sleepBuffer, 0, 0, Math.min(25, remaining));
     }
