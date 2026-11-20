@@ -13,7 +13,7 @@ import { performance } from 'node:perf_hooks';
 import { executeBridgeTool } from '../lib/bridge-service.mjs';
 import { manualSend } from '../lib/manual-service.mjs';
 import { canonicalClaudeSocket } from '../lib/claude-sessions.mjs';
-import { startCall } from '../lib/call-time.mjs';
+import { deadlineOf, startCall } from '../lib/call-time.mjs';
 import { getSession } from '../lib/store.mjs';
 import { nativeFixture, mockPipe, encodeFrame, messageTool } from './native-helpers.mjs';
 
@@ -301,21 +301,48 @@ test('doctor reports an inbox that is slow to accept a connection as inconclusiv
   assert.deepEqual(result.issues.find(issue => issue.check === 'claude_inbox'), { check: 'claude_inbox', status: 'warning', reason: 'target_unverified' });
 });
 
-test('doctor ends its inbox checks within their budget when process checks hang (FB04)', nativeOnly, async t => {
+function assertInboxUnverified(report, detail, setup) {
+  const inbox = report.checks.find(check => check.name === 'claude_inbox');
+  assert.equal(inbox.status, 'warning');
+  assert.equal(inbox.detail, detail);
+  assert.deepEqual(report.issues.find(issue => issue.check === 'claude_inbox'), { check: 'claude_inbox', status: 'warning', reason: 'target_unverified' });
+  assert.equal(setup.inbox.messages.length, 0);
+}
+
+test('doctor stops a hung read at the inbox budget and leaves the next registration unchecked (FB04)', nativeOnly, async t => {
   const setup = await codexToClaude(t);
   writeClaudeRecord(setup.registryDir, { ...setup.record, pid: process.ppid, sessionId: randomUUID(), messagingSocketPath: missingSocket() });
-  setup.probe.answer = signal => new Promise((resolve, reject) => {
-    signal.addEventListener('abort', () => reject(Object.assign(new Error('fixture hang'), { transient: true })), { once: true });
+  let now = 0, began;
+  t.mock.method(performance, 'now', () => now);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const reading = new Promise(resolve => { began = resolve; });
+  setup.probe.answer = signal => new Promise((_, reject) => {
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    began(signal);
   });
-  const started = performance.now();
-  const result = await executeBridgeTool('bridge_doctor', {}, setup.context);
-  const elapsed = performance.now() - started;
-  assert.ok(elapsed < 12_000, `doctor took ${Math.round(elapsed)} ms`);
-  const inbox = result.checks.find(check => check.name === 'claude_inbox');
-  assert.equal(inbox.status, 'warning');
-  assert.match(inbox.detail, /not checked within the diagnostic time budget/);
-  assert.deepEqual(result.issues.find(issue => issue.check === 'claude_inbox'), { check: 'claude_inbox', status: 'warning', reason: 'target_unverified' });
-  assert.equal(setup.inbox.messages.length, 0);
+  const report = executeBridgeTool('bridge_doctor', {}, setup.context);
+  const attempt = await Promise.race([reading, report.then(() => assert.fail('no process read started'))]);
+  assert.equal(deadlineOf(attempt) - now, 4500);
+  now += 4499; t.mock.timers.tick(4499);
+  assert.equal(attempt.aborted, false);
+  now += 1; t.mock.timers.tick(1);
+  assert.equal(attempt.aborted, true);
+  assertInboxUnverified(await report, 'Some Claude inboxes were not checked within the diagnostic time budget. Availability is inconclusive.', setup);
+  assert.equal(setup.probe.calls, 1, 'the second registration never started a process read');
+});
+
+test('doctor reports a started but unverified process read just before the inbox budget expires (FB04)', nativeOnly, async t => {
+  const setup = await codexToClaude(t); // Only one registration: its read actually started.
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  setup.probe.answer = signal => {
+    // A timer can wake with a fraction of a millisecond left: not expired, but too short for another inquiry.
+    now = deadlineOf(signal) - 0.5;
+    throw Object.assign(new Error('fixture read not verified'), { transient: true });
+  };
+  const report = await executeBridgeTool('bridge_doctor', {}, setup.context);
+  assertInboxUnverified(report, 'Could not verify the registered Claude Code conversation in time. Retry the same call.', setup);
+  assert.equal(setup.probe.calls, 1);
 });
 
 test('a panel shadow failure after both acceptances preserves both transport outcomes', nativeOnly, async t => {
