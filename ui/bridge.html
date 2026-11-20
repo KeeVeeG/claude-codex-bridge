@@ -483,7 +483,7 @@
   }
   function normalizeRow(row) {
     if (!object(row) || typeof row.id !== 'string' || typeof row.message !== 'string' || !['to_claude', 'to_codex'].includes(row.direction)) return null;
-    return { id: row.id, direction: row.direction, message: row.message, created_at: row.created_at, status: string(row.status) || 'submitted',
+    return { id: row.id, direction: row.direction, message: row.message, created_at: row.created_at, status: ['submitted', 'failed', 'sending'].includes(row.status) ? row.status : 'uncertain',
       manual: row.manual === true, notice_status: string(row.notice_status) || undefined, notice_retryable: row.notice_retryable === true,
       notice_reason: string(row.notice_reason) || undefined, notice_omitted: row.notice_omitted === true };
   }
@@ -500,7 +500,7 @@
   function checkPage(sessionId, data) {
     if (data.session_id !== sessionId || !Array.isArray(data.messages)) throw new Error('History belongs to another conversation. Refresh the panel.');
   }
-  function applyNewest(sessionId, cache, data) {
+  function applyNewest(sessionId, cache, data, inspecting) {
     checkPage(sessionId, data);
     const warnings = strings(data.warnings).concat(strings([data.warning]));
     // An unread page is not an empty page: keep what is shown and retry (C3 handoff).
@@ -519,7 +519,8 @@
         changed = setRows(cache, page) || cache.cursor !== next; cache.cursor = next; cache.hasMore = true; cache.generation++;
       } else changed = setRows(cache, cache.rows.slice(0, first).filter(row => !keys.has(keyOf(row))).concat(page));
       for (const key of [...(state.outbox.get(sessionId)?.keys() ?? [])]) if (cache.index.has(key)) state.outbox.get(sessionId).delete(key);
-      settleFromHistory(sessionId, cache);
+      // Only a row in this response is evidence; retained pages may predate the send.
+      changed = settleFromHistory(sessionId, inspecting, page) || changed;
     }
     return { rows: changed, alert: changed || was.join('|') !== [cache.incomplete, cache.warnings.join('\n'), cache.error].join('|') };
   }
@@ -527,10 +528,11 @@
     const cache = history(sessionId);
     if (cache.loading) { cache.again = true; return; }
     cache.loading = true; if (!cache.loaded && state.selected === sessionId) renderTimeline();
+    const inspecting = unknownSend(sessionId);
     try {
       const { data } = await callTool('panel_history', { session_id: sessionId, limit: 100 });
       if (state.histories.get(sessionId) !== cache) return;
-      const changed = applyNewest(sessionId, cache, data);
+      const changed = applyNewest(sessionId, cache, data, inspecting);
       if (state.selected === sessionId) {
         if (changed.rows || !cache.rows.length) renderTimeline({ preserve: true });
         renderComposer(); if (changed.alert) renderAlert();
@@ -549,6 +551,7 @@
     if (!cache?.cursor || cache.olderLoading) return;
     const cursor = cache.cursor; const generation = cache.generation; const height = $('timeline').scrollHeight;
     cache.olderLoading = true; cache.olderError = ''; renderTimeline({ preserve: true });
+    const inspecting = unknownSend(sessionId);
     let added = false;
     try {
       const { data } = await callTool('panel_history', { session_id: sessionId, limit: 100, cursor });
@@ -557,8 +560,9 @@
       if (data.incomplete === true || (data.incomplete === undefined && !data.messages.length && data.next_cursor === cursor)) {
         cache.olderError = 'Earlier messages could not be read in full.';
       } else {
-        const older = rowsOf(data).filter(row => !cache.index.has(keyOf(row)));
+        const page = rowsOf(data); const older = page.filter(row => !cache.index.has(keyOf(row)));
         setRows(cache, older.concat(cache.rows)); added = older.length > 0;
+        if (settleFromHistory(sessionId, inspecting, page) && state.selected === sessionId) renderComposer();
         cache.cursor = typeof data.next_cursor === 'string' ? data.next_cursor : null; cache.hasMore = data.has_more === true && Boolean(cache.cursor);
       }
     } catch (error) { cache.olderError = error.message; }
@@ -588,20 +592,12 @@
     return Boolean(state.ready && !state.ownerChanged && chat?.live && value.trim() && !draftProblem(value)
       && !(pending && ['sending', 'unknown'].includes(pending.phase)));
   }
-  async function sendMessage({ replay = false } = {}) {
+  async function sendMessage() {
     const sessionId = state.selected; const chat = state.chats.get(sessionId); const prior = state.sends.get(sessionId);
-    if (!chat || !state.ready || state.ownerChanged) return;
-    let message, id, revision, createdAt;
-    if (replay) {
-      // The same ID and the original text: the bridge reports the earlier result or completes it once.
-      if (prior?.phase !== 'unknown') return;
-      ({ message, id, revision, createdAt } = prior);
-    } else {
-      message = state.drafts.get(sessionId) || '';
-      if (!canSend(chat, message)) return;
-      const reuse = prior?.phase === 'failed' && prior.message === message && ['same_id', 'after_fix'].includes(prior.retry);
-      id = reuse ? prior.id : crypto.randomUUID(); revision = state.revisions.get(sessionId) || 0; createdAt = reuse ? prior.createdAt : Date.now();
-    }
+    const message = state.drafts.get(sessionId) || '';
+    if (!canSend(chat, message)) return;
+    const reuse = prior?.phase === 'failed' && prior.message === message && ['same_id', 'after_fix'].includes(prior.retry);
+    const id = reuse ? prior.id : crypto.randomUUID(); const revision = state.revisions.get(sessionId) || 0; const createdAt = reuse ? prior.createdAt : Date.now();
     const pending = { id, message, revision, createdAt, phase: 'sending' };
     state.sends.set(sessionId, pending); renderSelected(sessionId);
     let data, error;
@@ -622,7 +618,7 @@
       announce(`Not sent. ${failureText(pending)[0]} The draft is kept.`);
     } else {
       Object.assign(pending, { phase: 'unknown', reason: verdict.reason, detail: verdict.detail });
-      announce('The handoff is not confirmed. Check again before sending this text again.');
+      announce('Handoff not confirmed. Check again only reads bridge history.');
     }
     renderSelected(sessionId);
     if (verdict.delivered !== false) loadHistory(sessionId, { quiet: true });
@@ -639,12 +635,17 @@
     }
     if (state.selected === sessionId) renderChats();
   }
-  function settleFromHistory(sessionId, cache) {
-    // History settles an unknown send, never one whose request is still running (U01).
-    const pending = state.sends.get(sessionId); const row = pending && cache.index.get(`to_claude:${pending.id}`);
-    if (!row || pending.phase !== 'unknown' || row.message !== pending.message) return;
-    if (row.status === 'submitted') handOff(sessionId, pending, null);
-    else if (row.status === 'failed') Object.assign(pending, { phase: 'failed', reason: 'prior_failed', retry: 'after_fix', detail: '' });
+  function unknownSend(sessionId) {
+    const pending = state.sends.get(sessionId);
+    return pending?.phase === 'unknown' ? pending : null;
+  }
+  function settleFromHistory(sessionId, pending, rows) {
+    // An old-format failed row need not mean no write. Only a matching handoff resolves an unknown send.
+    if (!pending || state.sends.get(sessionId) !== pending) return false;
+    if (rows.some(row => row.direction === 'to_claude' && row.id === pending.id && row.message === pending.message && row.status === 'submitted')) {
+      handOff(sessionId, pending, null); return true;
+    }
+    const firstCheck = !pending.inspected; pending.inspected = true; return firstCheck;
   }
   async function retryNotice(sessionId, messageId) {
     const key = `${sessionId}:${messageId}`;
@@ -714,13 +715,13 @@
     if (row.notice_note === 'retry_unknown') return ['Posting the copy again has an unknown result. Check this Codex chat; Claude Code did not get the message again.', 'warning'];
     if (row.notice_note === 'retry_refused') return ['The copy could not be posted again. Check this Codex chat; Claude Code did not get the message again.', 'failed'];
     if (row.notice_status === 'submitted') return ['Copy posted in this Codex chat', ''];
-    if (row.notice_omitted) return ['No copy in this Codex chat: the notice ledger shared with older bridge versions is full. Claude Code has the message; do not send it again.', 'warning'];
+    if (row.notice_omitted) return ['No copy in this Codex chat: the notice ledger shared with older bridge versions is full. Do not resend the message to Claude Code.', 'warning'];
     if (row.notice_status === 'pending') return row.notice_retryable ? ['No copy in this Codex chat yet: the send stopped before posting it.', 'warning'] : ['Posting a copy in this Codex chat…', ''];
     if (row.notice_status === 'uncertain') return ['The copy for this Codex chat may not have been posted. Check this chat; it is not posted again automatically.', 'warning'];
     if (row.notice_status === 'failed') {
       const reason = NOTICE_REASONS[row.notice_reason];
       return row.notice_retryable ? [`Copy for this Codex chat not posted${reason ? `: ${reason}` : ''}.`, 'failed']
-        : ['Copy for this Codex chat not posted. Check this chat before acting; Claude Code has the message.', 'failed'];
+        : ['Copy for this Codex chat not posted. Check this chat; do not resend the message to Claude Code.', 'failed'];
     }
     return null;
   }
@@ -843,19 +844,19 @@
     // A10: name both destinations before the send.
     $('composer-dest').textContent = `To “${chat.title}” in Claude Code · a copy of the full text goes to this Codex chat`;
     $('composer-hint').textContent = problem || (pending?.phase === 'sending' ? 'Sending… You can keep editing; the text being sent is fixed.'
-      : pending?.phase === 'unknown' ? 'Sending is paused until the last message is checked.'
+      : pending?.phase === 'unknown' ? 'Sending is paused while the handoff is unconfirmed.'
       : bytes > LIMIT * 0.9 ? `${count(bytes)} of ${count(LIMIT)} bytes · ${keyHint()}` : keyHint());
     $('composer-hint').classList.toggle('problem', Boolean(problem));
   }
   function alertFor(sessionId) {
     const cache = state.histories.get(sessionId); const pending = state.sends.get(sessionId);
     if (pending?.phase === 'unknown') {
-      const confirmed = pending.reason !== 'no_answer' && pending.reason !== 'in_flight';
       const text = pending.reason === 'in_flight' ? 'Another attempt with this message is still running.'
-        : confirmed ? 'The bridge wrote this message but cannot confirm Claude Code took it. Look in the Claude Code conversation before sending this text again.'
-        : `Codex did not report whether this message was handed to Claude Code.${pending.detail ? ` ${pending.detail.slice(0, 200)}` : ''}`;
-      return { text: `${text} Check again reuses the same message ID: the bridge reports the earlier result or finishes the send once, never twice.`, tone: 'warning',
-        actions: [['Check again', () => sendMessage({ replay: true })], ['Write a new message', () => { state.sends.delete(sessionId); renderSelected(sessionId); }]] };
+        : pending.reason === 'no_answer' ? `Codex did not report whether this message was handed to Claude Code.${pending.detail ? ` ${pending.detail.slice(0, 200)}` : ''}`
+        : 'The handoff to Claude Code is not confirmed.';
+      const historyHint = cache?.error || cache?.incomplete ? ' Bridge history could not be read in full.' : pending.inspected ? ' No matching handoff in the history checked.' : '';
+      return { text: `${text}${historyHint} Look in Claude Code. Check again reads history only; it does not send anything.`, tone: 'warning',
+        actions: state.ready && !state.stopped ? [['Check again', () => loadHistory(sessionId)]] : [] };
     }
     if (pending?.phase === 'failed') {
       const [what, step, extra] = failureText(pending);

@@ -213,7 +213,14 @@ test('K03, X02, U03, Z01: Enter sends only when the host reports that Codex send
   assert.equal(second.requests('panel_send').length, 1);
 });
 
-test('A08: a lost response keeps one ID and blocks new sends; Check again replays the original text; only a recorded row releases it', async () => {
+async function checkHistoryOnly(h, messages, extra = {}) {
+  const before = h.outgoing.length;
+  alertButton(h, 'Check again').dispatch('click'); await flush();
+  assert.deepEqual(h.outgoing.slice(before).map(call => call.message.params.name), ['panel_history']);
+  h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages, has_more: false, next_cursor: null, ...extra }); await flush();
+}
+
+test('A08: after a lost reply, checking absent, incomplete or unresolved history never resends or releases the draft', async () => {
   const h = await live(); await h.choose('a'); type(h, 'Exact text');
   h.node('composer').dispatch('submit'); await flush();
   const send = h.requests('panel_send').at(-1); const args = send.message.params.arguments;
@@ -226,33 +233,46 @@ test('A08: a lost response keeps one ID and blocks new sends; Check again replay
   type(h, 'Edited meanwhile');
   h.node('composer').dispatch('submit'); h.node('message').dispatch('keydown', { key: 'Enter', ctrlKey: true }); await flush();
   assert.equal(h.requests('panel_send').length, 1);
-  alertButton(h, 'Check again').dispatch('click'); await flush();
-  assert.deepEqual(h.requests('panel_send').at(-1).message.params.arguments, args, 'The check replays the original ID and text.');
-  h.emit({ jsonrpc: '2.0', id: h.requests('panel_send').at(-1).message.id, error: { message: 'Desktop closed the call.' } }); await flush();
-  h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [record(args.message_id, args.message, { status: 'uncertain', manual: true })], has_more: false, next_cursor: null }); await flush();
-  assert.equal(h.node('send').disabled, true); assert.equal(h.uuidCount(), 1);
-  h.node('refresh').dispatch('click'); await flush(); h.result(h.requests('bridge_panel').at(-1), launcher()); await flush();
-  h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [record(args.message_id, args.message, { manual: true })], has_more: false, next_cursor: null }); await flush();
+  const row = record(args.message_id, args.message, { manual: true });
+  for (const [messages, extra] of [[[], {}], [[row], { incomplete: true }], [[{ ...row, status: undefined }], {}], [[{ ...row, status: 'uncertain' }], {}], [[{ ...row, status: 'failed' }], {}]]) {
+    await checkHistoryOnly(h, messages, extra);
+    if (extra.incomplete) assert.match(h.node('alert-text').textContent, /history could not be read in full/);
+    h.node('composer').dispatch('submit'); await flush();
+    assert.equal(h.requests('panel_send').length, 1); assert.equal(h.uuidCount(), 1);
+    assert.equal(h.node('send').disabled, true); assert.equal(h.node('message').value, 'Edited meanwhile');
+  }
+  await checkHistoryOnly(h, [row]);
   assert.equal(h.node('send').disabled, false); assert.equal(h.node('message').value, 'Edited meanwhile', 'Only the sent revision is cleared.');
-  assert.equal(h.requests('panel_send').length, 2); assert.equal(h.uuidCount(), 1);
+  assert.equal(h.requests('panel_send').length, 1); assert.equal(h.uuidCount(), 1);
 });
 
 test('A08: a same-ID history row with different text cannot settle an unknown send', async () => {
   const h = await live(); await h.choose('a'); type(h, 'Original body');
   h.node('composer').dispatch('submit'); await flush();
   const send = h.requests('panel_send').at(-1); const id = send.message.params.arguments.message_id;
-  h.emit({ jsonrpc: '2.0', id: send.message.id, error: { message: 'Transport ended.' } }); await flush();
+  h.reply(send, { delivery: delivery(id, 'Different body') }); await flush();
   h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [record(id, 'Different body')], has_more: false, next_cursor: null }); await flush();
   assert.equal(h.node('send').disabled, true, 'A mismatched history row does not release the unresolved send.');
   assert.equal(h.node('message').value, 'Original body');
-  assert.match(h.node('alert-text').textContent, /Check again reuses the same message ID/);
-  alertButton(h, 'Check again').dispatch('click'); await flush();
-  const replay = h.requests('panel_send').at(-1);
-  assert.deepEqual(replay.message.params.arguments, send.message.params.arguments);
-  h.reply(replay, { delivery: delivery(id, 'Different body') }); await flush();
-  assert.equal(h.node('message').value, 'Original body');
-  h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [record(id, 'Original body')], has_more: false, next_cursor: null }); await flush();
+  assert.match(h.node('alert-text').textContent, /No matching handoff in the history checked/);
+  await checkHistoryOnly(h, [record(id, 'Original body')]);
+  assert.equal(h.requests('panel_send').length, 1);
   assert.equal(h.node('message').value, ''); assert.deepEqual(bubbles(h).map(node => node.textContent), ['Original body']);
+});
+
+test('A08: retry:inspect offers only a read, makes no write claim, and cannot promote a failed history row to permission to resend', async () => {
+  const h = await live(); await h.choose('a'); type(h, 'Inspect this');
+  h.node('composer').dispatch('submit'); await flush();
+  const send = h.requests('panel_send').at(-1); const id = send.message.params.arguments.message_id;
+  h.reply(send, { delivery: delivery(id, 'Inspect this', { status: 'failed' }), outcome: { delivered: 'unknown', reason: 'prior_failed', retry: 'inspect' } }); await flush();
+  h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [], warnings: [], has_more: false, next_cursor: null }); await flush();
+  assert.match(h.node('alert-text').textContent, /handoff to Claude Code is not confirmed/);
+  assert.doesNotMatch(h.node('alert-text').textContent, /bridge wrote|arrived|Claude Code has the message/i);
+  assert.deepEqual(h.node('alert-actions').children.map(node => node.textContent), ['Check again']);
+  await checkHistoryOnly(h, [record(id, 'Inspect this', { status: 'failed' })]);
+  h.node('composer').dispatch('submit'); await flush();
+  assert.equal(h.node('send').disabled, true); assert.equal(h.node('message').value, 'Inspect this');
+  assert.equal(h.requests('panel_send').length, 1); assert.equal(h.uuidCount(), 1);
 });
 
 test('messages remain literal text and pagination prepends without moving the visible anchor', async () => {
@@ -542,7 +562,7 @@ test('C3 handoff and Q04: each owner-copy state has its own line, and only a saf
   ]);
   const lines = () => descendants(h.node('timeline')).filter(node => node.className.startsWith('notice-detail')).map(node => node.textContent);
   assert.deepEqual(lines(), [
-    'No copy in this Codex chat: the notice ledger shared with older bridge versions is full. Claude Code has the message; do not send it again.',
+    'No copy in this Codex chat: the notice ledger shared with older bridge versions is full. Do not resend the message to Claude Code.',
     'No copy in this Codex chat yet: the send stopped before posting it.',
     'Copy for this Codex chat not posted: Codex was busy.']);
   const buttons = descendants(h.node('timeline')).filter(node => node.tagName === 'button').map(node => node.textContent);
@@ -562,7 +582,7 @@ test('C3 handoff and E01: a send result names the Claude handoff and the skipped
   h.reply(send, { delivery: delivery(send.message.params.arguments.message_id, 'At capacity', { manual: true }), manual: true, notice_status: 'failed', notice_retryable: false,
     notice_omitted: true, outcome: { delivered: true, retry: 'no', reason: 'submitted' }, notice_outcome: { delivered: false, retry: 'no', reason: 'state_unavailable' } }); await flush();
   assert.equal(h.node('message').value, ''); assert.equal(h.node('conversation-alert').hidden, true);
-  assert.ok(texts(h, 'notice-detail warning').includes('No copy in this Codex chat: the notice ledger shared with older bridge versions is full. Claude Code has the message; do not send it again.'));
+  assert.ok(texts(h, 'notice-detail warning').includes('No copy in this Codex chat: the notice ledger shared with older bridge versions is full. Do not resend the message to Claude Code.'));
   type(h, 'Unrecorded'); h.node('composer').dispatch('submit'); await flush();
   send = h.requests('panel_send').at(-1);
   h.reply(send, { delivery: delivery(send.message.params.arguments.message_id, 'Unrecorded', { manual: true }), manual: true, notice_status: 'submitted',
