@@ -50,6 +50,20 @@ async function localCandidates(t, setup, threadId = targetId) {
     assertUntouched() { assert.deepEqual(daemon.requests(), []); assert.deepEqual(queue.queueCalls(), []); assert.deepEqual(app.messages, []); } };
 }
 
+test('compact SSH send and exact lookup preserve both hosts sharing a thread and message ID', mac, async t => {
+  const setup = await actor(t), id = 'one-key', target = 'target-thread', body = 'approved fixture';
+  for (const alias of ['fixture-a','fixture-b']) {
+    const fixture = sshFixture(), env = { ...setup.context.env, CLAUDE_CODEX_BRIDGE_SSH_HOST: alias };
+    const value = await executeBridgeTool('send_to_codex', { thread_id: target, message: body, message_id: id, include_message: false }, { ...setup.context, env, sshSpawn: fixture.spawnImpl });
+    assert.equal(Object.hasOwn(value.delivery, 'message'), false); assert.equal(value.delivery.to.host_id, `ssh:${alias}`);
+    assert.equal(value.outcome.reason, 'submitted');
+    const turns = fixture.requests.filter(r => r.method === 'turn/start'); assert.equal(turns.length, 1);
+    assert.match(turns[0].params.input[0].text, /Return route to the sender’s host not verified/);
+  }
+  const found = await executeBridgeTool('list_deliveries', { message_id: id }, setup.context);
+  assert.deepEqual(found.deliveries.map(row => [row.to.host_id, row.message]), [['ssh:fixture-b', body], ['ssh:fixture-a', body]]);
+});
+
 test('macOS MCP send uses SSH without an app-tools registry and records verified provenance', mac, async t => {
   const setup = await actor(t), fixture = sshFixture();
   const args = { thread_id: 'target-thread', message: 'Reply exactly ADAPTER_TEST_ACK', message_id: 'mac-ssh-once' };
@@ -145,6 +159,8 @@ test('macOS without an SSH alias refuses discovery, a default send and diagnosis
   await assert.rejects(executeBridgeTool('send_to_codex', { thread_id: targetId, message: 'hello', message_id: 'no-alias-auto' }, context), unset);
   const report = await executeBridgeTool('bridge_doctor', {}, context);
   assert.deepEqual(report.issues.find(item => item.check === 'codex_registry'), { check: 'codex_registry', status: 'fail', reason: 'setup_incomplete' });
+  assert.deepEqual(report.diagnosis, { reason: 'setup_incomplete',
+    next_action: 'Set CLAUDE_CODEX_BRIDGE_SSH_HOST to a valid SSH configuration alias.' });
   assert.equal(report.checks.some(check => ['codex_daemon', 'codex_tools', 'codex_context'].includes(check.name)), false);
   assert.deepEqual(fixture.launches, []);
   assert.deepEqual((await executeBridgeTool('list_deliveries', {}, context)).deliveries, []);
@@ -234,7 +250,25 @@ test('macOS doctor does not advertise send readiness when only active chats are 
   const result = await executeBridgeTool('bridge_doctor', {}, { ...setup.context, sshSpawn: fixture.spawnImpl });
   assert.ok(result.checks.some(c => c.name === 'codex_context' && c.status === 'warning'));
   assert.equal(result.ready, false);
+  assert.equal(Object.hasOwn(result, 'diagnosis'), false);
   assert.ok(!fixture.requests.some(r => r.method === 'turn/start'));
+});
+
+test('doctor retains the operator action for a refused SSH host key, not a catalog failure', mac, async t => {
+  const setup = await actor(t), fixture = sshFixture({ handshake: 'refused-key' });
+  const report = await executeBridgeTool('bridge_doctor', {}, { ...setup.context, sshSpawn: fixture.spawnImpl });
+  assert.deepEqual(report.diagnosis, { reason: 'route_unavailable', next_action: 'Verify the configured host key with its operator.' });
+  assert.deepEqual(fixture.requests, []);
+});
+
+test('macOS doctor reports incompatible SSH discovery without inferring a send blocker', mac, async t => {
+  const setup = await actor(t), fixture = sshFixture({ loaded: null });
+  const result = await executeBridgeTool('bridge_doctor', {}, { ...setup.context, sshSpawn: fixture.spawnImpl });
+  assert.equal(result.ready, false);
+  assert.deepEqual(result.issues.find(issue => issue.check === 'codex_tools'),
+    { check: 'codex_tools', status: 'fail', reason: 'protocol_incompatible' });
+  assert.equal(Object.hasOwn(result, 'diagnosis'), false);
+  assert.ok(!fixture.requests.some(r => r.method === 'turn/start' || r.method === 'thread/resume'));
 });
 
 test('SSH doctor finds an idle conversation after the first busy conversation and never probes local transports', mac, async t => {

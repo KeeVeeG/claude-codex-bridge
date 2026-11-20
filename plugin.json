@@ -30,7 +30,7 @@
         "logoDark": "./assets/bridge-dark.svg",
         "defaultPrompt": [
           "Find the Claude Code session I name and send it my message.",
-          "Find the Codex thread I name and send it my message.",
+          "Reply to the Claude Code session that sent me this bridge message.",
           "Open the conversation panel to search Claude sessions, read exchanged messages, and send manually.",
           "Check the bridge status and recent outgoing deliveries."
         ]

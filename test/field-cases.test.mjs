@@ -180,9 +180,9 @@ test('an unreadable Claude registration makes discovery report incompleteness in
 
 test('doctor names why a registered Claude inbox is unusable instead of advising a reopen (E08)', native, async t => {
   const cases = [
-    [{ key: false }, /^The chosen Claude session has published no inbox key\. Check its Peer address in \/status\.$/],
-    [{ key: {} }, /^The inbox key of the chosen Claude session has an unsupported format\. Update the bridge/],
-    [{}, /^The selected Claude inbox did not accept a connection\. Check its Peer address in \/status\.$/],
+    [{ key: false }, /^The registered Claude session has published no inbox key\.$/],
+    [{ key: {} }, /^The inbox key of the registered Claude session has an unsupported format\.$/],
+    [{}, /^The registered Claude inbox did not accept a connection\.$/],
   ];
   for (const [options, expected] of cases) {
     const setup = await world(t);

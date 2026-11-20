@@ -288,7 +288,7 @@ async function selectDesktopHost(hosts, config, signal, { limit = 1, reuse = fal
 
 /** The most actionable observed cause with its one repair, then the other observations as plain
  * facts, so a stale record never hides a stalled app and no reader gets two competing steps (V08). */
-function desktopFailure(report) {
+function desktopFailure(report, { factsOnly = false } = {}) {
   const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
   // Only an unsuccessful listing for a context says the context was refused; any other failure is the app's (E06).
   const rejected = (report.errors ?? []).filter(reason => reason === 'route_unavailable').length;
@@ -297,7 +297,7 @@ function desktopFailure(report) {
     [report.stalled, 'Codex Desktop is running but did not answer in time. Retry the same call.',
       `${plural(report.stalled, 'saved endpoint')} did not answer in time`],
     [report.unchecked, `${plural(report.unchecked, 'saved endpoint record')} could not be checked within ${report.budgetMs / 1000} s. Retry the same call.`,
-      `${plural(report.unchecked, 'saved endpoint record')} could not be checked in time`],
+      `${plural(report.unchecked, 'saved endpoint record')} could not be checked ${factsOnly ? `within ${report.budgetMs / 1000} s` : 'in time'}`],
     [report.incompatible, 'Codex Desktop does not offer local discovery and message tools this bridge can use. Check that its app tools are enabled.',
       `${plural(report.incompatible, 'endpoint')} lacked compatible local tools`],
     [failedRequests, 'Codex Desktop failed the discovery request. Restart Codex Desktop, then retry the same call.',
@@ -307,6 +307,8 @@ function desktopFailure(report) {
     [report.gone, `${plural(report.gone, 'saved Codex Desktop endpoint')} belong${report.gone === 1 ? 's' : ''} to earlier launches. Open a Codex Desktop task with the bridge enabled; its bridge server registers the current endpoint when it starts.`,
       `${plural(report.gone, 'saved endpoint')} belong${report.gone === 1 ? 's' : ''} to earlier Codex Desktop launches`],
   ].filter(([count]) => count);
+  if (factsOnly) return causes.length ? `Codex Desktop: ${causes.map(cause => cause[2]).join('; ')}.`
+    : 'No saved Codex Desktop endpoint has a usable task context.';
   if (!causes.length) return 'No saved Codex Desktop endpoint has a usable task context. Open a Codex Desktop task with the bridge enabled.';
   const others = causes.slice(1).map(cause => cause[2]);
   return `${causes[0][1]}${others.length ? ` Also observed: ${others.join('; ')}.` : ''}`;
@@ -367,6 +369,12 @@ function inspectStateDirectory(stateDir) {
 const issuesOf = checks => checks.filter(check => check.status !== 'pass')
   .map(({ name, status, reason }) => ({ check: name, status, reason: reason ?? 'internal_error' }));
 
+// Native diagnostic prose leads with an observation, followed by any repair instructions.
+function doctorFact(detail) {
+  const end = detail?.indexOf('. ');
+  return end >= 0 ? detail.slice(0, end + 1) : detail;
+}
+
 /** Why no Desktop endpoint worked: an app that did not answer in time is unverified, not gone (F07). */
 function desktopReason(report) {
   if (report.stalled || report.unchecked) return 'route_unverified';
@@ -378,16 +386,19 @@ function desktopReason(report) {
 const DOCTOR_BUDGETS = { callerMs: 20_000, claudeInboxMs: 4500 };
 const DOCTOR_DAEMON_BUDGET_MS = 6000;
 
-async function doctorCodexChecks(context, config, who, signal) {
+async function doctorCodexChecks(config, who, signal) {
   const checks = [];
   const add = (name, status, detail, reason) => checks.push({ name, status, detail, ...(status === 'pass' ? {} : { reason }) });
   const found = { acceptedContext: false, daemonReachable: false, terminalSessions: 0 };
+  const outbound = who?.kind === 'claude';
+  let diagnosis;
   if (config.platform === 'darwin') {
     let ssh;
-    try { ssh = sshHost(config); } catch (error) {
+    try { ssh = sshHost(config); } catch {
       // macOS reaches Codex only through the configured alias; no local transport is a fallback (S01).
-      add('codex_registry', 'fail', error.message, error.reason ?? 'setup_incomplete');
-      return { checks, ...found };
+      add('codex_registry', 'fail', 'No valid Codex SSH alias is configured on macOS.', 'setup_incomplete');
+      if (outbound) diagnosis = { reason: 'setup_incomplete', next_action: 'Set CLAUDE_CODEX_BRIDGE_SSH_HOST to a valid SSH configuration alias.' };
+      return { checks, ...found, diagnosis };
     }
     add('codex_registry', 'pass', 'The configured SSH route does not use the local Desktop registry or daemon.');
     try {
@@ -396,14 +407,17 @@ async function doctorCodexChecks(context, config, who, signal) {
       found.acceptedContext = chats.some(chat => chat.status === 'idle');
       add('codex_context', found.acceptedContext ? 'pass' : 'warning', found.acceptedContext
         ? 'The configured SSH host has a loaded idle chat.'
-        : 'No idle chat was found in the bounded loaded-chat catalog. Open the intended idle chat on the configured SSH host.', 'target_unavailable');
+        : 'No idle chat was found in the bounded loaded-chat catalog.', 'target_unavailable');
     } catch (error) {
       throwIfStopped(signal);
       const slow = error.reason === 'route_unverified';
-      add('codex_tools', slow ? 'warning' : 'fail', String(error.message).slice(0, 300), error.reason ?? (slow ? 'route_unverified' : 'route_unavailable'));
-      add('codex_context', slow ? 'warning' : 'fail', 'SSH discovery did not complete. No local Codex transport was attempted.', error.reason ?? (slow ? 'route_unverified' : 'route_unavailable'));
+      const reason = error.reason ?? 'route_unavailable';
+      add('codex_tools', slow ? 'warning' : 'fail', doctorFact(String(error.message)).slice(0, 300), reason);
+      // Only a verified connection blocker applies to direct sends too. Catalog results prove no more.
+      if (outbound && error.nextAction) diagnosis = { reason, next_action: error.nextAction };
+      add('codex_context', slow ? 'warning' : 'fail', 'SSH discovery did not complete. No local Codex transport was attempted.', reason);
     }
-    return { checks, ...found };
+    return { checks, ...found, diagnosis };
   }
   let hosts = [];
   try {
@@ -415,15 +429,16 @@ async function doctorCodexChecks(context, config, who, signal) {
     // Present, missing and unverified are separate observations: a name the directory lookup cannot
     // check is not evidence of a live endpoint, and a missing one does not prove an earlier launch (E05).
     add('codex_registry', existing ? 'pass' : 'warning', !hosts.length
-      ? 'No Codex Desktop registration is in this bridge’s state directory. Open a Codex Desktop task with the bridge enabled.'
-      : `Saved Codex Desktop registrations: ${existing} present, ${missing} missing, ${hosts.length - existing - missing} unverified by directory lookup.${existing ? ''
-        : ' Open a Codex Desktop task with the bridge enabled; its bridge server registers the current endpoint when it starts.'}`,
+      ? 'No Codex Desktop registration is in this bridge’s state directory.'
+      : `Saved Codex Desktop registrations: ${existing} present, ${missing} missing, ${hosts.length - existing - missing} unverified by directory lookup.`,
       existing === 0 && states.includes(undefined) ? 'route_unverified' : 'route_unavailable');
-  } catch {
-    add('codex_registry', 'fail', 'Saved Codex endpoint records are malformed or unreadable. Check the shared state configuration.', 'state_unavailable');
+  } catch (error) {
+    throwIfStopped(signal);
+    if (error.code === 'HOST_CHANGED') add('codex_registry', 'warning', 'Saved Codex endpoint records changed during the check.', 'route_unverified');
+    else add('codex_registry', 'fail', 'Saved Codex endpoint records are malformed or unreadable.', 'state_unavailable');
   }
   const current = who?.kind === 'codex' && who.transport === 'desktop' ? { pipePath: who.pipePath, threadId: who.threadId }
-    : config.env.CODEX_APP_TOOLS_PIPE_PATH ? { pipePath: config.env.CODEX_APP_TOOLS_PIPE_PATH,
+    : !who && config.env.CODEX_APP_TOOLS_PIPE_PATH ? { pipePath: config.env.CODEX_APP_TOOLS_PIPE_PATH,
       threadId: config.env.CODEX_THREAD_ID } : null;
   // The daemon listing, the version read and the Desktop probe are independent; run them together
   // and report them in the usual order (O03).
@@ -442,26 +457,46 @@ async function doctorCodexChecks(context, config, who, signal) {
     found.daemonReachable = true;
     add('codex_daemon', 'pass', found.terminalSessions
       ? 'The Codex daemon is reachable and lists stored Codex sessions. Their current client is not implied by discovery.'
-      : 'The Codex daemon is reachable, but no eligible loaded session was found in its bounded catalog. Open the intended Codex conversation.');
+      : 'The Codex daemon is reachable, but no eligible loaded session was found in its bounded catalog.');
   } else {
-    add('codex_daemon', 'warning', `Terminal Codex sessions are unavailable: ${daemon.error.message}`,
-      daemon.error.inconclusive ? 'route_unverified' : 'route_unavailable');
+    const { error } = daemon;
+    const unverified = error.inconclusive || error.code === 'DAEMON_TIMEOUT';
+    const detail = unverified ? 'The Codex daemon did not answer in time.'
+      : error.message === NOT_RUNNING_MESSAGE ? 'No Codex daemon is running.'
+      : /native Codex \.exe/.test(error.message) ? 'The configured executable is not a native Codex .exe.'
+      : /executable was not found/i.test(error.message) ? 'The Codex executable was not found.'
+      : /^Codex terminal support is disabled/.test(error.message) ? 'Codex terminal support is disabled.'
+      : 'Codex daemon discovery is unavailable.';
+    add('codex_daemon', 'warning', detail, unverified ? 'route_unverified' : 'route_unavailable');
   }
   if (versions) {
     const differ = versions.cli && versions.server && versions.cli !== versions.server;
     add('codex_versions', differ ? 'warning' : 'pass',
-      `Codex CLI ${versions.cli ?? 'unknown'}, daemon ${versions.server ?? 'unknown'}.${differ ? ' They differ; update or restart so both run the same version.' : ''}`,
+      `Codex CLI ${versions.cli ?? 'unknown'}, daemon ${versions.server ?? 'unknown'}.`,
       'version_mismatch');
   }
   const { host, report } = desktop;
   found.acceptedContext = Boolean(host);
   const codexStatus = passed => passed ? 'pass' : report.stalled || report.unchecked || found.daemonReachable ? 'warning' : 'fail';
+  const desktopIssue = desktopReason(report);
+  const desktopFacts = desktopFailure(report, { factsOnly: true });
   add('codex_tools', codexStatus(report.compatible > 0), report.compatible
-    ? 'Codex exposes compatible discovery and message tool schemas.' : desktopFailure(report), desktopReason(report));
+    ? 'Codex exposes compatible discovery and message tool schemas.' : desktopFacts, desktopIssue);
   add('codex_context', codexStatus(found.acceptedContext), found.acceptedContext
-    ? 'Codex accepted a registered context for read-only chat discovery.'
-    : desktopFailure(report), desktopReason(report));
-  return { checks, ...found };
+    ? 'Codex accepted a registered context for read-only chat discovery.' : desktopFacts, desktopIssue);
+  // An offline daemon still allows the explicit CLI queue. Only a shared executable/setting
+  // failure rules out both CLI routes; an empty/slow catalog cannot do so.
+  if (outbound && !host && daemon.error?.terminalUnavailable && desktopIssue !== 'route_unverified') {
+    const registry = checks.find(check => check.name === 'codex_registry');
+    if (registry.status === 'fail') {
+      diagnosis = { reason: registry.reason, next_action: 'Check the shared state directory and its saved Codex Desktop endpoint records.' };
+    } else if (registry.reason !== 'route_unverified' && desktopIssue === 'protocol_incompatible' && !report.errors.length) {
+      diagnosis = { reason: desktopIssue, next_action: 'Check that Codex Desktop exposes the bridge’s supported app tools.' };
+    } else if (registry.reason !== 'route_unverified' && desktopIssue === 'route_unavailable') {
+      diagnosis = { reason: desktopIssue, next_action: 'Run bridge_doctor from an open Codex Desktop task with the bridge enabled to register its endpoint.' };
+    }
+  }
+  return { checks, ...found, diagnosis };
 }
 
 async function doctorClaudeChecks(context, config, who, callerProbeError, signal) {
@@ -472,19 +507,34 @@ async function doctorClaudeChecks(context, config, who, callerProbeError, signal
     firstOnly: true, budgetMs: DOCTOR_BUDGETS.claudeInboxMs });
   const registryIssue = result.issues.find(item => item.reason === 'state_unavailable');
   add('claude_registry', registryIssue ? (result.candidates ? 'warning' : 'fail') : result.candidates ? 'pass' : 'fail',
-    registryIssue ? 'Some Claude registrations could not be read. Check access to the session registry.'
+    registryIssue ? 'Claude registrations could not all be read.'
     : result.candidates ? 'Claude registrations were found; inbox connectivity is checked separately.'
-    : result.details.target_unavailable ?? 'No eligible Claude session is registered. Check the intended session’s Peer address in /status.',
-    registryIssue?.reason ?? 'target_unavailable');
+    : 'No eligible Claude session is registered.', registryIssue?.reason ?? 'target_unavailable');
   const inboxAvailable = result.sessions.length > 0;
   // A slow or busy inbox proves nothing about the window: the check is inconclusive, not failed.
   const slow = ['target_unverified', 'target_busy'].find(reason => result.details[reason]);
   const failed = result.issues.find(item => item.reason !== 'state_unavailable')?.reason;
   const reason = callerProbeError || slow ? 'target_unverified' : failed ?? 'target_unavailable';
+  // An inconclusive detail is already a plain fact ("…in time. Its availability is inconclusive."),
+  // so it stays whole; a definite failure keeps only its observation, the repair goes to diagnosis.
+  const observation = (slow ? result.details[slow] : doctorFact(result.details[failed]))?.replace(/\b(?:chosen|selected) Claude\b/g, 'registered Claude');
   add('claude_inbox', inboxAvailable ? 'pass' : reason === 'target_unverified' ? 'warning' : 'fail',
     inboxAvailable ? 'A verified Claude inbox accepts local connections. No message was sent; inbound policy was not tested.'
-    : callerProbeError?.message ?? result.details[slow ?? failed] ?? 'No eligible Claude inbox was found. Check the intended session’s Peer address in /status.', reason);
-  return { checks, inboxAvailable };
+    : observation ?? (reason === 'target_unverified' ? 'Claude inbox availability could not be verified.'
+    : 'No eligible Claude inbox was verified.'), reason);
+  let diagnosis;
+  if (who?.kind === 'codex' && !inboxAvailable && !slow) {
+    if (registryIssue && !result.candidates) {
+      diagnosis = { reason: registryIssue.reason, next_action: 'Check read access to the Claude session registry configured for the bridge.' };
+    } else if (!registryIssue && result.issues.every(issue => issue.reason === 'target_unavailable')) {
+      // For a registered inbox, use the action its verifier actually observed. Distinct
+      // candidates can have unrelated causes; without a target, do not choose among them.
+      const next_action = !result.candidates ? 'Check the Peer address in /status from a Claude Code conversation you want to reach.'
+        : result.candidates === 1 ? result.details[reason]?.slice(doctorFact(result.details[reason]).length).trim() : undefined;
+      if (next_action) diagnosis = { reason, next_action };
+    }
+  }
+  return { checks, inboxAvailable, diagnosis };
 }
 
 /** Diagnose local configuration and transports, registering only verified Desktop
@@ -495,7 +545,8 @@ async function bridgeDoctor(context, config) {
   throwIfStopped(signal);
   const checks = [];
   const add = (name, status, detail, reason) => checks.push({ name, status, detail, ...(status === 'pass' ? {} : { reason }) });
-  add('platform', ['win32', 'darwin'].includes(config.platform) ? 'pass' : 'fail',
+  const supportedPlatform = ['win32', 'darwin'].includes(config.platform);
+  add('platform', supportedPlatform ? 'pass' : 'fail',
     config.platform === 'win32' ? 'Claude Code and Codex transports are supported on Windows.'
       : config.platform === 'darwin' ? 'macOS uses Claude Unix inboxes and an operator-configured Codex SSH host.'
       : 'Claude process identity verification is supported on Windows and macOS.', 'setup_incomplete');
@@ -515,6 +566,7 @@ async function bridgeDoctor(context, config) {
     : config.env.CODEX_APP_TOOLS_PIPE_PATH ? 'codex' : 'unknown';
   let who;
   let callerProbeError;
+  let callerDiagnosis;
   const callerBudget = startCall({ cancelSignal: signal, deadlineMs: Math.min(DOCTOR_BUDGETS.callerMs, remainingMs(signal)) });
   try {
     who = await identifyCaller({ ...context, signal: callerBudget.signal }, config);
@@ -527,6 +579,7 @@ async function bridgeDoctor(context, config) {
       callerProbeError = error.reason === 'caller_unverified' ? error
         : failure('Could not verify this Claude Code conversation within the diagnostic time budget. Retry the same call.', 'caller_unverified');
       add('caller', 'warning', callerProbeError.message, 'caller_unverified');
+      callerDiagnosis = { reason: 'caller_unverified', next_action: 'Run bridge_doctor again from the same conversation when it responds.' };
     } else {
       if (error.application) application = error.application;
       const specific = ['caller_invalid', 'caller_changed', 'identity_check_unavailable'].includes(error.reason);
@@ -536,11 +589,22 @@ async function bridgeDoctor(context, config) {
         ? 'This call has no valid Codex task context. Run the tool from an open Codex task with the bridge enabled.'
         : 'The direct Claude parent session could not be verified. Open the bridge in the intended Claude Code session.',
       REASONS[error.reason] ? error.reason : 'caller_invalid');
+      const next_action = {
+        caller_invalid: 'Run bridge_doctor from the intended open conversation with the bridge enabled.',
+        caller_changed: 'Run bridge_doctor from the conversation you intended to use.',
+        identity_check_unavailable: 'Check that the bridge can read the Claude Code process identity on this system.',
+        state_unavailable: 'Check read access to the Claude session registry configured for the bridge.',
+      }[error.reason];
+      if (typeof next_action === 'string') callerDiagnosis = { reason: error.reason, next_action };
     }
   } finally {
     callerBudget.dispose();
   }
   throwIfStopped(signal);
+  let stateDiagnosis = state.status === 'fail'
+    ? { reason: 'state_unavailable', next_action: 'Check the configured state directory’s location, write access and hard-link support.' }
+    : undefined;
+  const desktopCaller = who?.kind === 'codex' && who.transport === 'desktop';
   if (state.status === 'pass') {
     const locations = [['host_lock', config.stateDir], ['order_lock', path.join(config.stateDir, 'order')]];
     if (who) {
@@ -550,21 +614,42 @@ async function bridgeDoctor(context, config) {
     }
     for (const [name, directory] of locations) {
       const issue = inspectStateLocks(directory);
-      if (issue) add(name, issue.status, issue.detail, 'state_unavailable');
+      if (!issue) continue;
+      const outbound = name === 'host_lock' ? desktopCaller : who && name !== 'manual_lock';
+      add(name, issue.status, outbound ? issue.detail : doctorFact(issue.detail), 'state_unavailable');
+      if (outbound && issue.status === 'fail') stateDiagnosis ??= {
+        reason: 'state_unavailable', next_action: 'Consult the README’s shared-state lock recovery guidance before sending.',
+      };
     }
   }
-  if (state.status !== 'fail' && who?.kind === 'codex' && who.transport === 'desktop') {
+  let registrationError;
+  if (state.status !== 'fail' && desktopCaller) {
     try { await publishCodexHost({ signal: context.signal, stateDir: config.stateDir, pipePath: who.pipePath, threadId: who.threadId }); }
-    catch { add('codex_registration', 'fail', 'The verified Codex Desktop task could not be registered. Check the shared state directory and saved endpoint records.', 'state_unavailable'); }
+    catch (error) {
+      throwIfStopped(signal);
+      registrationError = error;
+      const busy = error.reason === 'state_busy' || error.code === 'HOST_CHANGED';
+      add('codex_registration', busy ? 'warning' : 'fail', 'The verified Codex Desktop task could not be registered.', busy ? 'state_busy' : 'state_unavailable');
+    }
   }
-  const [permissions, codex, claude] = await Promise.all([privacy, doctorCodexChecks(context, config, who, signal),
+  const [permissions, codex, claude] = await Promise.all([privacy, doctorCodexChecks(config, who, signal),
     doctorClaudeChecks(context, config, who, callerProbeError, signal)]);
+  if (registrationError && (registrationError.reason === 'state_unavailable' ||
+      ['EACCES', 'EROFS', 'ENOSPC', 'EDQUOT'].includes(registrationError.code) ||
+      codex.checks.some(check => check.name === 'codex_registry' && check.reason === 'state_unavailable'))) {
+    stateDiagnosis ??= { reason: 'state_unavailable', next_action: 'Check the shared state directory and its saved Codex Desktop endpoint records.' };
+  }
   if (permissions) checks.splice(privacyAt, 0, { name: 'state_permissions', status: 'warning', detail: permissions, reason: 'setup_incomplete' });
   checks.push(...codex.checks, ...claude.checks);
-  const ready = Boolean(who) && (codex.acceptedContext || (codex.daemonReachable && codex.terminalSessions > 0)) &&
+  const outbound = who?.kind === 'claude' ? codex : who?.kind === 'codex' ? claude : undefined;
+  const diagnosis = stateDiagnosis ?? callerDiagnosis ?? outbound?.diagnosis;
+  // Keep the 1.0 overall readiness contract. A caller-specific diagnosis is additive,
+  // not a new meaning for ready, and a false result need not block a one-way send.
+  const ready = Boolean(who) && !registrationError && (codex.acceptedContext || (codex.daemonReachable && codex.terminalSessions > 0)) &&
     claude.inboxAvailable && checks.every(check => check.status !== 'fail');
   const client = who?.kind === 'claude' ? who.endpoint.entrypoint : who?.kind === 'codex' ? `codex-${who.transport}` : 'unknown';
-  return { application, ready, checks: checks.map(({ reason, ...check }) => check), issues: issuesOf(checks), ...(context.pluginUpdate ? { client } : {}) };
+  return { application, ready, checks: checks.map(({ reason, ...check }) => check), issues: issuesOf(checks),
+    ...(diagnosis ? { diagnosis } : {}), ...(context.pluginUpdate ? { client } : {}) };
 }
 
 /** Errors a transport adapter raised without naming a reason, classified by their typed fields. */
@@ -661,10 +746,12 @@ async function deliver(name, args, context, config, who, held) {
     ? await desktopRoute(who, config, signal, { reuse: true }) : null;
   const host = ssh || desktop?.host || null;
   const messageId = args.message_id ?? crypto.randomUUID();
-  const peerText = terminalTarget || ssh ? codexPeerContent({ fromKind: 'claude', fromId: route.from.id, bridgeMessageId: messageId, body: args.message }) : undefined;
+  const peerText = terminalTarget || ssh ? codexPeerContent({ fromKind: 'claude', fromId: route.from.id, bridgeMessageId: messageId, body: args.message, remote: Boolean(ssh) }) : undefined;
   // Refuse before recordMessage reserves the ID, so a message that can never be sent does not spend it as failed.
-  const queueRefused = terminalTarget?.queueRoute ? queueTargetRefusal(targetThreadId) || queueRefusal(peerText) : null;
-  if (queueRefused) throw failure(queueRefused, 'invalid_argument');
+  const targetRefused = terminalTarget?.queueRoute && queueTargetRefusal(targetThreadId);
+  if (targetRefused) throw failure(targetRefused, 'invalid_argument');
+  const queueRefused = terminalTarget?.queueRoute ? queueRefusal(peerText) : null;
+  if (queueRefused) throw queueRefused;
   throwIfStopped(signal);
   checkSettlementCapacity();
   const session = lookup.session ?? await senderLedger(who, config, signal);
@@ -679,7 +766,11 @@ async function deliver(name, args, context, config, who, held) {
     if (direction === 'to_claude') {
       const source = context.manual === true ? 'User sent from Codex Desktop task'
         : who.transport === 'terminal' ? 'From Codex terminal session' : 'From Codex Desktop task';
-      const notice = collaboratorNotice(`[${source} ${quoted(route.from.id)}; bridge message ${quoted(messageId)}]`, args.message,
+      // A terminal/queue return path on Windows is explicit. Neither a carrier nor a matching ID
+      // identifies the caller's host across SSH; do not invent a local or remote return address.
+      const hint = context.manual === true ? '' : config.platform === 'darwin' ? '; reply host unverified'
+        : who.transport === 'terminal' && config.platform === 'win32' ? '; reply transport="terminal"' : '';
+      const notice = collaboratorNotice(`[${source} ${quoted(route.from.id)}; bridge message ${quoted(messageId)}${hint}]`, args.message,
         context.manual === true ? 'human' : 'peer');
       receipt = await sendToClaude({ ...endpoint, message: notice, senderName: senderLabel(route.from.id), signal, probe: context.processProbe });
     } else if (terminalTarget) {
@@ -829,7 +920,8 @@ async function runBridgeTool(name, args, context) {
     // A split or inaccessible root must not be passed to a registry check or host publication.
     if (name !== 'bridge_doctor' || error.reason !== 'state_unavailable') throw error;
     const checks = [{ name: 'state_directory', status: 'fail', detail: error.message }];
-    return { application: 'unknown', ready: false, checks, issues: issuesOf([{ ...checks[0], reason: error.reason }]) };
+    return { application: 'unknown', ready: false, checks, issues: issuesOf([{ ...checks[0], reason: error.reason }]),
+      diagnosis: { reason: error.reason, next_action: 'Check that both apps select the same usable shared state directory.' } };
   }
   if (name === 'bridge_doctor') return bridgeDoctor(context, config);
   if (name === 'list_claude_sessions') {
@@ -861,10 +953,15 @@ async function runBridgeTool(name, args, context) {
   if (name === 'list_deliveries') {
     let deliveries = [], issues = [];
     try {
-      ({ rows: deliveries, issues } = await listMessages(ledgerAt({ stateDir: config.stateDir, threadId: senderLedgerId(who) }), args.limit || 20, sender(who), context.signal));
+      ({ rows: deliveries, issues } = await listMessages(ledgerAt({ stateDir: config.stateDir, threadId: senderLedgerId(who) }),
+        { limit: args.limit ?? 20, messageId: args.message_id }, sender(who), context.signal));
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
     return { application: who.kind, sender_id: sender(who).id, deliveries: deliveries.map(publicDelivery), ...(issues.length ? { issues } : {}) };
   }
   if (name !== 'send_to_claude' && name !== 'send_to_codex') throw failure('Unknown bridge tool', 'invalid_argument');
-  return sendMessage(name, args, context, config, who);
+  const sent = await sendMessage(name, args, context, config, who);
+  if (context.manual) return sent;
+  // The public projection is fresh: change no reserved row, transport body, or panel receipt.
+  if (args.include_message === false) delete sent.delivery.message;
+  return { ...sent, summary: 'Handed off; recipient outcome unknown.' };
 }

@@ -48,6 +48,8 @@ test('doctor reports missing configuration without registering a host or creatin
   assert.equal(result.application, 'unknown');
   assert.equal(result.ready, false);
   assert.equal(result.checks.find(check => check.name === 'caller').status, 'fail');
+  assert.deepEqual(result.diagnosis, { reason: 'caller_invalid',
+    next_action: 'Run bridge_doctor from the intended open conversation with the bridge enabled.' });
   assert.equal(result.checks.find(check => check.name === 'state_directory').status, 'warning');
   assert.equal(fs.existsSync(fixture.stateDir), false);
   assert.doesNotMatch(JSON.stringify(result), /state_directory"\s*:\s*"|pipePath|socketPath|peerToken|procStart|pidDomain/);
@@ -69,6 +71,7 @@ for (const entrypoint of ['claude-desktop', 'cli', 'sdk-cli']) test(`doctor vali
   const result = await executeBridgeTool('bridge_doctor', {}, context);
   assert.equal(result.application, 'codex');
   assert.equal(result.ready, true);
+  assert.equal(Object.hasOwn(result, 'diagnosis'), false);
   assert.equal(result.checks.find(check => check.name === 'claude_inbox').status, 'pass');
   assert.equal(getCodexHosts({ stateDir: fixture.stateDir })[0].threadId, 'doctor-context');
   assert.equal(fs.readdirSync(fixture.stateDir).some(name => /^[a-f0-9]{64}$/.test(name)), false, 'doctor creates no message ledger');
@@ -94,6 +97,8 @@ test('doctor distinguishes malformed registries and unsupported native schemas s
     assert.equal(result.checks.find(check => check.name === name).status, 'fail', name);
   }
   assert.equal(result.ready, false);
+  assert.deepEqual(result.diagnosis, { reason: 'state_unavailable',
+    next_action: 'Check the shared state directory and its saved Codex Desktop endpoint records.' });
   assert.doesNotMatch(JSON.stringify(result), /private malformed registry|private registry data/);
   assert.equal(fs.readFileSync(path.join(fixture.stateDir, 'codex-host.json'), 'utf8'), '{private malformed registry');
 });
@@ -145,18 +150,34 @@ test('doctor warns a busy Claude caller to retry but fails a verified mismatch',
   assert.equal(result.application, 'claude');
   assert.equal(result.ready, false);
   assert.equal(calls, 3, 'doctor does not repeat the busy caller probe as an inbox check');
-  for (const name of ['caller', 'claude_inbox']) {
-    const check = result.checks.find(check => check.name === name);
-    assert.equal(check.status, 'warning');
-    assert.match(check.detail, /Could not verify this Claude Code conversation in time\. Retry the same call\./);
-    assert.doesNotMatch(check.detail, /restart|reopen|fixture/i);
-  }
+  const caller = result.checks.find(check => check.name === 'caller');
+  assert.equal(caller.status, 'warning');
+  assert.match(caller.detail, /Could not verify this Claude Code conversation in time\. Retry the same call\./);
+  assert.deepEqual(result.checks.find(check => check.name === 'claude_inbox'), {
+    name: 'claude_inbox', status: 'warning', detail: 'Claude inbox availability could not be verified.',
+  });
+  assert.deepEqual(result.diagnosis, { reason: 'caller_unverified',
+    next_action: 'Run bridge_doctor again from the same conversation when it responds.' });
   assert.deepEqual(result.issues.find(issue => issue.check === 'caller'), { check: 'caller', status: 'warning', reason: 'caller_unverified' });
   busy = false;
   const mismatch = await executeBridgeTool('bridge_doctor', {}, context);
   assert.equal(mismatch.checks.find(check => check.name === 'caller').status, 'fail');
   assert.equal(mismatch.issues.find(issue => issue.check === 'caller').reason, 'caller_invalid');
+  assert.equal(mismatch.diagnosis.reason, 'caller_invalid');
   assert.equal(fixture.inbox.messages.length, 0);
+});
+
+test('doctor reports a changed caller or unavailable identity check before transport findings', nativeIdentityOnly, async t => {
+  const fixture = await claudeFixture(t);
+  const context = claudeCaller(fixture);
+  const changed = await executeBridgeTool('bridge_doctor', {}, { ...context, callerSessionId: randomUUID() });
+  assert.deepEqual(changed.diagnosis, { reason: 'caller_changed',
+    next_action: 'Run bridge_doctor from the conversation you intended to use.' });
+  const unavailable = await executeBridgeTool('bridge_doctor', {}, { ...context,
+    processProbe: async () => { throw new Error('private fixture process inspection error'); } });
+  assert.deepEqual(unavailable.diagnosis, { reason: 'identity_check_unavailable',
+    next_action: 'Check that the bridge can read the Claude Code process identity on this system.' });
+  assert.doesNotMatch(JSON.stringify(unavailable), /private fixture/);
 });
 
 test('doctor reaches an older valid context after three removed Codex chats', windowsOnly, async t => {
@@ -179,7 +200,11 @@ test('doctor reaches an older valid context after three removed Codex chats', wi
     registryDir: fixture.registryDir, processProbe: fixture.processProbe, parentPid: process.pid,
     env: { CLAUDE_CODE_MESSAGING_SOCKET: fixture.inbox.pipePath } });
   assert.equal(result.ready, true);
+  assert.equal(Object.hasOwn(result, 'diagnosis'), false);
   assert.equal(result.checks.find(check => check.name === 'codex_context').status, 'pass');
+  assert.deepEqual(result.checks.find(check => check.name === 'codex_daemon'), {
+    name: 'codex_daemon', status: 'warning', detail: 'Codex terminal support is disabled.',
+  });
   assert.deepEqual(fs.readFileSync(path.join(fixture.stateDir, 'codex-host.json')), saved);
   assert.equal(fixture.inbox.messages.length, 0);
 });
@@ -338,15 +363,18 @@ test('a stalled Desktop is reported as stalled, not hidden behind endpoints of e
   assert.match(check('codex_registry').detail, /2 present, 1 missing, 0 unverified/);
   assert.equal(check('codex_tools').status, 'pass');
   assert.equal(check('codex_context').status, 'warning');
-  assert.match(check('codex_context').detail, /did not answer in time. Retry the same call/);
+  assert.match(check('codex_context').detail, /did not answer in time; 1 saved endpoint belongs to earlier Codex Desktop launches/);
+  assert.equal(Object.hasOwn(doctor, 'diagnosis'), false);
   assert.equal(calls(), 6);
 });
 
 test('bridge_doctor from a Codex Desktop task registers its endpoint, as the recovery advice says', async t => {
   const fixture = await nativeFixture(t);
   const codex = await mockPipe(t, { framed: true });
-  await executeBridgeTool('bridge_doctor', {}, { env: { CODEX_APP_TOOLS_PIPE_PATH: codex.pipePath, CLAUDE_CODEX_BRIDGE_DAEMON: 'off' },
+  const doctor = await executeBridgeTool('bridge_doctor', {}, { env: { CODEX_APP_TOOLS_PIPE_PATH: codex.pipePath, CLAUDE_CODEX_BRIDGE_DAEMON: 'off' },
     metadata: { 'openai/threadId': 'doctor-context' }, stateDir: fixture.stateDir, registryDir: path.join(fixture.root, 'absent') });
+  assert.deepEqual(doctor.diagnosis, { reason: 'target_unavailable',
+    next_action: 'Check the Peer address in /status from a Claude Code conversation you want to reach.' });
   assert.deepEqual(getCodexHosts({ stateDir: fixture.stateDir }).map(host => [host.pipePath, host.threadId]),
     [[codex.pipePath, 'doctor-context']]);
   assert.ok(codex.messages.every(entry => entry.message.method === 'tools/list'), 'registration and diagnostics send no model message');
@@ -357,8 +385,73 @@ test('only endpoints of earlier launches point to opening Codex Desktop', window
   const earlier = await mockPipe(t);
   publishCodexHost({ stateDir: fixture.stateDir, pipePath: earlier.pipePath, threadId: 'earlier-launch' });
   await earlier.close();
-  await assert.rejects(executeBridgeTool('list_codex_threads', {}, claudeCaller(fixture)),
+  const context = claudeCaller(fixture);
+  await assert.rejects(executeBridgeTool('list_codex_threads', {}, context),
     /1 saved Codex Desktop endpoint belongs to earlier launches\. Open a Codex Desktop task with the bridge enabled/);
+  const doctor = await executeBridgeTool('bridge_doctor', {}, context);
+  assert.deepEqual(doctor.diagnosis, { reason: 'route_unavailable',
+    next_action: 'Run bridge_doctor from an open Codex Desktop task with the bridge enabled to register its endpoint.' });
+});
+
+test('doctor diagnoses incompatible Desktop tools only when its caller needs the route', windowsOnly, async t => {
+  const fixture = await claudeFixture(t);
+  const app = await mockPipe(t, { framed: true, onMessage(message, socket) {
+    assert.equal(message.method, 'tools/list');
+    answer(socket, message.id, { tools: [listTool] });
+  } });
+  publishCodexHost({ stateDir: fixture.stateDir, pipePath: app.pipePath, threadId: 'doctor-context' });
+  const outbound = await executeBridgeTool('bridge_doctor', {}, claudeCaller(fixture));
+  assert.equal(outbound.ready, false);
+  assert.deepEqual(outbound.diagnosis, { reason: 'protocol_incompatible',
+    next_action: 'Check that Codex Desktop exposes the bridge’s supported app tools.' });
+  const reverse = await executeBridgeTool('bridge_doctor', {}, { ...claudeCaller(fixture),
+    env: { CLAUDE_CODEX_BRIDGE_DAEMON: 'off' }, metadata: { 'openai/threadId': 'terminal-doctor' } });
+  assert.equal(reverse.ready, false, 'legacy ready checks both sides');
+  assert.equal(Object.hasOwn(reverse, 'diagnosis'), false);
+  assert.equal(reverse.checks.find(check => check.name === 'codex_context').detail,
+    'Codex Desktop: 1 endpoint lacked compatible local tools.');
+  assert.equal(fixture.inbox.messages.length, 0);
+});
+
+test('legacy doctor readiness stays false without the reverse route, but a one-way sender gets no repair', windowsOnly, async t => {
+  const fixture = await claudeFixture(t);
+  const context = { stateDir: fixture.stateDir, registryDir: fixture.registryDir, processProbe: fixture.processProbe,
+    metadata: { 'openai/threadId': 'terminal-doctor' }, env: { CLAUDE_CODEX_BRIDGE_DAEMON: 'off' } };
+  const doctor = await executeBridgeTool('bridge_doctor', {}, context);
+  assert.equal(doctor.ready, false);
+  assert.equal(Object.hasOwn(doctor, 'diagnosis'), false);
+  const codex = doctor.checks.filter(check => check.name.startsWith('codex_'));
+  assert.match(codex.find(check => check.name === 'codex_registry').detail, /No Codex Desktop registration/);
+  assert.match(codex.find(check => check.name === 'codex_daemon').detail, /terminal support is disabled/);
+  assert.doesNotMatch(codex.map(check => check.detail).join(' '), /retry|restart|open|run|install/i);
+  const noSsh = await executeBridgeTool('bridge_doctor', {}, { ...context, platform: 'darwin' });
+  assert.equal(noSsh.ready, false);
+  assert.equal(Object.hasOwn(noSsh, 'diagnosis'), false);
+  assert.equal(noSsh.checks.find(check => check.name === 'codex_registry').detail, 'No valid Codex SSH alias is configured on macOS.');
+  assert.equal(fixture.inbox.messages.length, 0);
+  assert.equal(fs.existsSync(fixture.stateDir), false);
+});
+
+test('doctor distinguishes an unsupported registered inbox key from a missing address', windowsOnly, async t => {
+  const fixture = await claudeFixture(t);
+  const key = path.join(fixture.registryDir, fs.readdirSync(fixture.registryDir).find(name => name.endsWith('.key')));
+  fs.writeFileSync(key, JSON.stringify({ ...JSON.parse(fs.readFileSync(key, 'utf8')), peerToken: 'unsupported-fixture' }));
+  const report = await executeBridgeTool('bridge_doctor', {}, { ...claudeCaller(fixture),
+    metadata: { 'openai/threadId': 'codex-fixture' }, env: { CLAUDE_CODEX_BRIDGE_DAEMON: 'off' } });
+  assert.deepEqual(report.diagnosis, { reason: 'target_unavailable', next_action: 'Update the bridge to a version that supports this Claude Code release.' });
+  assert.equal(fixture.inbox.messages.length, 0);
+});
+
+test('doctor does not blame the reverse route when Claude inbox verification is inconclusive', windowsOnly, async t => {
+  const fixture = await claudeFixture(t);
+  const doctor = await executeBridgeTool('bridge_doctor', {}, { stateDir: fixture.stateDir, registryDir: fixture.registryDir,
+    metadata: { 'openai/threadId': 'terminal-doctor' }, env: { CLAUDE_CODEX_BRIDGE_DAEMON: 'off' },
+    processProbe: async () => { throw Object.assign(new Error('fixture timeout'), { transient: true }); } });
+  assert.equal(doctor.ready, false);
+  assert.deepEqual(doctor.issues.find(issue => issue.check === 'claude_inbox'),
+    { check: 'claude_inbox', status: 'warning', reason: 'target_unverified' });
+  assert.equal(Object.hasOwn(doctor, 'diagnosis'), false);
+  assert.equal(fixture.inbox.messages.length, 0);
 });
 
 test('a send reuses the context Desktop accepted earlier even while chat discovery stalls', windowsOnly, async t => {
@@ -421,6 +514,6 @@ test('a wait the budget cut short is reported as unchecked, not as a stalled Des
     desktop: { catalogMs: 1000, listMs: 1450, budgetMs: 1500 } });
   const check = doctor.checks.find(entry => entry.name === 'codex_context');
   assert.equal(check.status, 'warning');
-  assert.match(check.detail, /^1 saved endpoint record could not be checked within 1\.5 s\. Retry the same call\. Also observed: 1 saved task context was not accepted\.$/);
-  assert.doesNotMatch(check.detail, /restart/);
+  assert.match(check.detail, /^Codex Desktop: 1 saved endpoint record could not be checked within 1\.5 s; 1 saved task context was not accepted\.$/);
+  assert.equal(Object.hasOwn(doctor, 'diagnosis'), false);
 });

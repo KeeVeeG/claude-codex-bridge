@@ -32,6 +32,11 @@ export function sshFixture({ status = 'idle', handshake = 'valid', dropTurn = fa
       if (!upgraded) {
         const end = pending.indexOf('\r\n\r\n');
         if (end < 0) return;
+        if (handshake === 'refused-key') {
+          child.stderr.end('Host key verification failed.\n');
+          child.stderr.once('end', () => child.emit('close', 255));
+          return;
+        }
         const headers = pending.subarray(0, end).toString();
         assert.match(headers, /^GET \/rpc HTTP\/1\.1/);
         const key = /Sec-WebSocket-Key: ([^\r]+)/i.exec(headers)?.[1];

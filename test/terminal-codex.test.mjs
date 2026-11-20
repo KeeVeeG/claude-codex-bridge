@@ -301,10 +301,12 @@ claudeTest('a terminal Codex caller can send to a Claude session and the notice 
   await new Promise(resolve => server.listen(claude.record.messagingSocketPath, resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
   const context = { ...claude.context, metadata: terminalMeta(codexThread) };
-  const result = await executeBridgeTool('send_to_claude', { session_id: claude.record.sessionId, message: 'Hello from terminal.', message_id: 'm-6' }, context);
+  const result = await executeBridgeTool('send_to_claude', { session_id: claude.record.sessionId, message: 'Hello from terminal.', message_id: 'm-6', include_message: false }, context);
   assert.equal(result.delivery.status, 'submitted');
   await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(Object.hasOwn(result.delivery, 'message'), false);
   assert.match(received.join(''), /From Codex terminal session/);
+  if (context.platform === 'win32' || (!context.platform && process.platform === 'win32')) assert.match(received.join(''), /reply transport=\\"terminal\\"/);
 });
 
 claudeTest('listing returns terminal chats with a warning when Desktop is not registered', async t => {
@@ -342,6 +344,13 @@ claudeTest('bridge_doctor reports daemon reachability as optional and never fail
   assert.equal(check.status, 'warning');
   assert.match(check.detail, /No Codex daemon is running/);
   assert.equal(downReport.ready, false);
+  assert.equal(Object.hasOwn(downReport, 'diagnosis'), false, 'a missing daemon does not rule out an explicit CLI queue');
+  await desktopApp(t, down, [{ id: 'desk-only', title: 'Desktop chat' }]);
+  const desktopOnly = await executeBridgeTool('bridge_doctor', {}, down.context);
+  assert.equal(desktopOnly.ready, false, '1.0 ready still also requires a verified Claude inbox');
+  assert.equal(Object.hasOwn(desktopOnly, 'diagnosis'), false);
+  assert.deepEqual(desktopOnly.checks.find(item => item.name === 'codex_daemon'),
+    { name: 'codex_daemon', status: 'warning', detail: 'No Codex daemon is running.' });
 });
 
 claudeTest('bridge_doctor says so when the daemon is reachable but no terminal session is registered, and never reports it ready on that alone', async t => {
@@ -349,6 +358,7 @@ claudeTest('bridge_doctor says so when the daemon is reachable but no terminal s
   const report = await executeBridgeTool('bridge_doctor', {}, empty.context);
   assert.match(report.checks.find(check => check.name === 'codex_daemon').detail, /no eligible loaded session was found/);
   assert.equal(report.ready, false);
+  assert.equal(Object.hasOwn(report, 'diagnosis'), false, 'a bounded catalog cannot establish a target blocker');
 });
 
 function fixtureVersionExec(t, args, run) {
@@ -378,6 +388,7 @@ claudeTest('bridge_doctor warns when the Codex CLI and daemon versions differ an
   const warning = await check(null, '{"cliVersion":"0.160.0","appServerVersion":"0.162.1"}');
   assert.equal(warning?.status, 'warning');
   assert.match(warning.detail, /0\.160\.0.*0\.162\.1/);
+  assert.doesNotMatch(warning.detail, /restart|update/i);
   assert.equal((await check(null, '{"cliVersion":"0.162.1","appServerVersion":"0.162.1"}'))?.status, 'pass');
   assert.equal(await check(null, 'malformed fixture output'), undefined);
   assert.equal(await check({ killed: true, signal: 'SIGTERM', code: null }, ''), undefined);
@@ -557,7 +568,14 @@ claudeTest('a message the queue route cannot carry is refused before its message
   const setup = await queueSetup(t, 'ok');
   const send = (message, message_id) => executeBridgeTool('send_to_codex', { thread_id: setup.termId, transport: 'terminal', message, message_id }, setup.context);
   const overhead = codexPeerContent({ fromKind: 'claude', fromId: setup.record.sessionId, bridgeMessageId: 'q-edge', body: '' }).length;
-  await assert.rejects(() => send('x'.repeat(16000 - overhead + 1), 'q-edge'), error => /too long/.test(error.message) && !error.deliveryUnknown);
+  for (const [body, excess] of [['x'.repeat(16000 - overhead + 1), 1], ['x'.repeat(15990), overhead - 10]]) {
+    await assert.rejects(() => send(body, 'q-edge'), error => {
+      assert.equal(error.outcome.reason, 'queued_message_too_long');
+      assert.equal(error.outcome.delivered, false);
+      assert.match(error.message, new RegExp(`by ${excess} UTF-16 unit`));
+      return true;
+    });
+  }
   await assert.rejects(() => send('a\0b', 'q-nul'), error => /NUL character/.test(error.message) && !error.deliveryUnknown);
   assert.equal(setup.queueCalls().length, 0);
   assert.deepEqual((await executeBridgeTool('list_deliveries', {}, setup.context)).deliveries, [], 'nothing was reserved, not even as failed');

@@ -37,7 +37,9 @@ export function unconfirmedReply(source, detail, error = new Error()) {
 }
 
 export class DaemonUnavailableError extends Error {
-  constructor(message) { super(message); this.name = 'DaemonUnavailableError'; }
+  constructor(message, { terminalUnavailable = false } = {}) {
+    super(message); this.name = 'DaemonUnavailableError'; this.terminalUnavailable = terminalUnavailable;
+  }
 }
 
 export const NOT_RUNNING_MESSAGE = 'No Codex daemon is running; `codex app-server daemon start` starts one. The bridge never starts it.';
@@ -54,18 +56,18 @@ const disabledValue = env => {
 
 // The injected command (tests) skips the kill switch and the .exe check.
 function resolveExecutable({ effective, command }) {
-  if (debuglog('child_process').enabled) throw new DaemonUnavailableError('Child-process tracing can expose private data. Restart the bridge without NODE_DEBUG child_process tracing.');
+  if (debuglog('child_process').enabled) throw new DaemonUnavailableError('Child-process tracing can expose private data. Restart the bridge without NODE_DEBUG child_process tracing.', { terminalUnavailable: true });
   if (command) return command;
   const disabled = disabledValue(effective);
   if (disabled !== null) {
-    throw new DaemonUnavailableError(`Codex terminal support is disabled by CLAUDE_CODEX_BRIDGE_DAEMON=${disabled}.`);
+    throw new DaemonUnavailableError(`Codex terminal support is disabled by CLAUDE_CODEX_BRIDGE_DAEMON=${disabled}.`, { terminalUnavailable: true });
   }
   const executable = resolveCodexExecutable({ env: effective });
   if (!executable) {
-    if (effective.CLAUDE_CODEX_BRIDGE_CODEX_BIN) throw new DaemonUnavailableError('The configured Codex executable was not found. Correct or unset CLAUDE_CODEX_BRIDGE_CODEX_BIN.');
-    throw new DaemonUnavailableError('The Codex executable was not found. Install the Codex CLI, or set CLAUDE_CODEX_BRIDGE_CODEX_BIN to the path of codex.exe.');
+    if (effective.CLAUDE_CODEX_BRIDGE_CODEX_BIN) throw new DaemonUnavailableError('The configured Codex executable was not found. Correct or unset CLAUDE_CODEX_BRIDGE_CODEX_BIN.', { terminalUnavailable: true });
+    throw new DaemonUnavailableError('The Codex executable was not found. Install the Codex CLI, or set CLAUDE_CODEX_BRIDGE_CODEX_BIN to the path of codex.exe.', { terminalUnavailable: true });
   }
-  if (!isDirectExecutable(executable)) throw new DaemonUnavailableError(CMD_SHIM_MESSAGE);
+  if (!isDirectExecutable(executable)) throw new DaemonUnavailableError(CMD_SHIM_MESSAGE, { terminalUnavailable: true });
   return process.platform === 'win32' && executable.length >= 248 ? path.toNamespacedPath(path.resolve(executable)) : executable;
 }
 
@@ -401,12 +403,13 @@ export function queueTargetRefusal(threadId) {
 }
 
 /** Why the queue route cannot carry this text, or null. Only the queue route has these limits; the daemon route does not. */
-export function queueRefusal(text) {
+export function queueRefusal(text, limit = QUEUE_TEXT_LIMIT) {
   // Windows command lines are limited to about 32 K characters.
-  if (typeof text === 'string' && text.length > QUEUE_TEXT_LIMIT) {
-    return `The message is too long for the Codex queue route (limit ${QUEUE_TEXT_LIMIT} characters). Send a shorter message.`;
+  if (typeof text === 'string' && text.length > limit) {
+    const excess = text.length - limit;
+    return failure(`The message is too long for the Codex queue by ${excess} UTF-16 unit${excess === 1 ? '' : 's'}, including the bridge wrapper. Shorten the text by that amount or more.`, 'queued_message_too_long');
   }
-  if (typeof text === 'string' && text.includes('\0')) return 'The message contains a NUL character, which cannot be passed to the Codex queue route.';
+  if (typeof text === 'string' && text.includes('\0')) return failure('The message contains a NUL character, which cannot be passed to the Codex queue route.', 'invalid_argument');
   return null;
 }
 
@@ -414,13 +417,20 @@ export function queueRefusal(text) {
  * Class (b): one queue run that may already have queued the message, so it is never repeated. */
 export function queueToTerminalThread({ threadId, text, env = process.env, signal, timeoutMs = 30000, command, args } = {}) {
   try { throwIfAborted(signal); } catch (error) { return Promise.reject(error); }
-  const refusal = queueTargetRefusal(threadId) || queueRefusal(text);
-  if (refusal) return Promise.reject(new Error(refusal));
+  const target = queueTargetRefusal(threadId);
+  const refusal = target ? failure(target, 'invalid_argument') : queueRefusal(text);
+  if (refusal) return Promise.reject(refusal);
   threadId = normalizeCodexThreadId(threadId);
   const effective = { ...process.env, ...env };
   let executable;
   try { executable = resolveExecutable({ effective, command }); } catch (error) { return Promise.reject(error); }
-  if (process.platform === 'win32' && 2 * (text.length + executable.length + threadId.length) + 64 >= 32767) return Promise.reject(failure('The message and executable path exceed the queue command-line budget. Send a shorter message.', 'invalid_argument'));
+  if (process.platform === 'win32') {
+    // 2 * (text + path + ID) + 64 < 32767, even when libuv doubles the quoted arguments.
+    const limit = 16351 - executable.length - threadId.length;
+    if (limit < 1) return Promise.reject(failure('The executable path leaves no queue command-line budget. Select a shorter native Codex executable path.', 'invalid_argument'));
+    const overBudget = queueRefusal(text, limit);
+    if (overBudget) return Promise.reject(overBudget);
+  }
   try { beforeWrite(signal); } catch (error) { return Promise.reject(error); }
   const unknown = detail => unconfirmedReply('Codex queue', detail);
   return new Promise((resolve, reject) => {

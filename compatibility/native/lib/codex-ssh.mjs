@@ -65,13 +65,15 @@ class SshRpc {
       this.child.stderr.setEncoding('utf8');
       this.child.stderr.on('data', chunk => { diagnostic = (diagnostic + chunk).slice(-4096); });
       this.child.on('close', code => {
-        const detail = !this.upgraded && /host key verification failed|remote host identification has changed/i.test(diagnostic)
-          ? 'SSH host-key verification failed. Verify the configured host key with its operator.'
+        // Fixed operator actions only; never carry remote stderr into a result.
+        const problem = !this.upgraded && /host key verification failed|remote host identification has changed/i.test(diagnostic)
+          ? ['SSH host-key verification failed.', 'Verify the configured host key with its operator.']
           : !this.upgraded && code === 127 && /codex.*(?:not found|command not found)|command not found.*codex/i.test(diagnostic)
-          ? 'The remote login shell could not find Codex. Configure its login PATH to include Codex.'
-          : !this.upgraded && /permission denied/i.test(diagnostic) ? 'SSH authentication was denied. Configure noninteractive authentication for the selected alias.'
-          : 'The configured SSH proxy closed before replying. Check connectivity to the configured host.';
-        this.fail(failure(detail, 'route_unavailable'));
+          ? ['The remote login shell could not find Codex.', 'Configure its login PATH to include Codex.']
+          : !this.upgraded && /permission denied/i.test(diagnostic) ? ['SSH authentication was denied.', 'Configure noninteractive authentication for the selected alias.']
+          : null;
+        this.fail(problem ? failure(problem.join(' '), 'route_unavailable', { nextAction: problem[1] })
+          : failure('The configured SSH proxy closed before replying. Check connectivity to the configured host.', 'route_unavailable'));
       });
       this.child.stdin.on('error', () => this.fail(new Error('Could not write to the configured SSH proxy.')));
       this.child.stdout.on('error', () => this.fail(new Error('Could not read from the configured SSH proxy.')));

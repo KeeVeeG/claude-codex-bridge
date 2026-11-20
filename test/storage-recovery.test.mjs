@@ -168,10 +168,14 @@ test('doctor distinguishes unsupported hard links from an unusable state selecto
     registryDir: path.join(owner.root, 'no-registry'), parentPid: 2147483647 });
   assert.match(result.checks.find(c => c.name === 'state_directory').detail, /hard links/);
   assert.deepEqual(result.issues.find(c => c.check === 'state_directory'), { check: 'state_directory', status: 'fail', reason: 'state_unavailable' });
+  assert.deepEqual(result.diagnosis, { reason: 'state_unavailable',
+    next_action: 'Check the configured state directory’s location, write access and hard-link support.' });
   assert.ok(!fs.readdirSync(owner.stateDir).some(n => n.startsWith('.link-check-')));
   const notDirectory = path.join(owner.root, 'file'); fs.writeFileSync(notDirectory, 'fixture');
   const invalid = await executeBridgeTool('bridge_doctor', {}, { env: { CLAUDE_CODEX_BRIDGE_STATE_DIR: notDirectory } });
   assert.equal(invalid.ready, false); assert.equal(invalid.issues[0].reason, 'state_unavailable');
+  assert.deepEqual(invalid.diagnosis, { reason: 'state_unavailable',
+    next_action: 'Check that both apps select the same usable shared state directory.' });
   assert.ok(!JSON.stringify(invalid).includes(notDirectory));
 });
 
@@ -197,8 +201,12 @@ test('doctor reports dead sender and manual recovery owners without changing loc
   for (const dir of [session.dir, manual]) for (const lock of ['state.lock', 'state.lock.recovery']) fs.writeFileSync(path.join(dir, lock), contents);
   const report = await executeBridgeTool('bridge_doctor', {}, { stateDir: owner.stateDir, env: { CLAUDE_CODEX_BRIDGE_DAEMON: 'off' },
     metadata: { 'openai/threadId': owner.threadId }, registryDir: path.join(owner.root, 'absent') });
-  for (const name of ['sender_lock', 'manual_lock']) {
-    const finding = report.checks.find(c => c.name === name); assert.equal(finding.status, 'fail'); assert.match(finding.detail, /back up.*offline lock recovery/i);
-  }
+  const sender = report.checks.find(c => c.name === 'sender_lock');
+  assert.equal(sender.status, 'fail');
+  assert.match(sender.detail, /back up.*offline lock recovery/i);
+  assert.deepEqual(report.checks.find(c => c.name === 'manual_lock'), { name: 'manual_lock', status: 'fail',
+    detail: 'Recovery was interrupted and its owner no longer runs.' });
+  assert.deepEqual(report.diagnosis, { reason: 'state_unavailable',
+    next_action: 'Consult the README’s shared-state lock recovery guidance before sending.' });
   for (const dir of [session.dir, manual]) for (const lock of ['state.lock', 'state.lock.recovery']) assert.equal(fs.readFileSync(path.join(dir, lock), 'utf8'), contents);
 });
