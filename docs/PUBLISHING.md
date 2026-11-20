@@ -2,30 +2,32 @@
 
 ## Prepare the source
 
-These steps require a Git source checkout, not an extracted plugin. Edit release identity, version, and presentation in root `plugin.json`, and the portable stdio entry in root `mcp.json`. Run `npm run manifests:sync` once to update `package.json`, the native adapters, and `compatibility/native/`, including after a version change. Commit the generated tree with the source changes: the Git marketplaces install it. Keep the release MCP environment empty; check, sync and package reject local overrides. For a private install, set the local configuration at install time instead.
+These steps require a Git source checkout, not an extracted plugin. Edit release identity, version, and presentation in root `plugin.json`, and the portable stdio entry in root `mcp.json`. Run `npm run manifests:sync` once to update `package.json`, the native adapters, and `compatibility/native/`, including after a version change. Commit the generated tree with the source changes: the Git marketplaces install it from `main`, which a release reaches only through the gates below. Keep the release MCP environment empty; check, sync and package reject local overrides. For a private install, set the local configuration at install time instead.
 
 The plugin identity and skill namespace are `bridge-claude-codex`; the npm package and archive identity remain `claude-codex-bridge`. The native deployment stores its portable inputs in `config/plugin-source.json` and `config/mcp-source.json` so portable discovery does not change what Codex loads. It retains Codex's native `env_vars`; Claude uses a plugin-only inline server definition with supported nonsecret environment references, not a project `.mcp.json`. The installer stamps the staged version in all manifests and in the Claude launch arguments so an applied interactive reload sees a configuration change.
 
 Agent Plugins 1.0 cannot express native `env_vars`. The separate portable archive uses `${PLUGIN_ROOT}` and still requires a host that supplies the native application context. It does not replace the default native deployment.
 
-## Build and validate the tag
+## Validate the candidate
 
-Land the release commit (including its release notes and generated runtime) on the intended release branch. Create and push the annotated `v<version>` tag on that exact commit. Build in a fresh checkout of the tag so the working tree and the uploaded assets cannot come from different revisions. On Windows PowerShell, for example:
+The Git marketplaces install the generated runtime from `main`, so a commit there is already a release. Prepare the release as a candidate commit on `dev`: the version bump, the synchronized generated runtime and the release notes. Pushing `dev` runs CI, which tests and packages on Windows and macOS across Node.js 20, 22, 24 and 26; a candidate with failing CI is not published. Nothing reaches `main` or a tag until every gate below passes on that exact commit.
+
+Run the gates in a fresh, clean checkout of the candidate so the tested tree and the uploaded assets cannot come from different revisions. On Windows PowerShell, for example:
 
 ```powershell
 $version = 'X.Y.Z' # Replace with the version being released.
 $tag = "v$version"
+git fetch origin
+$candidate = git rev-parse origin/dev
 $checkout = "../bridge-release-$version"
-git worktree add --detach $checkout $tag
-if ($LASTEXITCODE -ne 0) { throw 'Could not check out the release tag' }
+git worktree add --detach $checkout $candidate
+if ($LASTEXITCODE -ne 0) { throw 'Could not check out the candidate commit' }
 Set-Location $checkout
-if ((git status --porcelain) -or (git rev-parse HEAD) -ne (git rev-list -n 1 $tag)) {
-  throw 'Use a clean checkout of the intended release tag'
-}
-if ((node -p "require('./package.json').version") -ne $version) { throw 'Tag and package version differ' }
+if ((git status --porcelain) -or (git rev-parse HEAD) -ne $candidate) { throw 'Use a clean checkout of the candidate commit' }
+if ((node -p "require('./package.json').version") -ne $version) { throw 'Candidate and release version differ' }
 npm run manifests:check
 if ($LASTEXITCODE -ne 0) { throw 'Manifest check failed' }
-npm test
+npm test # Run under Node.js 26, then again under Node.js 22.
 if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
 npm run package
 if ($LASTEXITCODE -ne 0) { throw 'Packaging failed' }
@@ -33,9 +35,10 @@ claude plugin validate dist/marketplace
 if ($LASTEXITCODE -ne 0) { throw 'Claude marketplace validation failed' }
 ```
 
-On Windows, also run the real released-writer check. Export the pinned Git tag `v1.0.6` into an empty disposable directory (`git archive v1.0.6 --output=bridge-106.tar`, then extract that archive there). Run `node test/released-writer.mjs <export-directory>`. It requires the real-writer test to pass and rejects a skipped test or the wrong version. The ordinary suite without the export does not cover the released writer.
+Then run the two Windows checks against the released 1.0.6. Export the pinned Git tag `v1.0.6` into an empty disposable directory (`git archive v1.0.6 --output=bridge-106.tar`, then extract that archive there).
 
-Also run the tests on Node.js 20, the oldest supported version. CI runs tests and packaging on Windows and macOS across Node.js 20, 22, 24, and 26.
+- **Released writer:** `node test/released-writer.mjs <export-directory>`. It requires the real-writer test to pass and rejects a skipped test or the wrong version. The ordinary suite without the export does not cover the released writer.
+- **Packaged upgrade:** `node test/packaged-upgrade.mjs "dist/claude-codex-bridge-$version.zip" <export-directory>`. In a disposable profile it installs 1.0.6 into both clients with the real `claude.exe` and Codex CLIs, upgrades with the packaged ZIP's installer, then starts the server the way each client starts it from the folder that client loads. It requires the packaged version at `initialize` and the packaged panel resource. It does not use or change your own profile.
 
 The packager writes these artifacts under `dist/`:
 
@@ -47,9 +50,18 @@ The packager writes these artifacts under `dist/`:
 
 The archives include runtime code, documentation, and the MIT license. They exclude Git history, test fixtures, local state, credentials, and installer backups. ZIP entry timestamps are fixed for reproducible builds.
 
-## GitHub release
+## Publish the validated commit
 
-From that verified tagged checkout, upload the three ZIPs and checksum file from the same build. Use the reviewed release notes, not an automatically generated account of the commit history.
+Only after every gate passes, move `main` to the candidate, then tag it. If `main` cannot fast-forward to the candidate, stop: a merge commit is a commit the gates did not test.
+
+```powershell
+git push origin "$($candidate):refs/heads/main"
+if ($LASTEXITCODE -ne 0) { throw 'main did not fast-forward to the candidate' }
+git tag -a $tag $candidate -m $tag
+git push origin $tag
+```
+
+From the same verified checkout, upload the three ZIPs and checksum file from the build the gates checked. Use the reviewed release notes, not an automatically generated account of the commit history.
 
 ```powershell
 gh release create $tag `

@@ -65,7 +65,7 @@ function readOwner(file) {
   const stat = fs.lstatSync(file);
   const data = stat.isFile() && stat.size < 8192 ? fs.readFileSync(file, 'utf8') : undefined;
   let value; try { value = JSON.parse(data); } catch {}
-  if (!Number.isSafeInteger(value?.pid) || value.pid <= 0) throw failure('The saved bridge records have an unverifiable lock owner. Quit both apps, stop all bridge servers and installers, back up the complete state and follow the READMEвЂ™s offline lock recovery steps.', 'state_unavailable', { code: 'LOCK_INCOMPLETE' });
+  if (!Number.isSafeInteger(value?.pid) || value.pid <= 0) throw failure('The saved bridge records have an unverifiable lock owner. Quit both apps, stop all bridge servers and installers, back up the complete state and follow the README’s offline lock recovery steps.', 'state_unavailable', { code: 'LOCK_INCOMPLETE' });
   return value;
 }
 // Read-only doctor check. Never acquire, remove or refresh either lock while diagnosing it.
@@ -182,7 +182,7 @@ function* transaction(directory, callback, io) {
       if (e.code !== 'EEXIST') { yield* retry(e); continue; }
       let guardian;
       try { guardian = readOwner(guard); } catch (e) { if (e.code !== 'ENOENT') yield* retry(e); continue; }
-      if (!(yield* alive(guardian, io))) throw failure('Bridge lock recovery was interrupted. Quit both apps, stop all bridge servers and installers, back up the complete state and follow the READMEвЂ™s offline lock recovery steps.', 'state_unavailable');
+      if (!(yield* alive(guardian, io))) throw failure('Bridge lock recovery was interrupted. Quit both apps, stop all bridge servers and installers, back up the complete state and follow the README’s offline lock recovery steps.', 'state_unavailable', { code: 'LOCK_RECOVERY_INTERRUPTED' });
       yield io.pause(15, true); continue;
     }
     try {

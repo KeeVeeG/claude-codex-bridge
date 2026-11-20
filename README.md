@@ -41,6 +41,7 @@ To update, run the installer again from the updated checkout or native ZIP with 
 - **Before updating 1.0.0–1.0.2 with the installer**, fully quit Claude and Codex, including terminal sessions, before you run it: those servers load code from the staged folder the installer replaces, so a running one could mix versions. If you are not sure which version or source you have, quit them first as well.
 - **Turned-off plugins:** Codex has no update command that keeps a plugin turned off. If you turned the bridge off, the installer stops before updating either client. Use `--claude` to update Claude alone. When you want to use the Codex bridge again, turn it on and rerun the installer. Adding it from a Codex marketplace also turns it on; after a marketplace update, turn it off again in Codex to keep that choice. Claude keeps a disabled plugin disabled when it updates.
 - **Client caches:** keep local edits outside `plugins/cache` in the Codex home or Claude configuration directory. A Codex update replaces its cached copy; Claude can keep the old version, but the new version does not include your edits. If Codex's cached copy differs from every verified installer stage, the installer stops and names the folder to move. A marketplace update makes no such check.
+- **Failed updates:** if an update fails after a client took the new version, the installer returns each client to the version it ran before. When it cannot, the error names each client's version before and after, and the folder holding its previous files or, if none was kept, that version's release package. An installer lock left by a stopped installer is named with its own [recovery step](#offline-lock-recovery).
 
 Then load the new server in each client:
 
@@ -171,6 +172,8 @@ A repeated ID reports its record without sending. Only a recorded, proven no-wri
 ### Offline lock recovery
 
 If `bridge_doctor` reports interrupted recovery or an unverifiable lock that persists after an ordinary operation finishes, do not delete a lock from a running installation. Quit both apps, stop every bridge server and installer using that directory, and back up the entire state tree. Make a separate private copy on a volume that supports hard links. In the **copy only**, omit `state.lock` and `state.lock.recovery`; keep all ledger, manual, clock and other data files. Pin both apps (and any older writers) to that one copy before restarting. Run doctor and inspect saved deliveries and receiving conversations. A `sending` or `uncertain` row is not proof that nothing arrived. If you cannot establish that all writers are stopped or which state tree is authoritative, leave the originals untouched.
+
+The installer's own locks are not bridge state, and copying or re-pinning state does not clear them: `.bridge-claude-codex-install-lock` in `~/plugins`, `.bridge-claude-codex-marketplace-lock` in `~/.agents/plugins`, and `.bridge-claude-codex-permissions-lock` in the Claude configuration directory. If the installer reports one as left by a stopped installer or as unverifiable, stop every bridge installer, check the files the message names (the staged files, the personal catalog or Claude `settings.json`), then delete only the named lock folder and run the installer again. Never delete it while an installer runs.
 
 ## Compatibility
 
