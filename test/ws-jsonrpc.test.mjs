@@ -53,9 +53,13 @@ test('decoder waits for the upgrade, reports open, and accepts bytes split acros
   assert.deepEqual(events, [{ type: 'open' }, { type: 'text', text: '{"id":1}' }]);
 });
 
-test('decoder rejects a refused upgrade', () => {
-  assert.throws(() => new FrameDecoder({ accept: upgradeRequest().accept }).push(Buffer.from('HTTP/1.1 403 Forbidden\r\n\r\n')),
-    /refused the WebSocket upgrade/);
+test('decoder rejects a refused upgrade and types an authorization refusal as access denied', () => {
+  for (const status of ['401 Unauthorized', '403 Forbidden']) {
+    assert.throws(() => new FrameDecoder({ accept: upgradeRequest().accept }).push(Buffer.from(`HTTP/1.1 ${status}\r\n\r\n`)),
+      error => error.reason === 'access_denied' && /denied/.test(error.message));
+  }
+  assert.throws(() => new FrameDecoder({ accept: upgradeRequest().accept }).push(Buffer.from('HTTP/1.1 400 Bad Request\r\n\r\n')),
+    error => /refused the WebSocket upgrade/.test(error.message) && error.reason === undefined);
 });
 
 test('a decoder that reads the upgrade cannot be built without the expected accept key', () => {

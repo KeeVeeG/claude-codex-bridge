@@ -8,7 +8,8 @@ import { listClaudeConversations } from '../lib/claude-history.mjs';
 import { canonicalClaudeSocket } from '../lib/claude-sessions.mjs';
 import { getBridgeConversation, listBridgeContacts } from '../lib/bridge-history.mjs';
 import { createSession, recordMessage, finishMessage, updateSession } from '../lib/store.mjs';
-import { nativeFixture } from './native-helpers.mjs';
+import os from 'node:os';
+import { mockPipe, nativeFixture } from './native-helpers.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 function ledger(fixture, owner) {
@@ -96,7 +97,10 @@ test('history pagination reaches every message once even when timestamps and IDs
   await assert.rejects(getBridgeConversation({ stateDir: fixture.stateDir, ownerThreadId: 'pagination-owner', sessionId, cursor: '../state.json' }), /Invalid conversation cursor/);
 });
 
-for (const entrypoint of ['claude-desktop', 'cli', 'sdk-cli']) test(`catalog indexes ${entrypoint} live sessions and bounded native metadata without returning transcript text`, async t => {
+const native = { skip: !['win32', 'darwin'].includes(process.platform) && 'Verified native Claude process identity supports Windows and macOS.' };
+const START = process.platform === 'win32' ? '133700000000000000' : 'Thu Oct  8 02:03:04 2026';
+const DOMAIN = process.platform === 'win32' ? `win32:${os.hostname().toLowerCase()}` : 'darwin';
+for (const entrypoint of ['claude-desktop', 'cli', 'sdk-cli']) test(`catalog indexes ${entrypoint} live sessions and bounded native metadata without returning transcript text`, native, async t => {
   const fixture = await nativeFixture(t);
   const sessionId = randomUUID();
   const oldSession = randomUUID();
@@ -115,16 +119,16 @@ for (const entrypoint of ['claude-desktop', 'cli', 'sdk-cli']) test(`catalog ind
   writeHistory(path.join(project, 'subagents'), randomUUID(), [{ type: 'custom-title', customTitle: 'Do not index subagent' }]);
   const registryDir = path.join(fixture.root, 'sessions');
   fs.mkdirSync(registryDir);
-  const socketPath = process.platform === 'win32' ? '\\\\.\\pipe\\fixture-history-session' : '/tmp/fixture-history-session.sock';
+  const socketPath = (await mockPipe(t)).pipePath;
   fs.writeFileSync(path.join(registryDir, `${process.pid}.json`), JSON.stringify({ pid: process.pid,
-    sessionId, entrypoint, procStart: '1', pidDomain: 'fixture', messagingSocketPath: socketPath,
+    sessionId, entrypoint, procStart: START, pidDomain: DOMAIN, messagingSocketPath: socketPath,
     cwd: fixture.cwd, name: 'Live reference conversation' }));
-  // A live row is a registration with a usable inbox key (E08).
+  // A live row is a verified process with a usable inbox key and a connected inbox (E08, DR04).
   fs.writeFileSync(path.join(registryDir, `${process.pid}.${createHash('sha256').update(canonicalClaudeSocket(socketPath)).digest('hex')}.key`),
-    JSON.stringify({ peerToken: '3'.repeat(32), procStart: '1', pidDomain: 'fixture' }));
+    JSON.stringify({ peerToken: '3'.repeat(32), [process.platform === 'win32' ? 'procStartFt' : 'procStart']: START, pidDomain: DOMAIN }));
   const ownLedger = ledger(fixture, 'catalog-owner');
   message(ownLedger, { kind: 'codex', id: 'catalog-owner' }, { kind: 'claude', id: oldSession }, 'contact', 'Sent through bridge');
-  const result = await listClaudeConversations({ projectsDir, registryDir, stateDir: fixture.stateDir, ownerThreadId: 'catalog-owner' });
+  const result = await listClaudeConversations({ projectsDir, registryDir, stateDir: fixture.stateDir, ownerThreadId: 'catalog-owner', probe: async () => ({ start: START }) });
   assert.equal(result.conversations.length, 2);
   const live = result.conversations.find(value => value.session_id === sessionId);
   assert.equal(live.title, 'Live reference conversation');

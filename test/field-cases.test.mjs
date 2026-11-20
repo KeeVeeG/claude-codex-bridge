@@ -139,10 +139,14 @@ test('a Desktop endpoint without a message tool never takes a send from a workin
   claudeWindow(setup, { socketPath: inbox.pipePath });
   const working = await desktopApp(t, setup.stateDir, 'working-context');
   const readOnly = await desktopApp(t, setup.stateDir, 'read-only-context', { tools: [listTool] });
-  assert.deepEqual((await executeBridgeTool('list_codex_threads', {}, setup.context)).threads.map(chat => chat.thread_id), ['live-task']);
+  const listed = await executeBridgeTool('list_codex_threads', {}, setup.context);
+  assert.deepEqual(listed.threads.map(chat => chat.thread_id), ['live-task']);
+  assert.ok(listed.issues.some(issue => issue.source === 'desktop' && issue.reason === 'protocol_incompatible'), 'the read-only app is reported as unable to take a send (CA04)');
+  const sendsBefore = readOnly.messages.length;
   assert.equal((await sendCodex(setup, 'x04')).delivery.status, 'submitted');
   assert.deepEqual(working.sent().map(params => params.arguments.threadId), ['live-task']);
-  assert.deepEqual(readOnly.messages.map(entry => entry.message.method), ['tools/list', 'tools/list'], 'the read-only app is only asked for its tools');
+  assert.deepEqual(readOnly.messages.filter(entry => entry.message.method !== 'tools/list').map(entry => entry.message.params.tool), ['list_threads'], 'the read-only app is only read for discovery');
+  assert.deepEqual(readOnly.messages.slice(sendsBefore).map(entry => entry.message.method), ['tools/list'], 'a send only asks the read-only app for its tools');
 });
 
 test('an unassigned or parked Claude process is not offered or addressable as a conversation (L02)', native, async t => {
@@ -270,13 +274,14 @@ test('F02: a newer running Desktop with no chats does not hide the chats and the
   assert.deepEqual([older.sent().map(params => params.arguments.threadId), newer.sent()], [['live-task'], []]);
 });
 
-test('the conversation catalog offers a Claude registration as live only with a usable inbox key (E08)', native, async t => {
+test('the conversation catalog offers a Claude registration as live only with a usable inbox key and a verified connection (E08, DR04)', native, async t => {
   const setup = await world(t);
   const keyless = claudeWindow(setup, { key: false });
-  const keyed = claudeWindow(setup, { pid: process.ppid, name: 'Keyed window' });
+  const inbox = await mockPipe(t);
+  const keyed = claudeWindow(setup, { pid: process.ppid, name: 'Keyed window', socketPath: inbox.pipePath });
   const projectsDir = path.join(setup.root, 'projects');
   fs.mkdirSync(projectsDir);
-  const catalog = await listClaudeConversations({ projectsDir, registryDir: setup.registryDir, stateDir: setup.stateDir, ownerThreadId: 'catalog-owner' });
+  const catalog = await listClaudeConversations({ projectsDir, registryDir: setup.registryDir, stateDir: setup.stateDir, ownerThreadId: 'catalog-owner', probe: processProbe });
   assert.deepEqual(catalog.conversations.map(row => [row.session_id, row.live]), [[keyed.record.sessionId, true]]);
   assert.equal(catalog.conversations.some(row => row.session_id === keyless.record.sessionId), false);
 });

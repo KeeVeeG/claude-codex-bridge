@@ -332,8 +332,9 @@ test('an old live owner is waited for and never stolen', { timeout: 15_000 }, as
   assert.equal(readSession(session).counter, 2);
 });
 
-function assertDoctorRecovery(error) {
-  assert.match(error.message, /\bbridge_doctor\b/);
+function assertOfflineRecovery(error) {
+  assert.match(error.message, /stop all bridge servers.*offline lock recovery steps/);
+  assert.doesNotMatch(error.message, /\bbridge_doctor\b/, 'recovery cannot depend on the stopped server (EC06)');
   assert.doesNotMatch(error.message, /state\.(?:lock|json)\b/);
   return true;
 }
@@ -348,13 +349,13 @@ test('a crashed recovery guard stops safely without removing either lock', async
   const staleRecovery = JSON.stringify({ pid: DEAD_PID, token: 'dead-recovery' });
   fs.writeFileSync(lock, staleLock);
   fs.writeFileSync(recovery, staleRecovery);
-  assert.throws(() => updateSession(session, () => assert.fail('Crashed guard cannot grant ownership')), assertDoctorRecovery);
+  assert.throws(() => updateSession(session, () => assert.fail('Crashed guard cannot grant ownership')), assertOfflineRecovery);
   assert.equal(fs.readFileSync(lock, 'utf8'), staleLock);
   assert.equal(fs.readFileSync(recovery, 'utf8'), staleRecovery);
   assert.equal(readSession(session).unexpected, undefined);
 });
 
-test('unverifiable lock metadata directs to doctor without changing locks or state', async t => {
+test('unverifiable lock metadata directs to offline recovery without changing locks or state', async t => {
   for (const target of ['main', 'recovery']) {
     for (const [format, invalid] of [['empty', ''], ['missing PID', '{"token":"unverified"}']]) {
       await t.test(`${target}: ${format}`, async sub => {
@@ -366,7 +367,7 @@ test('unverifiable lock metadata directs to doctor without changing locks or sta
         fs.writeFileSync(lock, mainBytes);
         if (target === 'recovery') fs.writeFileSync(recovery, invalid);
         const stateBefore = fs.readFileSync(session.stateFile, 'utf8');
-        assert.throws(() => updateSession(session, () => assert.fail('Invalid lock cannot grant ownership')), assertDoctorRecovery);
+        assert.throws(() => updateSession(session, () => assert.fail('Invalid lock cannot grant ownership')), assertOfflineRecovery);
         assert.equal(fs.readFileSync(lock, 'utf8'), mainBytes);
         if (target === 'recovery') assert.equal(fs.readFileSync(recovery, 'utf8'), invalid);
         else assert.equal(fs.existsSync(recovery), false);

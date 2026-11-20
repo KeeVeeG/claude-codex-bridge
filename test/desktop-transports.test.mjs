@@ -170,7 +170,7 @@ test('Codex chat listing rejects unsupported limits before transport and keeps n
   assert.equal(pipe.connections.length, 0);
   await assert.rejects(listCodexChats({ pipePath: pipe.pipePath, contextThreadId: 'registered-context', limit: 30 }), error => {
     assert.ok(!error.message.includes('Native list_threads'), 'peer text is classified, never shown (X05)');
-    assert.equal(error.reason, 'route_unavailable');
+    assert.equal(error.reason, 'desktop_listing_failed', 'a failed listing is not a missing route or a stale task (EC05)');
     assert.notEqual(error.deliveryUnknown, true, 'read-only listing failures are not uncertain message delivery');
     return true;
   });
