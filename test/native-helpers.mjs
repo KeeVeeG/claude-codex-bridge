@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const RUNTIME_IDENTITY_ENV_VARS = ['CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN',
+const RUNTIME_IDENTITY_ENV_VARS = ['CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN',
   'CODEX_APP_TOOLS_PIPE_PATH', 'CODEX_THREAD_ID'];
 
 // Keep every test process off the real Codex daemon. Always force it (an inherited
@@ -85,7 +85,7 @@ export async function mockPipe(t, { framed = false, onMessage, onConnection } = 
     await new Promise(resolve => server.close(resolve));
   };
   t.after(close);
-  return { pipePath, server, connections, messages, close };
+  return { pipePath, connections, messages, close };
 }
 
 export const messageTool = {

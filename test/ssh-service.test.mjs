@@ -251,7 +251,7 @@ test('installer pins the operator-selected SSH alias into both native MCP config
   const setup = await nativeFixture(t);
   const prepared = prepareInstallation({ homeDir: setup.root, env: { CLAUDE_CODEX_BRIDGE_SSH_HOST: 'codex-test-host' } });
   const codex = JSON.parse(fs.readFileSync(path.join(prepared.destination, '.codex-plugin/plugin.json')));
-  const claude = JSON.parse(fs.readFileSync(path.join(prepared.destination, '.mcp.json')));
+  const claude = JSON.parse(fs.readFileSync(path.join(prepared.destination, '.claude-plugin/plugin.json')));
   assert.equal(codex.mcpServers['bridge-claude-codex'].env.CLAUDE_CODEX_BRIDGE_SSH_HOST, 'codex-test-host');
   assert.equal(claude.mcpServers['bridge-claude-codex'].env.CLAUDE_CODEX_BRIDGE_SSH_HOST, 'codex-test-host');
 });

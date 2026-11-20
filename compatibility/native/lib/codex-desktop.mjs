@@ -3,7 +3,7 @@
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { listSshCodexChats, sendSshCodex } from './codex-ssh.mjs';
-import { beforeWrite } from './call-time.mjs';
+import { beforeWrite, cancelledError, throwIfAborted } from './call-time.mjs';
 import { markDeliveryUnknown, rpcReplyKind, unconfirmedReply } from './codex-daemon.mjs';
 import { failure } from './outcome.mjs';
 
@@ -24,18 +24,10 @@ function encodeFrame(message) {
   return frame;
 }
 
-function cancelled() {
-  return Object.assign(new Error('Bridge request was cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
-}
-
-function checkCancellation(signal) {
-  if (signal?.aborted) throw cancelled();
-}
-
 // Class (b): one framed request to the local Desktop pipe. A submitted call is reported unconfirmed and
 // never repeated; discovery passes the sub-budgets in DESKTOP_TIMEOUTS (bridge-service) instead.
 function request(pipePath, method, params, { timeoutMs = 30000, mutating = false, signal } = {}) {
-  checkCancellation(signal);
+  throwIfAborted(signal);
   requiredText(pipePath, 'Codex Desktop pipe path');
   const id = 1;
   const frame = encodeFrame({ id, jsonrpc: '2.0', method, params });
@@ -67,7 +59,7 @@ function request(pipePath, method, params, { timeoutMs = 30000, mutating = false
         : failure(`Codex Desktop returned ${detail}.`, 'protocol_incompatible'));
     }
 
-    function onAbort() { fail(cancelled()); }
+    function onAbort() { fail(cancelledError()); }
     signal?.addEventListener('abort', onAbort, { once: true });
     if (signal?.aborted) onAbort();
 
@@ -158,7 +150,7 @@ function appToolResult(result) {
 
 /** Discover actual local Codex chats through the running Desktop app. */
 async function listNativeCodexChats({ pipePath, contextThreadId, limit = 30, signal, timeoutMs = 10000, catalog }) {
-  checkCancellation(signal);
+  throwIfAborted(signal);
   requiredText(contextThreadId, 'Registered Codex context task id');
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_CODEX_CHAT_LIMIT) {
     throw new Error(`limit must be between 1 and ${MAX_CODEX_CHAT_LIMIT}`);
@@ -219,7 +211,7 @@ export const desktopCompatible = catalog => Boolean(localMessageTool(catalog) &&
  * idempotency guarantee. On transport loss deliveryUnknown is set on the error.
  */
 async function sendNativeToCodex({ pipePath, contextThreadId, threadId, message, turnId, callId, signal, catalog }) {
-  checkCancellation(signal);
+  throwIfAborted(signal);
   requiredText(contextThreadId, 'Registered Codex context task id');
   requiredText(threadId, 'Selected Codex task id');
   requiredText(message, 'Message');

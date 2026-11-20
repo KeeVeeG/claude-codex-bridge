@@ -34,8 +34,15 @@ class AttemptTimeoutError extends Error {
   }
 }
 
-export function cancelledError() {
-  return Object.assign(new Error('Bridge request was cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
+export function cancelledError(message = 'Bridge request was cancelled.') {
+  return Object.assign(new Error(message), { name: 'AbortError', code: 'ABORT_ERR' });
+}
+
+export const isCancelledError = error => error?.code === 'ABORT_ERR' || error?.name === 'AbortError';
+
+// Some transport checks deliberately recognize only a raw abort, not a call deadline or its reason.
+export function throwIfAborted(signal, message) {
+  if (signal?.aborted) throw cancelledError(message);
 }
 
 /** The error that explains why a signal stopped: the call deadline, an attempt timeout, or cancellation. */

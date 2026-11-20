@@ -1,3 +1,4 @@
+import { legacyStage } from './fixtures/legacy-stage.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -36,7 +37,7 @@ function oldInstallation(t) {
   const setup = fixture(t); const { homeDir, oldState } = setup;
   // Installer scenarios begin after the operator's offline state cutover.
   fs.renameSync(oldState, defaultStatePath(homeDir));
-  const staging = path.join(homeDir, 'plugins', oldPlugin);
+  const staging = legacyStage(homeDir);
   const backup = path.join(homeDir, 'plugins', `.${oldPlugin}.backup-previous`);
   put(path.join(staging, 'old.json'), { previous: true }); put(path.join(backup, 'old.json'), { previous: true });
   const marketplacePath = path.join(homeDir, '.agents', 'plugins', 'marketplace.json');
@@ -50,12 +51,12 @@ function oldInstallation(t) {
   const stateFile = path.join(homeDir, 'fake-plugin-state.json');
   put(stateFile, { calls: [], claude: { plugins: [
     { id: `${oldPlugin}@${oldLocal}`, scope: 'user' },
-    { id: `${oldPlugin}@${oldCatalog}`, scope: 'project', projectPath: homeDir },
+    { id: `${oldPlugin}@${oldCatalog}`, scope: 'user' },
     { id: `${oldPlugin}@custom`, scope: 'local', projectPath: homeDir },
-  ], marketplaces: [{ name: oldLocal }, { name: oldCatalog }, { name: 'keep' }] } });
+  ], marketplaces: [{ name: oldLocal, source: { source: 'directory', path: staging } }, { name: oldCatalog, source: { source: 'github', repo: 'KeeVeeG/codex-claude-desktop-bridge' } }, { name: 'keep' }] } });
   const codexConfig = path.join(homeDir, '.codex', 'config.toml');
   fs.mkdirSync(path.dirname(codexConfig), { recursive: true });
-  fs.writeFileSync(codexConfig, ['model = "kept"\n', `[marketplaces.${oldCatalog}]\nsource_type = "git"\n`, "[marketplaces.keep]\nsource_type = \"local\"\nsource = 'C:\\missing'\n",
+  fs.writeFileSync(codexConfig, ['model = "kept"\n', `[marketplaces.${oldCatalog}]\nsource_type = "git"\nsource = "https://github.com/KeeVeeG/codex-claude-desktop-bridge.git"\n`, "[marketplaces.keep]\nsource_type = \"local\"\nsource = 'C:\\missing'\n",
     `[plugins."${oldPlugin}@personal"]\nenabled = true\n`, `[plugins.'${oldPlugin}@${oldCatalog}']\nenabled = false\n`, '[plugins."unrelated@keep"]\nenabled = true\n'].join('\n'));
   const logs = [];
   const options = { homeDir, env: {}, log: value => logs.push(value), execute(app, args, { cwd = homeDir } = {}) {
@@ -72,20 +73,21 @@ test('installer migrates every released artifact through fake CLIs, preserving c
   const f = oldInstallation(t);
   const beforeCatalog = fs.readFileSync(f.marketplacePath, 'utf8');
   const prepared = await main([], f.options);
-  assert.equal(fs.existsSync(f.staging), false); assert.equal(fs.existsSync(f.backup), false);
+  assert.ok(fs.existsSync(f.staging)); assert.ok(fs.existsSync(f.backup), 'The old name and prefix are not proof of ownership.');
   assert.equal(fs.existsSync(f.oldState), false); assert.equal(prepared.stateDir, defaultStatePath(f.homeDir));
   assert.equal(prepared.destination, path.join(f.homeDir, 'plugins', 'bridge-claude-codex'));
-  assert.equal(prepared.claudeMarketplace, 'claude-codex-local');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(prepared.destination, '.claude-plugin/marketplace.json'))).name, 'claude-codex-local');
   assert.equal(getMessages(getSession({ stateDir: prepared.stateDir, threadId: 'record-owner' }))[0].message, f.record.message);
   assert.equal(fs.readFileSync(prepared.marketplaceBackup, 'utf8'), beforeCatalog);
   assert.deepEqual(JSON.parse(fs.readFileSync(f.marketplacePath)).plugins.map(entry => entry.name), ['unrelated', 'bridge-claude-codex']);
   const settings = JSON.parse(fs.readFileSync(f.settingsPath));
   assert.deepEqual(settings.enabledPlugins, { 'unrelated@personal': false });
-  assert.deepEqual(settings.permissions, { allow: ['Read', CLAUDE_SEND_PERMISSION], ask: [`${newPrefix}__list_deliveries(suffix)`, 'Write'], deny: [`${newPrefix}__send_to_claude`, 'Bash(rm *)'] });
+  assert.deepEqual(settings.permissions, { allow: ['Read', `${oldPrefix}__send_to_codex`, CLAUDE_SEND_PERMISSION], ask: [`${oldPrefix}__list_deliveries(suffix)`, `${newPrefix}__list_deliveries(suffix)`, 'Write'], deny: [`${oldPrefix}__send_to_claude`, `${newPrefix}__send_to_claude`, 'Bash(rm *)'] });
   const cli = JSON.parse(fs.readFileSync(f.stateFile));
-  assert.equal(cli.calls.filter(call => ['uninstall', 'remove'].includes(call.args[1])).length, 5);
+  assert.equal(cli.calls.filter(call => ['uninstall', 'remove'].includes(call.args[1])).length, 4);
   assert.equal(cli.calls.filter(call => call.args[1] === 'marketplace' && call.args[2] === 'remove').length, 3);
-  assert.ok(cli.calls.some(call => call.app === 'claude' && call.args.includes('local') && call.cwd === f.homeDir));
+  assert.ok(cli.claude.plugins.some(row => row.id === `${oldPlugin}@custom` && row.scope === 'local'));
+  assert.equal(prepared.cleanupPending, true);
   assert.ok(cli.claude.marketplaces.some(entry => entry.name === 'keep'));
   assert.deepEqual(fs.readFileSync(f.codexConfig, 'utf8').match(/^\[.+\]$/gm),
     ['[marketplaces.keep]', '[plugins."unrelated@keep"]', '[plugins."bridge-claude-codex@personal"]']);
@@ -93,7 +95,7 @@ test('installer migrates every released artifact through fake CLIs, preserving c
   assert.ok(f.logs.some(line => line.includes('Removed old bridge entry')));
   const before = snapshot(f.homeDir); const callCount = cli.calls.length; f.logs.length = 0;
   migrateLegacyInstallation(f.options);
-  assert.deepEqual(snapshot(f.homeDir), before); assert.deepEqual(f.logs, []);
+  assert.deepEqual(snapshot(f.homeDir), before); assert.ok(f.logs.every(line => line.includes('Unverified registrations')));
   assert.ok(JSON.parse(fs.readFileSync(f.stateFile)).calls.slice(callCount).every(call => call.args.includes('list')));
 });
 
@@ -101,10 +103,9 @@ for (const first of ['--claude', '--codex']) test(`${first} alone keeps the old 
   const f = oldInstallation(t);
   put(path.join(f.homeDir, '.claude', 'plugins', 'known_marketplaces.json'), { [oldLocal]: { source: { source: 'directory', path: f.staging } } });
   await main([first], f.options);
-  assert.ok(fs.existsSync(f.staging)); assert.equal(fs.existsSync(f.backup), false);
-  assert.ok(f.logs.some(line => line.startsWith(`Kept old staged bridge files for ${first === '--claude' ? 'Codex' : 'Claude'}`)));
+  assert.ok(fs.existsSync(f.staging)); assert.ok(fs.existsSync(f.backup));
   await main([first === '--claude' ? '--codex' : '--claude'], f.options);
-  assert.equal(fs.existsSync(f.staging), false);
+  assert.ok(fs.existsSync(f.staging), 'Unmarked legacy directories survive both migrations.');
 });
 
 test('an old Codex plugin held open by running Codex is turned off, and a later run removes it', async t => {
@@ -124,7 +125,7 @@ for (const field of ['ask', 'deny']) test(`legacy ${field} blocks the renamed se
   const f = oldInstallation(t);
   put(f.settingsPath, { permissions: { [field]: [oldPrefix, `${oldPrefix}__send_to_codex`, `${oldPrefix}__*`] } });
   await assert.rejects(main([], f.options), /already matches the outbound bridge tool/);
-  assert.deepEqual(JSON.parse(fs.readFileSync(f.settingsPath)).permissions, { [field]: [newPrefix, CLAUDE_SEND_PERMISSION, `${newPrefix}__*`] });
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.settingsPath)).permissions, { [field]: [oldPrefix, `${oldPrefix}__send_to_codex`, `${oldPrefix}__*`] });
 });
 
 for (const pin of [false, true]) test(`legacy default blocks until offline cutover${pin ? ' with an installer pin' : ''}`, t => {

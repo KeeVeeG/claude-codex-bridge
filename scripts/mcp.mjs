@@ -1,23 +1,18 @@
 #!/usr/bin/env node
 import path from 'node:path';
 import fs from 'node:fs';
+import { isMainModule } from '../lib/entry-point.mjs';
 import os from 'node:os';
-import { fileURLToPath } from 'node:url';
 import { defaultStateDir } from '../lib/store.mjs';
 import { CLAUDE_ENTRYPOINTS, callerSessionId } from '../lib/claude-sessions.mjs';
 import { stopProcessProbe } from '../lib/claude-process.mjs';
 import { startCall, throwIfStopped } from '../lib/call-time.mjs';
 import { OUTCOME_SCHEMA, REASONS, errorOutcome, outcome, sendErrorText, tagged } from '../lib/outcome.mjs';
 import { MAX_CODEX_CHAT_LIMIT } from '../lib/codex-desktop.mjs';
-// All code loads at start: the installer replaces these files in place, and a module read
-// later would mix two versions in one running server. The lib modules' dynamic imports then
-// resolve to these already loaded copies.
+// Load tool modules at startup: late imports could mix versions after an in-place update.
 import { warmLedgerWorker } from '../lib/call-store.mjs';
 import { PANEL_CATALOG, executeBridgeTool, hasCodexCallerMetadata } from '../lib/bridge-service.mjs';
 import { publishCodexHost, getCodexHosts } from '../lib/codex-host.mjs';
-import '../lib/manual-service.mjs';
-import '../lib/claude-history.mjs';
-import '../lib/bridge-history.mjs';
 
 const versions = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const manifestUrl = ['../plugin.json', '../config/plugin-source.json', '../.claude-plugin/plugin.json']
@@ -133,7 +128,7 @@ export const TOOLS = [
     outputSchema: schema({ application: { type: 'string', enum: ['claude', 'codex', 'unknown'] },
       ready: { type: 'boolean' }, checks: { type: 'array', items: schema({ name: outputText,
         status: { type: 'string', enum: ['pass', 'fail', 'warning'] }, detail: outputText }, ['name', 'status', 'detail']) },
-      issues: issues('check', outputText), plugin_version: outputText }, ['application', 'ready', 'checks', 'plugin_version']),
+      issues: issues('check', outputText), client: outputText, plugin_version: outputText }, ['application', 'ready', 'checks', 'plugin_version']),
   },
   {
     name: 'bridge_panel',
@@ -247,13 +242,26 @@ function errorResult(error, name) {
     _meta: { [OUTCOME_META]: result } };
 }
 
+const reloadAdvice = {
+  cli: 'Run /reload-plugins in this Claude Code CLI conversation. Use /reload-plugins --force only if the reload is held.',
+  'sdk-cli': 'Start a new Claude Code print-mode session.',
+  'claude-desktop': 'Fully quit and reopen Claude Desktop, including its background instance.',
+  'claude-vscode': 'Reload the VS Code window hosting this Claude Code session.',
+  'codex-terminal': 'Restart this Codex CLI session.',
+  'codex-desktop': 'Fully quit and reopen Codex Desktop; closing only its window does not load the update.',
+};
 async function executeDefault(name, args, context) {
-  const result = await executeBridgeTool(name, args, context);
-  if (name !== 'bridge_doctor') return result;
+  if (name !== 'bridge_doctor') return executeBridgeTool(name, args, context);
+  // An app may run an immutable cache copy. Only a local installer pins its authoritative stage.
+  const root = context.env?.CLAUDE_CODEX_BRIDGE_INSTALL_ROOT;
+  const checkAt = root && path.isAbsolute(root) ? path.join(root, 'config', 'plugin-source.json') : manifestUrl;
   let installed = null;
-  try { installed = JSON.parse(fs.readFileSync(manifestUrl, 'utf8')).version; } catch { /* reported as current */ }
-  const stale = installed && installed !== runtimeVersion ? [{ name: 'plugin_version', status: 'warning',
-    detail: `Version ${installed} is installed, but this server still runs ${runtimeVersion}. Reload plugins or restart the application to load it.` }] : [];
+  try { const v = JSON.parse(fs.readFileSync(checkAt, 'utf8')).version; if (typeof v === 'string' && /^\d+\.\d+\.\d+(?:[-+][\w.+-]{1,64})?$/.test(v)) installed = v; } catch { /* An unreadable install does not prove a version change. */ }
+  const pluginUpdate = Boolean(installed && installed !== runtimeVersion);
+  const result = await executeBridgeTool(name, args, { ...context, pluginUpdate });
+  const advice = reloadAdvice[result.client] ?? 'Ask which client hosts this conversation before recommending its update step.';
+  const stale = pluginUpdate ? [{ name: 'plugin_version', status: 'warning',
+    detail: `Version ${installed} is installed, but this server still runs ${runtimeVersion}. ${advice}` }] : [];
   return { ...result, checks: [...result.checks, ...stale], issues: [...result.issues,
     ...stale.map(({ name: check, status }) => ({ check, status, reason: 'version_mismatch' }))], plugin_version: runtimeVersion };
 }
@@ -639,7 +647,7 @@ export async function runMcpServer({ input = process.stdin, output = process.std
 }
 
 // Node resolves the entry module through links (macOS /tmp is /private/tmp), so compare real paths.
-if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isMainModule(import.meta.url)) {
   // Node logs child argv and environments in the parent before any child-side redaction (PR01).
   if ((await import('node:util')).debuglog('child_process').enabled) {
     process.stderr.write('Claude–Codex Bridge did not start: disable NODE_DEBUG child_process tracing, which logs message text and environments.\n');

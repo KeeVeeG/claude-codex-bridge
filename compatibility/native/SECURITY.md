@@ -14,6 +14,8 @@ The Claude peer envelope retains `from-mode="bypass"` on supported platforms for
 
 Bridge delivery records contain plaintext. Keep their shared state directory private to the current OS user. On Windows, check inherited access as well as the root's own ACL; the bridge does not change it. See [local storage and Windows permissions](docs/PRIVACY.md#local-records).
 
-Please report a vulnerability through [GitHub private vulnerability reporting](https://github.com/KeeVeeG/claude-codex-bridge/security/advisories/new). Include the affected version, operating system and application versions, transport, a minimal reproduction, and the expected impact. Avoid posting credentials, private conversation text, or live routing addresses in public issues.
+Installer settings and catalog backups can contain private data from other applications; protect them independently of the state directory. See [Installer backups](docs/PRIVACY.md#installer-backups).
+
+Please report a vulnerability through [GitHub private vulnerability reporting](https://github.com/KeeVeeG/claude-codex-bridge/security/advisories/new). Include the affected version, operating system and application versions, transport, a minimal reproduction, and the expected impact. Do not attach raw host MCP cache or debug logs, settings, or backups to a public issue. [Redact private fields](docs/PRIVACY.md#credentials-and-diagnostics) from excerpts.
 
 For installation and usage problems that do not expose sensitive data, [open a public issue](https://github.com/KeeVeeG/claude-codex-bridge/issues/new).

@@ -52,6 +52,18 @@ for (const [status, text, reason] of [['notLoaded', /not loaded\. Open it on the
 test('SSH accepts fragmented JSON frames interleaved with ping frames', async () => {
   const fixture = sshFixture({ fragmented: true });
   assert.equal((await sendToCodex(options(fixture))).turnId, 'accepted-turn');
+  assert.deepEqual(fixture.pongs, ['ping', 'ping', 'ping']);
+});
+
+test('SSH keeps the accepted turn when a close or invalid frame follows in the same read', async t => {
+  for (const [name, suffix] of [['close', Buffer.from([0x88, 0])], ['invalid frame', Buffer.from([0xc1, 0])]]) {
+    await t.test(name, async () => {
+      const fixture = sshFixture({ turnSuffix: suffix });
+      assert.equal((await sendToCodex(options(fixture))).turnId, 'accepted-turn');
+      assert.equal(fixture.acceptedTurns.length, 1);
+      assert.ok(fixture.children[0].stdin.destroyed);
+    });
+  }
 });
 
 test('SSH ignores server requests whose IDs collide with pending client calls', async () => {

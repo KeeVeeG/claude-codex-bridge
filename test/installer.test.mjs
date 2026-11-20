@@ -27,6 +27,8 @@ function fixture(t) {
   return { homeDir, marketplacePath };
 }
 
+const previousFile = file => path.join(path.dirname(file), '.bridge-claude-codex-backups', path.basename(file) + '.previous');
+
 function installationOptions(homeDir) {
   return { homeDir, env: {}, log() {}, execute() { return '[]'; } };
 }
@@ -39,8 +41,10 @@ function backupFixture(t) {
   const stagedBackups = suffixes.map(suffix => path.join(pluginsDir, `.${PLUGIN_NAME}.backup-${suffix}`));
   const marketplaceBackups = suffixes.map(suffix => `${setup.marketplacePath}.backup-${suffix}`);
   for (const directory of stagedBackups) {
-    fs.mkdirSync(directory);
-    fs.writeFileSync(path.join(directory, 'previous.txt'), 'previous staged files');
+    for (const relative of [...RUNTIME_FILES, '.bridge-installed', '.claude-plugin/marketplace.json']) {
+      const target = path.join(directory, relative); fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.copyFileSync(path.join(prepared.destination, relative), target);
+    }
   }
   for (const filename of marketplaceBackups) fs.writeFileSync(filename, 'previous catalog');
   return { ...setup, destination: prepared.destination, pluginsDir, stagedBackups, marketplaceBackups };
@@ -111,7 +115,7 @@ async function probeMcpStartup(server, cwd, env) {
   });
 }
 
-test('successful installation prunes older installer backups and retains this run and all Claude settings backups', async t => {
+test('successful installation prunes only marked stage backups and keeps one private settings backup', async t => {
   const setup = backupFixture(t);
   const { homeDir, marketplacePath, stagedBackups, marketplaceBackups } = setup;
   fs.writeFileSync(marketplacePath, JSON.stringify({ name: 'personal', plugins: [] }));
@@ -130,9 +134,10 @@ test('successful installation prunes older installer backups and retains this ru
   assert.ok(prepared.marketplaceBackup);
   assert.ok(fs.existsSync(path.join(prepared.backupDirectory, '.codex-plugin', 'plugin.json')));
   assert.equal(fs.readFileSync(prepared.marketplaceBackup, 'utf8'), JSON.stringify({ name: 'personal', plugins: [] }));
-  for (const filename of [...stagedBackups, ...marketplaceBackups]) assert.equal(fs.existsSync(filename), false);
+  for (const filename of stagedBackups) assert.equal(fs.existsSync(filename), false);
+  for (const filename of marketplaceBackups) assert.equal(fs.readFileSync(filename, 'utf8'), 'previous catalog', 'A name is not ownership.');
   for (const filename of settingsBackups) assert.equal(fs.readFileSync(filename, 'utf8'), 'previous settings');
-  assert.equal(fs.readdirSync(path.dirname(settingsFile)).filter(name => name.startsWith('settings.json.backup-')).length, 3);
+  assert.equal(fs.readFileSync(previousFile(settingsFile), 'utf8'), '{"model":"keep"}\n');
 });
 
 test('successful installation keeps the newest existing backups when this run makes none', async t => {
@@ -143,16 +148,14 @@ test('successful installation keeps the newest existing backups when this run ma
       const prepared = await main([target], installationOptions(homeDir));
       assert.equal(prepared.backupDirectory, null);
       assert.equal(prepared.marketplaceBackup, null);
-      for (const backups of [stagedBackups, marketplaceBackups]) {
-        assert.equal(fs.existsSync(backups[0]), false);
-        assert.equal(fs.existsSync(backups[1]), true);
-      }
+      assert.equal(fs.existsSync(stagedBackups[0]), false); assert.equal(fs.existsSync(stagedBackups[1]), true);
+      for (const backup of marketplaceBackups) assert.equal(fs.existsSync(backup), true);
     });
   }
 });
 
 test('failed installations do not prune any older backups', async t => {
-  for (const failure of ['staging', 'codex', 'claude', 'permissions', 'host registration']) {
+  for (const failure of ['staging', 'codex', 'claude', 'permissions']) {
     await t.test(failure, async sub => {
       const { homeDir, destination, stagedBackups, marketplaceBackups } = backupFixture(sub);
       const options = installationOptions(homeDir);
@@ -165,9 +168,6 @@ test('failed installations do not prune any older backups', async t => {
         fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
         fs.writeFileSync(settingsFile, JSON.stringify({ permissions: { deny: [CLAUDE_SEND_PERMISSION] } }));
         expected = /already matches/;
-      } else if (failure === 'host registration') {
-        options.env = { CODEX_APP_TOOLS_PIPE_PATH: 'https://invalid.example', CODEX_THREAD_ID: 'test-source' };
-        expected = /local named pipe or absolute Unix socket/;
       } else {
         options.execute = (command, args) => {
           if (command === failure && (command === 'codex' || args[1] === 'install')) throw new Error('simulated installation failure');
@@ -176,17 +176,19 @@ test('failed installations do not prune any older backups', async t => {
       }
       await assert.rejects(main([], options), expected);
       for (const filename of marketplaceBackups) assert.equal(fs.readFileSync(filename, 'utf8'), 'previous catalog');
-      for (const directory of stagedBackups) assert.equal(fs.readFileSync(path.join(directory, 'previous.txt'), 'utf8'), 'previous staged files');
+      for (const directory of stagedBackups) assert.ok(fs.existsSync(path.join(directory, '.bridge-installed')));
     });
   }
 });
 
-test('preparation-only staging never prunes older backups', async t => {
+test('successful preparation bounds owned stage backups without removing unknown files', async t => {
   const { homeDir, stagedBackups, marketplaceBackups } = backupFixture(t);
   const options = installationOptions(homeDir);
   options.execute = () => assert.fail('Preparation must not invoke application commands');
-  await main(['--prepare-only'], options);
-  for (const filename of [...stagedBackups, ...marketplaceBackups]) assert.ok(fs.existsSync(filename));
+  const prepared = await main(['--prepare-only'], options);
+  assert.ok(fs.existsSync(prepared.backupDirectory));
+  for (const file of stagedBackups) assert.equal(fs.existsSync(file), false);
+  for (const file of marketplaceBackups) assert.ok(fs.existsSync(file));
 });
 
 test('backup pruning leaves similarly named entries and links untouched without following nested links', async t => {
@@ -215,7 +217,7 @@ test('backup pruning leaves similarly named entries and links untouched without 
   assert.equal(fs.readFileSync(path.join(unrelatedDirectory, 'keep.txt'), 'utf8'), 'unrelated directory');
   assert.equal(fs.lstatSync(link).isSymbolicLink(), true);
   assert.equal(fs.readFileSync(path.join(target, 'keep.txt'), 'utf8'), 'do not follow links');
-  assert.equal(fs.existsSync(stagedBackups[0]), false);
+  assert.equal(fs.existsSync(stagedBackups[0]), true, 'A stage with an extra link is no longer a closed installer tree.');
 });
 
 test('backup pruning does not traverse a linked marketplace parent', async t => {
@@ -265,7 +267,7 @@ test('atomic JSON writer preserves an external catalog change made before replac
   let injected = false;
   fs.writeFileSync = (filename, ...args) => {
     const result = write(filename, ...args);
-    if (!injected && String(filename).startsWith(`${marketplacePath}.tmp-`)) {
+    if (!injected && path.basename(String(filename)).startsWith('marketplace.json.tmp-')) {
       injected = true;
       write(marketplacePath, newer);
     }
@@ -291,7 +293,7 @@ test('atomic JSON writer refuses a snapshot that was already replaced', t => {
 
 test('both staged plugins share a profile state path despite different MSIX LOCALAPPDATA values', t => {
   const { homeDir } = fixture(t);
-  const sourceFile = path.join(root, '.mcp.json');
+  const sourceFile = path.join(root, '.claude-plugin/plugin.json');
   const sourceBefore = fs.readFileSync(sourceFile, 'utf8');
   const expected = path.join(homeDir, '.local', 'share', 'claude-codex-bridge');
   const statePaths = [];
@@ -308,7 +310,7 @@ test('both staged plugins share a profile state path despite different MSIX LOCA
     assert.equal(canonicalMcp.mcpServers[PLUGIN_NAME].env.CLAUDE_CODEX_BRIDGE_STATE_DIR, expected);
     assert.equal(fs.existsSync(path.join(prepared.destination, 'plugin.json')), false, 'native install must retain Codex env_vars forwarding');
     assert.equal(fs.existsSync(path.join(prepared.destination, 'mcp.json')), false);
-    const aligned = checkManifests(prepared.destination);
+    const aligned = checkManifests(prepared.destination, { allowConfiguredSource: true });
     assert.equal(aligned.packageJson.version, `${JSON.parse(fs.readFileSync(path.join(root, 'plugin.json'), 'utf8')).version}+codex.${prepared.build}`);
   }
   assert.deepEqual(statePaths, [expected, expected, expected, expected]);
@@ -331,12 +333,12 @@ test('every install gives the Claude server a new configuration, so /reload-plug
 
 test('installer pins an explicit shared state override without changing portable source config', t => {
   const { homeDir } = fixture(t);
-  const sourceFile = path.join(root, '.mcp.json');
+  const sourceFile = path.join(root, '.claude-plugin/plugin.json');
   const sourceBefore = fs.readFileSync(sourceFile, 'utf8');
   const override = path.join(homeDir, 'chosen-shared-state');
   const prepared = prepareInstallation({ sourceRoot: root, homeDir, codex: false, claude: true,
     env: { CLAUDE_CODEX_BRIDGE_STATE_DIR: override, LOCALAPPDATA: path.join(homeDir, 'app-private') } });
-  const config = JSON.parse(fs.readFileSync(path.join(prepared.destination, '.mcp.json'), 'utf8'));
+  const config = JSON.parse(fs.readFileSync(path.join(prepared.destination, '.claude-plugin/plugin.json'), 'utf8'));
   assert.equal(prepared.stateDir, override);
   assert.equal(config.mcpServers[PLUGIN_NAME].env.CLAUDE_CODEX_BRIDGE_STATE_DIR, override);
   assert.equal(stagedServer(prepared.destination, '.codex-plugin').env.CLAUDE_CODEX_BRIDGE_STATE_DIR, override);
@@ -346,7 +348,7 @@ test('installer pins an explicit shared state override without changing portable
 test('staged Claude and Codex configurations start the complete MCP catalog from Unicode paths and an unrelated working directory', async t => {
   const { homeDir } = fixture(t);
   const sourceCodexPath = path.join(root, '.codex-plugin', 'plugin.json');
-  const sourceClaudeConfigPath = path.join(root, '.mcp.json');
+  const sourceClaudeConfigPath = path.join(root, '.claude-plugin/plugin.json');
   const originalCodex = fs.readFileSync(sourceCodexPath, 'utf8');
   const originalClaude = fs.readFileSync(sourceClaudeConfigPath, 'utf8');
   const prepared = prepareInstallation({ sourceRoot: root, homeDir });
@@ -445,7 +447,7 @@ test('a native deployment can prepare a new installation without depending on th
   const { homeDir } = fixture(t);
   const first = prepareInstallation({ sourceRoot: root, homeDir: path.join(homeDir, 'first-profile'), env: {} });
   const second = prepareInstallation({ sourceRoot: first.destination, homeDir: path.join(homeDir, 'second-profile'), env: {} });
-  const bundle = checkManifests(second.destination);
+  const bundle = checkManifests(second.destination, { allowConfiguredSource: true });
   assert.equal(bundle.native, true);
   assert.equal(bundle.manifest.version, `${JSON.parse(fs.readFileSync(path.join(root, 'plugin.json'), 'utf8')).version}+codex.${second.build}`);
   assert.equal(bundle.packageJson.version, bundle.manifest.version);
@@ -486,14 +488,12 @@ test('Claude permission grant preserves settings, backs up exact previous bytes,
   assert.deepEqual(JSON.parse(written), {
     ...existing, permissions: { ...existing.permissions, allow: [...existing.permissions.allow, CLAUDE_SEND_PERMISSION] },
   });
-  const backups = fs.readdirSync(path.dirname(settingsFile)).filter(name => name.startsWith('settings.json.backup-'));
-  assert.equal(backups.length, 1);
-  assert.equal(fs.readFileSync(path.join(path.dirname(settingsFile), backups[0]), 'utf8'), original);
+  assert.equal(fs.readFileSync(previousFile(settingsFile), 'utf8'), original);
   const beforeRepeat = fs.statSync(settingsFile).mtimeMs;
   grantClaudeSendPermission({ homeDir, env: {} });
   assert.equal(fs.readFileSync(settingsFile, 'utf8'), written);
   assert.equal(fs.statSync(settingsFile).mtimeMs, beforeRepeat);
-  assert.deepEqual(fs.readdirSync(path.dirname(settingsFile)).filter(name => name.startsWith('settings.json.backup-')), backups);
+  assert.deepEqual(fs.readdirSync(path.dirname(previousFile(settingsFile))).sort(), ['.bridge-installed', 'settings.json.previous']);
 });
 
 test('Claude permission grant respects a custom config directory and leaves the default profile untouched', t => {
@@ -571,7 +571,7 @@ test('Claude permission grant preserves a concurrent settings edit instead of re
   let injected = false;
   fs.writeFileSync = (filename, ...args) => {
     const result = write(filename, ...args);
-    if (!injected && String(filename).startsWith(`${settingsFile}.tmp-`)) {
+    if (!injected && path.basename(String(filename)).startsWith('settings.json.tmp-')) {
       injected = true;
       write(settingsFile, newer);
     }
@@ -612,9 +612,7 @@ test('normal all-app and Claude-only installations grant exactly send_to_codex a
       });
       assert.equal(applicationCalls.some(([command]) => command === 'codex'), codex);
       assert.ok(applicationCalls.some(([command, args]) => command === 'claude' && args[0] === 'plugin' && args[1] === 'install'));
-      const backups = fs.readdirSync(path.dirname(settingsFile)).filter(name => name.startsWith('settings.json.backup-'));
-      assert.equal(backups.length, 1);
-      assert.equal(fs.readFileSync(path.join(path.dirname(settingsFile), backups[0]), 'utf8'), original);
+      assert.equal(fs.readFileSync(previousFile(settingsFile), 'utf8'), original);
     });
   }
 });

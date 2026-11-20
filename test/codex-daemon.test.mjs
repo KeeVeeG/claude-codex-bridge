@@ -83,6 +83,16 @@ test('a response with neither result nor error fails the connection and a writte
     error => error.deliveryUnknown === true && /malformed response/.test(error.message));
 });
 
+test('the daemon settles an accepted turn before failing on an invalid frame in the same read', async t => {
+  const setup = await fakeDaemon(t, { corruptTurnSuffix: true });
+  const connection = await openDaemon({ ...setup.daemon });
+  t.after(() => connection.close());
+  const result = await connection.request('turn/start', { threadId: 'x' }, { mutating: true });
+  assert.equal(result.turn.id, 'turn-started');
+  await assert.rejects(() => connection.request('thread/list', {}), /closed|reserved bits/);
+  assert.equal(setup.requests().filter(request => request.method === 'turn/start').length, 1);
+});
+
 test('closing the connection settles a pending request instead of leaving it hanging', async t => {
   const setup = await fakeDaemon(t, { threads: [], silent: 'thread/read' });
   const connection = await openDaemon({ ...setup.daemon });

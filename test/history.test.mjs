@@ -137,12 +137,6 @@ for (const entrypoint of ['claude-desktop', 'cli', 'sdk-cli']) test(`catalog ind
   assert.equal(old.entrypoint, undefined, 'historical metadata must not guess which Claude client ran the session');
   assert.equal(typeof old.last_contact_at, 'number');
   assert.doesNotMatch(JSON.stringify(result), /SECRET_NATIVE_TRANSCRIPT|Do not index subagent|Sent through bridge|senderPid|messagingSocketPath/);
-  const filtered = await listClaudeConversations({ projectsDir, registryDir, stateDir: fixture.stateDir,
-    ownerThreadId: 'catalog-owner', search: 'ARCHIVED' });
-  assert.deepEqual(filtered.conversations.map(value => value.session_id), [oldSession]);
-  const secretSearch = await listClaudeConversations({ projectsDir, registryDir, stateDir: fixture.stateDir,
-    ownerThreadId: 'catalog-owner', search: secret });
-  assert.deepEqual(secretSearch.conversations, []);
 });
 
 test('tail title events and incomplete trailing records have safe fallback behavior', async t => {

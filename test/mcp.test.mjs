@@ -15,9 +15,16 @@ import { CALL_DEADLINE_MS, WRITE_RESERVE_MS } from '../lib/call-time.mjs';
 
 const childWaitMs = CALL_DEADLINE_MS + WRITE_RESERVE_MS;
 const serverPath = fileURLToPath(new URL('../scripts/mcp.mjs', import.meta.url));
-const processStart = process.platform === 'win32'
-  ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${process.pid}).StartTime.ToFileTimeUtc().ToString()`], { encoding: 'utf8', windowsHide: true }).stdout.trim()
-  : String(Date.now());
+const identityServer = fileURLToPath(new URL('./fixtures/mcp-identity-child.mjs', import.meta.url));
+const fixtureStarts = { desktop: '133700000000000000', cli: '133700000000010000' };
+let ownProcessStart;
+function nativeProcessStart(pid) {
+  if (process.platform !== 'win32') return String(Date.now());
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${pid}).StartTime.ToFileTimeUtc().ToString()`], { encoding: 'utf8', windowsHide: true });
+  const start = result.stdout?.trim();
+  assert.ok(result.status === 0 && /^\d+$/.test(start ?? ''), 'Native fixture creation time was unavailable');
+  return start;
+}
 const windowsOnly = { skip: process.platform !== 'win32' && 'Native Claude registry uses Windows process identity.' };
 const metadata = threadId => ({ 'x-codex-turn-metadata': { thread_id: threadId } });
 
@@ -30,8 +37,14 @@ function startMcp(t, env = {}, { parentProxy = false, server = serverPath } = {}
     'CLAUDE_CODEX_BRIDGE_SSH_HOST', 'CLAUDE_CODEX_BRIDGE_CODEX_BIN']) delete childEnv[name];
   Object.assign(childEnv, env);
   const args = parentProxy
-    ? ['-e', 'const {spawn}=require("node:child_process"); const child=spawn(process.execPath,[process.argv[1]],{stdio:"inherit",windowsHide:true}); child.on("exit",code=>process.exit(code??1));', serverPath]
+    ? ['-e', 'const {spawn}=require("node:child_process"); const child=spawn(process.execPath,[process.argv[1]],{stdio:"inherit",windowsHide:true}); child.on("exit",code=>process.exit(code??1));', server]
     : [server];
+  const identityMode = env.FIXTURE_IDENTITY_MODE === 'native' ? 'native' : 'fixture';
+  const caller = ['codex', 'desktop', 'cli'].includes(env.FIXTURE_CALLER) ? env.FIXTURE_CALLER : 'unknown';
+  const identityCase = server === identityServer ? `${identityMode}/${caller}` : null;
+  const started = performance.now();
+  const identityFailure = (category, since = started) =>
+    new Error(`C5 identity ${identityCase} ${category} ${Math.round(performance.now() - since)}ms`);
   const child = spawn(process.execPath, args, { env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   let stderr = '';
   let buffer = '';
@@ -69,9 +82,10 @@ function startMcp(t, env = {}, { parentProxy = false, server = serverPath } = {}
     }
     pending.clear();
   }
-  child.on('error', rejectPending);
-  child.on('close', (code, signal) => rejectPending(new Error(`MCP exited (${code ?? signal}): ${stderr}`)));
-  child.stdin.on('error', rejectPending);
+  child.on('error', error => rejectPending(identityCase ? identityFailure('spawn-error') : error));
+  child.on('close', (code, signal) => rejectPending(identityCase
+    ? identityFailure('exit') : new Error(`MCP exited (${code ?? signal}): ${stderr}`)));
+  child.stdin.on('error', error => rejectPending(identityCase ? identityFailure('stdin-error') : error));
   function notify(method, params = {}) {
     if (stopped) throw stopped;
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`);
@@ -80,9 +94,10 @@ function startMcp(t, env = {}, { parentProxy = false, server = serverPath } = {}
     if (stopped) return Promise.reject(stopped);
     return new Promise((resolve, reject) => {
       const id = nextId++;
+      const requested = performance.now();
       const timer = setTimeout(() => {
         pending.delete(id);
-        reject(new Error(`MCP ${method} timed out: ${stderr}`));
+        reject(identityCase ? identityFailure('timeout', requested) : new Error(`MCP ${method} timed out: ${stderr}`));
       }, childWaitMs);
       pending.set(id, { resolve, reject, timer });
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
@@ -418,7 +433,7 @@ test('unknown, malformed, completed, and initialization cancellations do not can
   assert.ok(signals.every(signal => !signal.aborted));
 });
 
-async function setupMcp(t, { envThreadId, entrypoint = 'claude-desktop', holdFirstNotification = false, rejectedContextIds = [] } = {}) {
+async function setupMcp(t, { envThreadId, entrypoint = 'claude-desktop', holdFirstNotification = false, rejectedContextIds = [], identityMode } = {}) {
   const fixture = await nativeFixture(t);
   const claude = await mockPipe(t);
   const notifications = [];
@@ -466,6 +481,7 @@ async function setupMcp(t, { envThreadId, entrypoint = 'claude-desktop', holdFir
   const sessionId = randomUUID();
   const token = randomUUID().replaceAll('-', '');
   const pidDomain = `win32:${os.hostname().toLowerCase()}`;
+  const processStart = identityMode === 'fixture' ? fixtureStarts.desktop : (ownProcessStart ??= nativeProcessStart(process.pid));
   const record = { pid: process.pid, sessionId, name: 'Claude MCP test', cwd: fixture.cwd, entrypoint, procStart: processStart, pidDomain, messagingSocketPath: claude.pipePath };
   fs.writeFileSync(path.join(registryDir, `${process.pid}.json`), JSON.stringify(record));
   const keyHash = createHash('sha256').update(claude.pipePath.toLowerCase()).digest('hex');
@@ -479,9 +495,11 @@ async function setupMcp(t, { envThreadId, entrypoint = 'claude-desktop', holdFir
     CLAUDE_CONFIG_DIR: path.join(fixture.root, 'claude-config'),
     ...(envThreadId ? { CODEX_THREAD_ID: envThreadId } : {}),
   };
-  const client = startMcp(t, env, { parentProxy: true });
+  const probeFile = identityMode && path.join(fixture.root, 'process-proofs.json');
+  const client = identityMode ? startIdentityMcp(t, env, { identityMode, probeFile, caller: 'codex', parentProxy: true })
+    : startMcp(t, env, { parentProxy: true });
   await initialize(client);
-  return { ...fixture, registryDir, sessionId, token, claude, codex, notifications, catalogCalls, codexChats, env, client,
+  return { ...fixture, registryDir, sessionId, token, claude, codex, notifications, catalogCalls, codexChats, env, client, probeFile,
     firstNotification, releaseFirstNotification() { releaseHeldNotification?.(); releaseHeldNotification = undefined; } };
 }
 
@@ -489,8 +507,7 @@ function claudeEnv(setup) {
   return { CLAUDE_CODEX_BRIDGE_STATE_DIR: setup.stateDir, CLAUDE_CODEX_BRIDGE_REGISTRY_DIR: setup.registryDir };
 }
 
-function registerClaudeParent(setup, parentPid, socketPath, entrypoint = 'claude-desktop') {
-  const procStart = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${parentPid}).StartTime.ToFileTimeUtc().ToString()`], { encoding: 'utf8', windowsHide: true }).stdout.trim();
+function registerClaudeParent(setup, parentPid, socketPath, entrypoint = 'claude-desktop', procStart = nativeProcessStart(parentPid)) {
   const sessionId = randomUUID();
   const pidDomain = `win32:${os.hostname().toLowerCase()}`;
   const record = { pid: parentPid, sessionId, name: 'Different Claude MCP parent', cwd: setup.cwd, entrypoint, procStart, pidDomain, messagingSocketPath: socketPath };
@@ -593,6 +610,15 @@ test('a server started through a folder link keeps the code it started with when
   assert.equal(diagnostics.plugin_version, running);
   assert.deepEqual(diagnostics.issues.find(issue => issue.check === 'plugin_version'), { check: 'plugin_version', status: 'warning', reason: 'version_mismatch' });
   assert.match(diagnostics.checks.find(check => check.name === 'plugin_version').detail, /99\.0\.0 is installed, but this server still runs/);
+  assert.match(diagnostics.checks.find(check => check.name === 'plugin_version').detail, /Ask which client/);
+});
+
+test('a cached server checks its pinned installer stage and names the verified Codex CLI update action', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-stage-check-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, 'config')); fs.writeFileSync(path.join(dir, 'config/plugin-source.json'), JSON.stringify({ version: '99.0.1' }));
+  const client = startMcp(t, { CLAUDE_CODEX_BRIDGE_INSTALL_ROOT: dir }); await initialize(client);
+  const doctor = toolValue(await callTool(client, 'bridge_doctor', {}, metadata('synthetic-terminal')));
+  assert.equal(doctor.client, 'codex-terminal'); assert.match(doctor.checks.find(check => check.name === 'plugin_version').detail, /Restart this Codex CLI session/);
 });
 
 test('a rejected direct Desktop caller receives doctor registration advice through MCP', async t => {
@@ -921,25 +947,66 @@ test('a v0.1.0 pairing record cannot constrain direct sends or leak into new sta
   assert.equal(setup.claude.messages.filter(entry => entry.message.type === 'user').length, 1);
 });
 
-test('two Codex tasks can address simultaneous Claude Desktop and CLI sessions without confusing their identities', windowsOnly, async t => {
-  const setup = await setupMcp(t);
-  const peerA = startMcp(t, claudeEnv(setup));
+function startIdentityMcp(t, env, { identityMode, probeFile, caller, parentProxy = false }) {
+  const peer = startMcp(t, { ...env, FIXTURE_PROBE_FILE: probeFile, FIXTURE_IDENTITY_MODE: identityMode, FIXTURE_CALLER: caller },
+    { server: identityServer, parentProxy });
+  if (identityMode === 'native') t.after(() => {
+    const safeProof = /^C5 proof (?:codex-[ab]|desktop|cli) (?:desktop|cli|unknown) call\d+ proof\d+ attempt\d+ (?:answered|missing|inconclusive|timeout|aborted|unavailable) \d+ms$/;
+    for (const line of peer.stderr().split(/\r?\n/)) if (safeProof.test(line)) t.diagnostic(line);
+  });
+  return peer;
+}
+
+async function setupIdentityMcp(t, identityMode) {
+  const setup = await setupMcp(t, { identityMode });
+  const options = { identityMode, probeFile: setup.probeFile };
+  const peerA = startIdentityMcp(t, claudeEnv(setup), { ...options, caller: 'desktop' });
   await initialize(peerA);
   const claudeB = await mockPipe(t);
-  const peerB = startMcp(t, { ...claudeEnv(setup), CLAUDE_CODE_SESSION_ID: setup.sessionId }, { parentProxy: true });
-  const sessionB = registerClaudeParent(setup, peerB.child.pid, claudeB.pipePath, 'cli');
+  const peerB = startIdentityMcp(t, { ...claudeEnv(setup), CLAUDE_CODE_SESSION_ID: setup.sessionId },
+    { ...options, caller: 'cli', parentProxy: true });
+  const sessionB = registerClaudeParent(setup, peerB.child.pid, claudeB.pipePath, 'cli',
+    identityMode === 'fixture' ? fixtureStarts.cli : undefined);
+  fs.writeFileSync(setup.probeFile, JSON.stringify({
+    [process.pid]: { id: 'desktop', start: fixtureStarts.desktop },
+    [peerB.child.pid]: { id: 'cli', start: fixtureStarts.cli },
+  }));
   await initialize(peerB);
+  return { setup, peerA, peerB, claudeB, sessionB };
+}
 
+function identityToolValue(response) {
+  assert.ok(!isToolFailure(response), 'Fixture identity tool call did not succeed');
+  return toolValue(response);
+}
+
+test('native process proof distinguishes the simultaneous Claude Desktop and CLI parents and targets', windowsOnly, async t => {
+  const { setup, peerA, peerB, claudeB, sessionB } = await setupIdentityMcp(t, 'native');
+  for (const [peer, sessionId] of [[peerA, setup.sessionId], [peerB, sessionB]]) {
+    const status = identityToolValue(await callTool(peer, 'list_deliveries'));
+    assert.equal(status.application, 'claude');
+    assert.ok(status.sender_id === sessionId, 'Caller must match the registered direct parent');
+  }
+  // Cover both native target proofs (resolve and pre-write) without a cross-product of deliveries.
+  for (const [sessionId, threadId] of [[setup.sessionId, 'codex-target-a'], [sessionB, 'codex-target-b']]) {
+    identityToolValue(await callTool(setup.client, 'send_to_claude', { session_id: sessionId, message: 'Fixture native proof.' }, metadata(threadId)));
+  }
+  assert.equal(setup.claude.messages.filter(entry => entry.message.type === 'user').length, 1);
+  assert.equal(claudeB.messages.filter(entry => entry.message.type === 'user').length, 1);
+});
+
+test('two Codex tasks can address simultaneous Claude Desktop and CLI sessions without confusing their identities', windowsOnly, async t => {
+  const { setup, peerA, peerB, claudeB, sessionB } = await setupIdentityMcp(t, 'fixture');
   for (const codexId of ['codex-target-a', 'codex-target-b']) {
     for (const claudeId of [setup.sessionId, sessionB]) {
-      toolValue(await callTool(setup.client, 'send_to_claude', {
+      identityToolValue(await callTool(setup.client, 'send_to_claude', {
         session_id: claudeId, message: `From ${codexId} to ${claudeId}.`, message_id: 'same-per-target-id',
       }, metadata(codexId)));
     }
   }
   for (const [peer, claudeId] of [[peerA, setup.sessionId], [peerB, sessionB]]) {
     for (const codexId of ['codex-target-a', 'codex-target-b']) {
-      toolValue(await callTool(peer, 'send_to_codex', {
+      identityToolValue(await callTool(peer, 'send_to_codex', {
         thread_id: codexId, message: `From ${claudeId} to ${codexId}.`, message_id: 'same-per-target-id',
       }));
     }
@@ -955,22 +1022,22 @@ test('two Codex tasks can address simultaneous Claude Desktop and CLI sessions w
   ]);
   for (const codexId of ['codex-target-a', 'codex-target-b']) {
     assert.ok([...deliveriesA, ...deliveriesB].some(entry => entry.message.message.content.includes(`From Codex Desktop task "${codexId}"; bridge message`)));
-    const status = toolValue(await callTool(setup.client, 'list_deliveries', {}, metadata(codexId)));
+    const status = identityToolValue(await callTool(setup.client, 'list_deliveries', {}, metadata(codexId)));
     assert.equal(status.deliveries.length, 2);
     assert.ok(status.deliveries.every(message => message.from.app === 'codex' && message.from.id === codexId));
   }
   for (const [peer, claudeId, otherId] of [[peerA, setup.sessionId, sessionB], [peerB, sessionB, setup.sessionId]]) {
-    const status = toolValue(await callTool(peer, 'list_deliveries'));
-    assert.equal(status.sender_id, claudeId);
+    const status = identityToolValue(await callTool(peer, 'list_deliveries'));
+    assert.ok(status.sender_id === claudeId, 'Ledger owner must match the fixture caller');
     assert.equal(status.deliveries.length, 2);
     assert.ok(status.deliveries.every(message => message.from.app === 'claude' && message.from.id === claudeId));
-    assert.doesNotMatch(JSON.stringify(status), new RegExp(`From ${otherId} to`));
+    assert.ok(!JSON.stringify(status).includes(`From ${otherId} to`), 'Ledger must not contain the other caller’s text');
   }
   for (const [index, call] of setup.notifications.entries()) {
     const label = index < 2 ? 'Claude Desktop' : 'Claude Code CLI';
     const id = index < 2 ? setup.sessionId : sessionB;
     assert.ok(call.arguments.prompt.startsWith(`[From ${label} session ${JSON.stringify(id)}; bridge message`));
-    assert.doesNotMatch(call.arguments.prompt, /context only/);
+    assert.ok(!call.arguments.prompt.includes('context only'), 'Direct deliveries must not use the context-only envelope');
   }
 });
 

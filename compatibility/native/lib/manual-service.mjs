@@ -76,6 +76,13 @@ function interrupted(record) {
     (record.writer_id === writerId && !active.has(record.attempt_id));
 }
 
+// For an overflow shadow, interruption evidence comes from the writer of the notice.
+function markInterruptedNotice(record, attempt = record) {
+  if (record.notice_status === 'pending' && record.notice_attempted && interrupted(attempt)) {
+    record.notice_status = 'uncertain'; record.notice_retryable = false;
+  }
+}
+
 function pendingReceipt(paths, record) {
   const receipt = record.writer_id === writerId && record.sender_pid === process.pid && receipts.get(record.attempt_id);
   return receipt && receipt.owner === paths.threadId && receipt.session === record.session_id &&
@@ -98,9 +105,7 @@ function project(paths, record, legacy) {
     for (const field of ['notice_status', 'notice_attempted', 'notice_reason', 'notice_error']) visible[field] = oldNotice[field];
     visible.notice_retryable = false; // A 1.1 overflow record cannot claim this 1.0.x notice slot.
   }
-  if (visible.notice_status === 'pending' && visible.notice_attempted && interrupted(oldNotice ?? visible)) {
-    visible.notice_status = 'uncertain'; visible.notice_retryable = false;
-  }
+  markInterruptedNotice(visible, oldNotice ?? visible);
   if (unclaimedNotice(visible)) visible.notice_retryable = true;
   return visible;
 }
@@ -247,7 +252,7 @@ function validatePrimary(message, fingerprint) {
   if (message && message.fingerprint !== fingerprint) {
     throw failure('This manual message_id already belongs to another recipient or message text.', 'id_conflict', { record: message });
   }
-  if (message && message.manual !== true && message.origin !== 'manual') {
+  if (message && message.manual !== true) {
     throw failure(`This message_id was already used by an automatic send (status: ${message.status}). Check that delivery with list_deliveries before sending again; use a new message_id only for a deliberately new message.`,
       'id_conflict', { record: message });
   }
@@ -294,9 +299,7 @@ function reconcile(paths, record, message, attempts) {
     if (message && ['failed', 'uncertain'].includes(message.status)) record.send_status = message.status;
     else if (interrupted(record)) record.send_status = 'uncertain';
   }
-  if (record.notice_status === 'pending' && record.notice_attempted && interrupted(record)) {
-    record.notice_status = 'uncertain'; record.notice_retryable = false;
-  }
+  markInterruptedNotice(record);
   return record;
 }
 
@@ -453,8 +456,8 @@ async function doRetryManualNotice(args, context, attempts) {
   try {
     await updateManualEntry(paths, key, entry => {
       const record = checked(entry, key, paths);
-      if (!record || record.send_status !== 'submitted' || (message && (message.fingerprint !== record.fingerprint ||
-          (message.manual !== true && message.origin !== 'manual')))) throw new Error(confirmed);
+      if (!record || record.send_status !== 'submitted' ||
+          (message && (message.fingerprint !== record.fingerprint || message.manual !== true))) throw new Error(confirmed);
       const text = record.message ?? message?.message;
       if (text === undefined || fingerprintFor(route, text) !== record.fingerprint) throw new Error(confirmed);
       if (!unclaimedNotice(record) && (record.overflow || record.notice_status !== 'failed' || record.notice_retryable !== true)) {

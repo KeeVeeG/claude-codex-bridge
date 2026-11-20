@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
-import { PLUGIN_NAME, PORTABLE_RUNTIME_FILES, checkManifests, nativeBundleEntries } from './manifests.mjs';
+import { isMainModule } from '../lib/entry-point.mjs';
+import { PLUGIN_NAME, PORTABLE_RUNTIME_FILES, checkManifests, nativeBundleEntries, runtimePackageJson } from './manifests.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const catalogName = 'keeveeg';
@@ -98,6 +99,7 @@ export function buildPackages({ sourceRoot = root, outputDir = path.join(root, '
   const source = fs.realpathSync(sourceRoot);
   const destination = path.resolve(outputDir);
   const bundle = checkManifests(source);
+  if (bundle.native) throw new Error('Build release packages from a clean source checkout, not the native runtime.');
   const version = bundle.manifest.version;
   if (!/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(version)) throw new Error('Release version must not contain a local build suffix');
   fs.mkdirSync(destination, { recursive: true });
@@ -114,7 +116,8 @@ export function buildPackages({ sourceRoot = root, outputDir = path.join(root, '
       const realRelative = path.relative(source, real);
       if (!fs.lstatSync(filename).isFile() || !realRelative || realRelative === '..' ||
           realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) throw new Error(`Invalid runtime entry: ${relative}`);
-      put(safeChild(portable, relative), fs.readFileSync(filename));
+      put(safeChild(portable, relative), relative === 'package.json'
+        ? json(runtimePackageJson(bundle.packageJson)) : fs.readFileSync(filename));
     }
     const codexCatalog = { name: catalogName, interface: { displayName: 'Claude–Codex Bridge' }, plugins: [{
       name: PLUGIN_NAME, source: { source: 'local', path: `./plugins/${PLUGIN_NAME}` },
@@ -155,8 +158,7 @@ export function buildPackages({ sourceRoot = root, outputDir = path.join(root, '
   }
 }
 
-// Node resolves the entry module through links (macOS /tmp is /private/tmp), so compare real paths.
-if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isMainModule(import.meta.url)) {
   try { console.log(JSON.stringify(buildPackages(), null, 2)); }
   catch (error) { console.error(error.message); process.exitCode = 1; }
 }

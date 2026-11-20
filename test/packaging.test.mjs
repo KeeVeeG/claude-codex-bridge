@@ -4,10 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { prepareInstallation } from '../scripts/install.mjs';
 import { buildPackages, zipEntries } from '../scripts/package.mjs';
 import { PLUGIN_NAME, PLUGIN_SCHEMA, MCP_SCHEMA, PORTABLE_RUNTIME_FILES, NATIVE_RUNTIME_FILES,
-  checkManifests, syncManifests, validateCanonical } from '../scripts/manifests.mjs';
+  checkManifests, compatibilityFiles, syncManifests, validateCanonical } from '../scripts/manifests.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const work = path.join(root, 'work');
@@ -35,6 +36,14 @@ function copySource(t) {
   }
   syncManifests(source);
   return { directory, source };
+}
+
+function isolatedEnv(directory) {
+  const env = Object.fromEntries(['SystemRoot', 'SystemDrive', 'WINDIR', 'COMSPEC', 'PATHEXT', 'PATH']
+    .filter(name => process.env[name]).map(name => [name, process.env[name]]));
+  return { ...env, USERPROFILE: directory, HOME: directory, LOCALAPPDATA: directory, APPDATA: directory,
+    TMPDIR: directory, TEMP: directory, TMP: directory, CLAUDE_CONFIG_DIR: path.join(directory, 'claude'),
+    CODEX_HOME: path.join(directory, 'codex'), CLAUDE_CODEX_BRIDGE_DAEMON: 'off' };
 }
 
 function unzipStored(buffer) {
@@ -112,7 +121,7 @@ test('packaging stops on manifest identity/version drift or generated native run
     ['package version', 'package.json', value => { value.version = '99.0.0'; }],
     ['Claude identity', '.claude-plugin/plugin.json', value => { value.name = 'another-plugin'; }],
     ['Codex command', '.codex-plugin/plugin.json', value => { value.mcpServers[PLUGIN_NAME].args = ['./unreviewed.mjs']; }],
-    ['Claude command', '.mcp.json', value => { value.mcpServers[PLUGIN_NAME].command = 'unreviewed'; }],
+    ['Claude command', '.claude-plugin/plugin.json', value => { value.mcpServers[PLUGIN_NAME].command = 'unreviewed'; }],
   ]) {
     await t.test(name, sub => {
       const { directory, source } = copySource(sub);
@@ -151,7 +160,9 @@ test('release ZIPs contain exactly the native or portable allowlist and reproduc
   assert.equal(native.has('mcp.json'), false);
   assert.equal(JSON.parse(native.get('config/plugin-source.json').toString()).version, first.version);
   assert.equal(JSON.parse(native.get('config/plugin-source.json').toString()).name, 'bridge-claude-codex');
-  assert.equal(JSON.parse(native.get('package.json').toString()).name, 'claude-codex-bridge');
+  const nativePackage = JSON.parse(native.get('package.json'));
+  assert.equal(nativePackage.name, 'claude-codex-bridge');
+  assert.equal(nativePackage.scripts, undefined, 'runtime does not advertise source-only commands');
   const marketplace = unzipStored(fs.readFileSync(first.archives[1]));
   assert.deepEqual([...marketplace.keys()].sort(), [
     '.agents/plugins/marketplace.json', '.claude-plugin/marketplace.json',
@@ -163,8 +174,187 @@ test('release ZIPs contain exactly the native or portable allowlist and reproduc
   assert.deepEqual([...portable.keys()].sort(), [...PORTABLE_RUNTIME_FILES].sort());
   assert.equal(JSON.parse(portable.get('plugin.json').toString()).version, first.version);
   assert.equal(JSON.parse(portable.get('mcp.json').toString()).mcpServers[PLUGIN_NAME].type, 'stdio');
+  assert.equal(JSON.parse(portable.get('package.json')).scripts, undefined);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(source, 'package.json'))).scripts.package, 'node scripts/package.mjs');
+  assert.equal(native.has('.mcp.json'), false);
+  assert.equal(portable.has('.mcp.json'), false);
   const sums = fs.readFileSync(first.sha256, 'utf8').trim().split('\n');
   assert.deepEqual(sums, first.archives.map(filename => `${createHash('sha256').update(fs.readFileSync(filename)).digest('hex')}  ${path.basename(filename)}`));
+});
+
+test('Claude MCP is plugin-only and forwards nonsecret context with supported env mappings', () => {
+  assert.equal(fs.existsSync(path.join(root, '.mcp.json')), false);
+  const { files, manifest } = checkManifests(root);
+  const claude = files['.claude-plugin/plugin.json'].mcpServers[PLUGIN_NAME];
+  assert.deepEqual(claude.args, ['${CLAUDE_PLUGIN_ROOT}/scripts/mcp.mjs', `--plugin-version=${manifest.version}`]);
+  assert.equal(claude.env_vars, undefined);
+  for (const name of ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODEX_BRIDGE_REGISTRY_DIR', 'CODEX_HOME',
+    'CLAUDE_CODEX_BRIDGE_CODEX_BIN', 'CLAUDE_CODEX_BRIDGE_DAEMON', 'CLAUDE_CODEX_BRIDGE_SSH_HOST',
+    'CLAUDE_CODEX_BRIDGE_STATE_DIR', 'CLAUDE_CODE_MESSAGING_SOCKET']) {
+    assert.equal(claude.env[name], '${' + name + ':-}');
+  }
+  assert.doesNotMatch(JSON.stringify(claude), /TOKEN|PASSWORD|API_KEY/);
+});
+
+test('publication metadata permits only bundled asset references and reviewed public links', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'plugin.json')));
+  const mcp = JSON.parse(fs.readFileSync(path.join(root, 'mcp.json')));
+  assert.doesNotThrow(() => validateCanonical(manifest, mcp));
+  const marker = 'synthetic-private';
+  for (const [field, value] of [
+    ['logo', `/${marker}/logo.svg`],
+    ['logoDark', `C:\\${marker}\\logo.svg`],
+    ['composerIcon', `\\\\${marker}\\share\\logo.svg`],
+    ['composerIconDark', './../assets/bridge-dark.svg'],
+    ['logo', './assets/not-bundled.svg'],
+    ['logo', './scripts/mcp.mjs'],
+    ['logo', 'https://example.invalid/logo.svg'],
+    ['screenshots', [`/${marker}/screenshot.png`]],
+    ['displayName', { path: `/${marker}/name` }],
+    ['defaultPrompt', [{ path: `/${marker}/prompt` }]],
+    ['websiteURL', `file:///${marker}/index.html`],
+    ['supportURL', `https://localhost/${marker}`],
+    ['privacyPolicyURL', `https://github.com/${marker}/privacy`],
+    ['termsOfServiceURL', `${manifest.extensions['com.openai'].interface.termsOfServiceURL}?token=${marker}`],
+  ]) {
+    const candidate = structuredClone(manifest);
+    candidate.extensions['com.openai'].interface[field] = value;
+    assert.throws(() => validateCanonical(candidate, mcp), error =>
+      /interface/.test(error.message) && !error.message.includes(marker), field);
+  }
+  for (const mutate of [
+    value => { value.extensions[marker] = { path: `/${marker}/source` }; },
+    value => { value.extensions['com.openai'].path = `/${marker}/source`; },
+    value => { value.homepage = `/${marker}/index.html`; },
+    value => { value.repository = `https://${marker}.example.invalid/repo`; },
+    value => { value.author.url = `file:///${marker}/author`; },
+  ]) {
+    const candidate = structuredClone(manifest);
+    mutate(candidate);
+    assert.throws(() => validateCanonical(candidate, mcp), error =>
+      /extensions|homepage|repository|author\.url/.test(error.message) && !error.message.includes(marker));
+  }
+});
+
+test('publication gates reject even an aligned native adapter with a private logo path', t => {
+  const source = fixture(t);
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'plugin.json')));
+  const mcp = JSON.parse(fs.readFileSync(path.join(root, 'mcp.json')));
+  const adapters = compatibilityFiles(manifest, mcp);
+  const marker = 'synthetic-private';
+  const logo = `C:\\${marker}\\logo.svg`;
+  for (const [relative, value] of Object.entries({ ...adapters, 'config/plugin-source.json': manifest,
+    'config/mcp-source.json': mcp, 'package.json': { name: 'claude-codex-bridge', version: manifest.version } })) {
+    const filename = path.join(source, relative);
+    fs.mkdirSync(path.dirname(filename), { recursive: true });
+    fs.writeFileSync(filename, json(value));
+  }
+  const configPath = path.join(source, 'config/mcp-source.json');
+  const configuredMcp = structuredClone(mcp);
+  const env = { CODEX_HOME: `C:\\${marker}\\codex` };
+  configuredMcp.mcpServers[PLUGIN_NAME].env = env;
+  fs.writeFileSync(configPath, json(configuredMcp));
+  assert.deepEqual(checkManifests(source, { allowConfiguredSource: true }).mcp.mcpServers[PLUGIN_NAME].env, env);
+  assert.throws(() => checkManifests(source), /release MCP environment/);
+  fs.writeFileSync(configPath, json(mcp));
+
+  manifest.extensions['com.openai'].interface.logo = logo;
+  adapters['.codex-plugin/plugin.json'].interface.logo = logo;
+  fs.writeFileSync(path.join(source, 'config/plugin-source.json'), json(manifest));
+  fs.writeFileSync(path.join(source, '.codex-plugin/plugin.json'), json(adapters['.codex-plugin/plugin.json']));
+  const rejectsLogo = error => /interface\.logo/.test(error.message) && !error.message.includes(marker);
+  assert.throws(() => checkManifests(source), rejectsLogo);
+  assert.throws(() => syncManifests(source), rejectsLogo); // Native-source fixture: no generated mirror.
+  for (const [relative, value] of Object.entries(adapters)) {
+    assert.equal(fs.readFileSync(path.join(source, relative), 'utf8'), json(value));
+  }
+  fs.writeFileSync(path.join(source, 'plugin.json'), json(manifest));
+  fs.writeFileSync(path.join(source, 'mcp.json'), json(mcp));
+  const outputDir = path.join(source, 'output');
+  assert.throws(() => buildPackages({ sourceRoot: source, outputDir }), rejectsLogo);
+  assert.equal(fs.existsSync(outputDir), false);
+});
+
+test('release gates reject private canonical env before writing or echoing it; local install may read path overrides', t => {
+  const { directory, source } = copySource(t);
+  const serverFile = path.join(source, 'mcp.json');
+  const mcp = JSON.parse(fs.readFileSync(serverFile));
+  const server = mcp.mcpServers[PLUGIN_NAME];
+  const marker = 'synthetic-private-marker';
+  const adapter = path.join(source, '.claude-plugin/plugin.json');
+  const before = fs.readFileSync(adapter);
+  server.env = { CLAUDE_CODEX_BRIDGE_STATE_DIR: path.join(directory, marker, 'state') };
+  fs.writeFileSync(serverFile, json(mcp));
+  const local = checkManifests(source, { checkNative: false, allowConfiguredSource: true });
+  assert.deepEqual(local.mcp.mcpServers[PLUGIN_NAME].env, server.env);
+  const prepared = prepareInstallation({ sourceRoot: source, homeDir: path.join(directory, 'profile'), env: {}, codex: false });
+  assert.equal(prepared.stateDir, server.env.CLAUDE_CODEX_BRIDGE_STATE_DIR);
+  for (const name of ['.codex-plugin/plugin.json', '.claude-plugin/plugin.json']) {
+    const launch = JSON.parse(fs.readFileSync(path.join(prepared.destination, name))).mcpServers[PLUGIN_NAME];
+    assert.equal(launch.env.CLAUDE_CODEX_BRIDGE_STATE_DIR, prepared.stateDir);
+  }
+  const outputDir = path.join(directory, 'output');
+  for (const action of [() => checkManifests(source), () => syncManifests(source), () => buildPackages({ sourceRoot: source, outputDir })]) {
+    assert.throws(action, error => /release.*MCP environment/i.test(error.message) && !error.message.includes(marker));
+  }
+  assert.deepEqual(fs.readFileSync(adapter), before);
+  assert.equal(fs.existsSync(outputDir), false);
+  for (const env of [{ CLAUDE_CODE_MESSAGING_TOKEN: marker }, { CODEX_HOME: '${ANTHROPIC_API_KEY}' }]) {
+    server.env = env;
+    fs.writeFileSync(serverFile, json(mcp));
+    assert.throws(() => checkManifests(source, { checkNative: false, allowConfiguredSource: true }),
+      error => /local MCP environment/i.test(error.message) && !error.message.includes(marker));
+  }
+  fs.writeFileSync(serverFile, `{"env":"${marker}`);
+  assert.throws(() => checkManifests(source), error => /Invalid JSON.*mcp\.json/.test(error.message) && !error.message.includes(marker));
+});
+
+test('release gates refuse env overrides in native source adapters without replacing them', t => {
+  const { directory, source } = copySource(t);
+  for (const file of ['.claude-plugin/plugin.json', '.codex-plugin/plugin.json', 'compatibility/native/config/mcp-source.json']) {
+    const filename = path.join(source, file);
+    const before = fs.readFileSync(filename);
+    const config = JSON.parse(before);
+    config.mcpServers[PLUGIN_NAME].env = { CLAUDE_CODEX_BRIDGE_SSH_HOST: 'synthetic-private-alias' };
+    const privateConfig = json(config);
+    fs.writeFileSync(filename, privateConfig);
+    const outputDir = path.join(directory, 'output');
+    for (const action of [() => checkManifests(source), () => syncManifests(source), () => buildPackages({ sourceRoot: source, outputDir })]) {
+      assert.throws(action, error => /differs|release MCP environment/.test(error.message) && !error.message.includes('synthetic-private'));
+    }
+    assert.equal(fs.readFileSync(filename, 'utf8'), privateConfig);
+    assert.equal(fs.existsSync(outputDir), false);
+    fs.writeFileSync(filename, before);
+  }
+});
+
+test('a root project MCP file blocks release rather than being read or overwritten', t => {
+  const { source } = copySource(t);
+  const projectMcp = path.join(source, '.mcp.json');
+  fs.writeFileSync(projectMcp, 'synthetic-private-project-config');
+  for (const action of [() => checkManifests(source), () => syncManifests(source)]) {
+    assert.throws(action, error => /root \.mcp\.json/.test(error.message) && !error.message.includes('synthetic-private'));
+  }
+  assert.equal(fs.readFileSync(projectMcp, 'utf8'), 'synthetic-private-project-config');
+});
+
+test('manifest and package commands run through a linked entry with preserve-symlinks-main', t => {
+  const { directory, source } = copySource(t);
+  fs.copyFileSync(path.join(root, 'scripts/package.mjs'), path.join(source, 'scripts/package.mjs'));
+  const link = path.join(directory, 'linked source');
+  fs.symlinkSync(source, link, process.platform === 'win32' ? 'junction' : 'dir');
+  for (const [script, args, output] of [['manifests.mjs', ['--check'], /are aligned/], ['package.mjs', [], /"archives"/]]) {
+    const entry = path.join(link, 'scripts', script);
+    const launch = spawnSync(process.execPath, ['--preserve-symlinks-main', entry, ...args],
+      { cwd: directory, encoding: 'utf8', timeout: 15_000, windowsHide: true });
+    assert.equal(launch.status, 0, launch.stderr);
+    assert.match(launch.stdout, output);
+    const imported = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `await import(${JSON.stringify(new URL(`./scripts/${script}`, pathToFileURL(`${link}${path.sep}`)).href)});`, 'nonexistent-entry'],
+    { cwd: directory, encoding: 'utf8', timeout: 15_000, windowsHide: true });
+    assert.equal(imported.status, 0, imported.stderr);
+    assert.equal(imported.stdout, '');
+  }
 });
 
 test('ZIP writer rejects duplicate names and paths that escape the archive root', () => {
@@ -190,9 +380,7 @@ test('portable archive expands PLUGIN_ROOT to a cached Unicode installation and 
   fs.mkdirSync(unrelated); fs.mkdirSync(dataDirectory);
   const expand = value => value.replace(/\$\{PLUGIN_(ROOT|DATA)\}/g, (_, name) => name === 'ROOT' ? cache : dataDirectory);
   assert.equal(expand(config.cwd), cache);
-  const env = { ...process.env, PLUGIN_ROOT: cache, PLUGIN_DATA: dataDirectory, USERPROFILE: directory, HOME: directory };
-  for (const key of ['CODEX_APP_TOOLS_PIPE_PATH', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET',
-    'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODEX_BRIDGE_STATE_DIR', 'CLAUDE_CODEX_BRIDGE_REGISTRY_DIR']) delete env[key];
+  const env = { ...isolatedEnv(directory), PLUGIN_ROOT: cache, PLUGIN_DATA: dataDirectory };
   const child = spawn(config.command, config.args.map(expand), { cwd: unrelated, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill(); });
   const result = await new Promise((resolve, reject) => {
@@ -215,18 +403,49 @@ test('portable archive expands PLUGIN_ROOT to a cached Unicode installation and 
   assert.equal(fs.existsSync(path.join(directory, '.local/share', 'claude-codex-bridge')), false, 'probe must not register a real app endpoint');
 });
 
-test('the generated native runtime starts and answers initialize, so every imported module is packaged', () => {
-  const script = fileURLToPath(new URL('../compatibility/native/scripts/mcp.mjs', import.meta.url));
+function probeInitialize(command, args, { cwd, env }) {
   const request = `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize',
     params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'packaging-test', version: '0' } } })}\n`;
-  const result = spawnSync(process.execPath, [script], { input: request, encoding: 'utf8', timeout: 15000, windowsHide: true });
+  const result = spawnSync(command, args, { cwd, env, input: request, encoding: 'utf8', timeout: 15_000, windowsHide: true });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /"protocolVersion"/);
+  return JSON.parse(result.stdout).result.serverInfo.version;
+}
+
+test('the generated native runtime starts from an unrelated cwd and reports the packaged version', t => {
+  const directory = fixture(t);
+  const script = fileURLToPath(new URL('../compatibility/native/scripts/mcp.mjs', import.meta.url));
+  const version = JSON.parse(fs.readFileSync(path.join(root, 'package.json'))).version;
+  assert.equal(probeInitialize(process.execPath, [script], { cwd: directory, env: isolatedEnv(directory) }), version);
 });
 
-test('the generated native runtime can import the lazily loaded service graph, so every module it needs is packaged', () => {
-  const service = new URL('../compatibility/native/lib/bridge-service.mjs', import.meta.url).href;
-  const result = spawnSync(process.execPath, ['--input-type=module', '-e', `await import(${JSON.stringify(service)});`],
-    { encoding: 'utf8', timeout: 15000, windowsHide: true });
-  assert.equal(result.status, 0, result.stderr);
+test('the native archive installer stages an inline Claude server that starts from an unrelated cwd', t => {
+  const { directory, source } = copySource(t);
+  const built = buildPackages({ sourceRoot: source, outputDir: path.join(directory, 'output') });
+  const unpacked = path.join(directory, 'unpacked plugin café');
+  const profile = path.join(directory, 'synthetic profile');
+  fs.mkdirSync(profile);
+  for (const [relative, data] of unzipStored(fs.readFileSync(built.archives[0]))) {
+    const target = path.join(unpacked, relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, data);
+  }
+  const env = isolatedEnv(profile);
+  const prepared = spawnSync(process.execPath, [path.join(unpacked, 'scripts/install.mjs'), '--claude', '--prepare-only'],
+    { cwd: directory, env, encoding: 'utf8', timeout: 15_000, windowsHide: true });
+  assert.equal(prepared.status, 0, prepared.stderr);
+  const installed = path.join(profile, 'plugins', PLUGIN_NAME);
+  assert.equal(fs.existsSync(path.join(installed, '.mcp.json')), false);
+  const manifest = JSON.parse(fs.readFileSync(path.join(installed, '.claude-plugin/plugin.json')));
+  const server = manifest.mcpServers[PLUGIN_NAME];
+  const expand = value => value.replaceAll('${CLAUDE_PLUGIN_ROOT}', installed)
+    .replace(/\$\{([A-Z_]+):-\}/g, (_, name) => env[name] ?? '');
+  const forwarded = Object.fromEntries(Object.entries(server.env).map(([name, value]) => [name, expand(value)]));
+  assert.match(manifest.version, /\+codex\./);
+  assert.equal(probeInitialize(server.command, server.args.map(expand), { cwd: directory, env: { ...env, ...forwarded } }), manifest.version);
+  const configured = checkManifests(installed, { allowConfiguredSource: true });
+  assert.equal(configured.manifest.version, manifest.version);
+  assert.equal(configured.packageJson.scripts, undefined);
+  const forbiddenOutput = path.join(directory, 'must-not-package');
+  assert.throws(() => buildPackages({ sourceRoot: installed, outputDir: forbiddenOutput }), /release MCP environment/i);
+  assert.throws(() => buildPackages({ sourceRoot: unpacked, outputDir: forbiddenOutput }), /clean source checkout/);
+  assert.equal(fs.existsSync(forbiddenOutput), false);
 });

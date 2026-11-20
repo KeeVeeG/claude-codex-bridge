@@ -5,10 +5,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import test from 'node:test';
 import { canonicalClaudeSocket } from '../lib/claude-sessions.mjs';
 import { executeBridgeTool, shouldReportTerminalUnavailable } from '../lib/bridge-service.mjs';
-import { DaemonUnavailableError, NOT_RUNNING_MESSAGE } from '../lib/codex-daemon.mjs';
+import { DaemonUnavailableError, NOT_RUNNING_MESSAGE, readDaemonVersions } from '../lib/codex-daemon.mjs';
 import { publishCodexHost } from '../lib/codex-host.mjs';
 import { codexPeerContent } from '../lib/codex-peer.mjs';
 import { fakeDaemon, fakeQueue } from './codex-daemon-helpers.mjs';
@@ -349,15 +351,65 @@ claudeTest('bridge_doctor says so when the daemon is reachable but no terminal s
   assert.equal(report.ready, false);
 });
 
+function fixtureVersionExec(t, args, run) {
+  const original = childProcess.execFile;
+  const mock = t.mock.method(childProcess, 'execFile', (file, actualArgs, options, callback) =>
+    file === process.execPath && actualArgs === args ? run(original, options, callback) : original(file, actualArgs, options, callback));
+  syncBuiltinESMExports();
+  t.after(() => { mock.mock.restore(); syncBuiltinESMExports(); });
+}
+
 claudeTest('bridge_doctor warns when the Codex CLI and daemon versions differ and stays quiet when they match', async t => {
   const setup = await claudeCallerSetup(t, { threads: [] });
-  const versions = (cli, server) => ({ command: process.execPath, args: ['-e', `console.log(JSON.stringify({cliVersion:'${cli}',appServerVersion:'${server}'}))`] });
-  const differ = await executeBridgeTool('bridge_doctor', {}, { ...setup.context, daemonVersion: versions('0.160.0', '0.162.1') });
-  const warning = differ.checks.find(check => check.name === 'codex_versions');
-  assert.equal(warning.status, 'warning');
+  const args = [];
+  let reply;
+  let calls = 0;
+  fixtureVersionExec(t, args, (_original, options, callback) => {
+    assert.equal(options.timeout, 2000);
+    calls++;
+    queueMicrotask(() => callback(...reply));
+  });
+  const check = async (error, stdout) => {
+    reply = [error, stdout];
+    const report = await executeBridgeTool('bridge_doctor', {}, { ...setup.context, platform: 'win32',
+      daemonVersion: { command: process.execPath, args } });
+    return report.checks.find(item => item.name === 'codex_versions');
+  };
+  const warning = await check(null, '{"cliVersion":"0.160.0","appServerVersion":"0.162.1"}');
+  assert.equal(warning?.status, 'warning');
   assert.match(warning.detail, /0\.160\.0.*0\.162\.1/);
-  const same = await executeBridgeTool('bridge_doctor', {}, { ...setup.context, daemonVersion: versions('0.162.1', '0.162.1') });
-  assert.equal(same.checks.find(check => check.name === 'codex_versions').status, 'pass');
+  assert.equal((await check(null, '{"cliVersion":"0.162.1","appServerVersion":"0.162.1"}'))?.status, 'pass');
+  assert.equal(await check(null, 'malformed fixture output'), undefined);
+  assert.equal(await check({ killed: true, signal: 'SIGTERM', code: null }, ''), undefined);
+  assert.equal(calls, 4);
+});
+
+test('the fixture CLI version child is observed under the doctor deadline', async t => {
+  const args = ['-e', 'process.stdout.write(\'{"cliVersion":"0.160.0","appServerVersion":"0.162.1"}\')'];
+  let category = 'not-started';
+  fixtureVersionExec(t, args, (original, options, callback) => {
+    const started = performance.now();
+    return original(process.execPath, args, options, (error, stdout) => {
+      category = 'exit-ok';
+      if (error) category = error.killed && error.code === null ? 'timeout' : 'exit-error';
+      else {
+        try {
+          const parsed = JSON.parse(stdout);
+          if (parsed?.cliVersion !== '0.160.0' || parsed?.appServerVersion !== '0.162.1') category = 'parse';
+        } catch { category = 'parse'; }
+      }
+      t.diagnostic(`C5 version ${category} ${Math.round(performance.now() - started)}ms`);
+      callback(error, stdout);
+    });
+  });
+  const versions = await readDaemonVersions({ command: process.execPath, args, timeoutMs: 2000 });
+  // A bounded, best-effort diagnostic may time out. Its reporting branches are
+  // asserted above with controlled replies; this case observes the real child.
+  if (category === 'timeout') assert.equal(versions, null);
+  else {
+    assert.equal(category, 'exit-ok');
+    assert.deepEqual(versions, { cli: '0.160.0', server: '0.162.1' });
+  }
 });
 
 async function listenInbox(t, claude) {

@@ -1,7 +1,9 @@
 import { connect } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
-import { closeSync, fstatSync, lstatSync, openSync, readdirSync, readSync } from 'node:fs';
+import { lstatSync, readdirSync } from 'node:fs';
+import { readBoundedJson } from './state-files.mjs';
+import { processAlive } from './state-lock.mjs';
 import { homedir } from 'node:os';
 import { canonicalLocalSocket } from './local-socket.mjs';
 import { verifyClaudeProcess } from './claude-process.mjs';
@@ -37,21 +39,13 @@ function claudePeerContent(message, senderName) {
   return `<${CLAUDE_PEER_TAG}${name} from-mode="bypass">\n${body}\n</${CLAUDE_PEER_TAG}>`;
 }
 
-function checkCancellation(signal) {
-  throwIfStopped(signal);
-}
-
-export function canonicalClaudeSocket(socketPath) {
-  return canonicalLocalSocket(socketPath);
-}
-
-const canonicalPipe = canonicalClaudeSocket;
+export { canonicalLocalSocket as canonicalClaudeSocket };
 
 function checkEndpoint(socketPath) {
   if (typeof socketPath !== 'string' || !socketPath || /[\r\n\0]/.test(socketPath)) {
     throw new Error('Claude messaging socket is missing or invalid. Select the intended Claude Code session.');
   }
-  if (canonicalPipe(socketPath) === null) {
+  if (canonicalLocalSocket(socketPath) === null) {
     throw new Error('Claude messaging endpoint must be a local named pipe on Windows or an absolute Unix socket path.');
   }
 }
@@ -72,35 +66,22 @@ function registryLocation(registryDir) {
   return directory;
 }
 
-function readRegularJson(file, maxBytes) {
-  const before = lstatSync(file);
-  if (!before.isFile() || before.isSymbolicLink() || before.size > maxBytes) {
-    throw new Error('Claude registry entry is not a regular file of the expected size.');
-  }
-  const fd = openSync(file, 'r');
-  try {
-    const opened = fstatSync(fd);
-    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size > maxBytes) {
-      throw new Error('Claude registry entry changed while it was opened.');
-    }
-    const data = Buffer.alloc(maxBytes + 1);
-    const bytesRead = readSync(fd, data, 0, data.length, 0);
-    if (bytesRead > maxBytes) throw new Error('Claude registry entry exceeds its size limit.');
-    const after = lstatSync(file);
-    if (!after.isFile() || after.isSymbolicLink() || after.dev !== opened.dev || after.ino !== opened.ino) {
-      throw new Error('Claude registry entry changed while it was read.');
-    }
-    const value = JSON.parse(data.subarray(0, bytesRead).toString('utf8'));
+const registryReadChecks = {
+  invalid(phase, error) {
+    return error ?? new Error({
+      entry: 'Claude registry entry is not a regular file of the expected size.',
+      open: 'Claude registry entry changed while it was opened.',
+      size: 'Claude registry entry exceeds its size limit.',
+      read: 'Claude registry entry changed while it was read.',
+    }[phase]);
+  },
+  validate(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Claude registry entry.');
     return value;
-  } finally {
-    closeSync(fd);
-  }
-}
+  },
+};
 
-function processIsAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
-}
+const readRegularJson = (file, maxBytes) => readBoundedJson(file, maxBytes, registryReadChecks);
 
 function metadata(record) {
   return {
@@ -109,9 +90,7 @@ function metadata(record) {
     name: typeof record.name === 'string' ? record.name : '',
     cwd: typeof record.cwd === 'string' ? record.cwd : '',
     status: typeof record.status === 'string' ? record.status : 'unknown',
-    version: typeof record.version === 'string' ? record.version : '',
     entrypoint: record.entrypoint,
-    hostSessionId: record.hostSessionId ?? null,
     procStart: record.procStart,
     pidDomain: record.pidDomain,
   };
@@ -123,8 +102,8 @@ function ineligibility(record, pid) {
   if (record.spare === true || record.parkedJobId) return 'inactive';
   if (!CLAUDE_ENTRYPOINTS.has(record.entrypoint) || typeof record.sessionId !== 'string' || !record.sessionId.trim()) return 'client';
   if (typeof record.procStart !== 'string' || !record.procStart || typeof record.pidDomain !== 'string') return 'metadata';
-  if (!canonicalPipe(record.messagingSocketPath)) return 'socket';
-  if (!processIsAlive(record.pid)) return 'exited';
+  if (!canonicalLocalSocket(record.messagingSocketPath)) return 'socket';
+  if (!processAlive(record.pid)) return 'exited';
   return null;
 }
 
@@ -192,7 +171,7 @@ export function discoverClaudeSessions({ registryDir, issues } = {}) {
 function sameSessionIdentity(left, right) {
   return left.sessionId === right.sessionId && left.pid === right.pid && left.entrypoint === right.entrypoint &&
     left.procStart === right.procStart && left.pidDomain === right.pidDomain &&
-    canonicalPipe(left.messagingSocketPath ?? left.socketPath) === canonicalPipe(right.messagingSocketPath ?? right.socketPath);
+    canonicalLocalSocket(left.messagingSocketPath ?? left.socketPath) === canonicalLocalSocket(right.messagingSocketPath ?? right.socketPath);
 }
 
 // Process-proof results worded for the conversation they concern. A confirmed change or exit is
@@ -227,7 +206,7 @@ async function proveProcess(record, role, { signal, probe }) {
 /** Read the inbox key and confirm the registration did not change meanwhile. Synchronous and
  * sub-millisecond, so it can run immediately before an authenticated write. */
 function readEndpoint(directory, record, role, changedMessage) {
-  const socketPath = canonicalPipe(record.messagingSocketPath);
+  const socketPath = canonicalLocalSocket(record.messagingSocketPath);
   const keyHash = createHash('sha256').update(socketPath).digest('hex');
   let key;
   const keyReason = role === 'caller' ? 'caller_invalid' : 'target_unavailable';
@@ -245,7 +224,7 @@ function readEndpoint(directory, record, role, changedMessage) {
   // Catch a restart or registry replacement that occurred during the key read.
   let current;
   try { current = readRegularJson(join(directory, `${record.pid}.json`), 65_536); } catch { current = null; }
-  if (!current || ineligibility(current, record.pid) || !sameSessionIdentity(current, record) || !processIsAlive(record.pid)) {
+  if (!current || ineligibility(current, record.pid) || !sameSessionIdentity(current, record) || !processAlive(record.pid)) {
     throw failure(changedMessage, role === 'caller' ? 'caller_changed' : 'target_changed');
   }
   const endpoint = Object.freeze({ ...metadata(record), socketPath, token: key.peerToken });
@@ -334,7 +313,7 @@ const DESTINATION_CHANGED = 'Claude destination changed before the message was w
  * fails at once, before the process check (FB05); the key and registration are reread last. */
 async function verifyResolvedSession(resolved, { socketPath, token, sessionId }, { signal, probe }) {
   const expected = resolved.endpoint;
-  if (canonicalPipe(socketPath) !== expected.socketPath || token !== expected.token || sessionId !== expected.sessionId) {
+  if (canonicalLocalSocket(socketPath) !== expected.socketPath || token !== expected.token || sessionId !== expected.sessionId) {
     throw failure('Claude destination differs from the selected session. Select its current conversation and retry.', 'invalid_argument');
   }
   const { record } = knownRecord(resolved.directory, expected.pid);
@@ -369,7 +348,7 @@ function callerDirectory(registryDir) {
 export async function resolveClaudeCaller({ registryDir, parentPid = process.ppid,
   socketPath = process.env.CLAUDE_CODE_MESSAGING_SOCKET, signal, probe } = {}) {
   const directory = callerDirectory(registryDir);
-  const ownSocket = socketPath === undefined ? null : canonicalClaudeSocket(socketPath);
+  const ownSocket = socketPath === undefined ? null : canonicalLocalSocket(socketPath);
   if (socketPath !== undefined && !ownSocket) throw failure('Claude caller exported an invalid messaging socket. Reload the bridge in that Code session.', 'caller_invalid');
   if (!Number.isSafeInteger(parentPid) || parentPid <= 0) {
     throw failure('Claude caller has no valid direct parent process. Reload the bridge from the intended Code session.', 'caller_invalid');
@@ -377,7 +356,7 @@ export async function resolveClaudeCaller({ registryDir, parentPid = process.ppi
   // The caller is its own parent process, even when its conversation is also open in another window.
   const { record, problem } = knownRecord(directory, parentPid);
   if (!record) throw failure(CALLER_PROBLEMS[problem] ?? CALLER_PROBLEMS.missing, 'caller_invalid');
-  if (ownSocket && canonicalClaudeSocket(record.messagingSocketPath) !== ownSocket) {
+  if (ownSocket && canonicalLocalSocket(record.messagingSocketPath) !== ownSocket) {
     throw failure('The messaging socket exported to this bridge does not match the Claude Code conversation that started it. Reload the bridge MCP server in this conversation.', 'caller_invalid');
   }
   await proveProcess(record, 'caller', { signal, probe });
@@ -398,7 +377,7 @@ function checkToken(token) {
 /** Test local inbox connectivity without authenticating or sending a message. Class (b): a local
  * connect that only diagnostics use; a slow accept is reported as a warning, never as a failure. */
 export async function probeClaudeInbox({ socketPath, signal, timeoutMs = 1500 }) {
-  checkCancellation(signal);
+  throwIfStopped(signal);
   checkEndpoint(socketPath);
   return new Promise((resolveProbe, rejectProbe) => {
     const socket = connect({ path: socketPath });
@@ -433,7 +412,7 @@ export async function probeClaudeInbox({ socketPath, signal, timeoutMs = 1500 })
  */
 export async function sendToClaude({ socketPath, token, message, senderName = 'Codex desktop bridge', sessionId, signal,
   probe, [RESOLVED_SESSION]: resolved }) {
-  checkCancellation(signal);
+  throwIfStopped(signal);
   checkEndpoint(socketPath);
   checkToken(token);
   if (typeof message !== 'string' || !message.trim()) throw new Error('Claude message must be nonempty text.');

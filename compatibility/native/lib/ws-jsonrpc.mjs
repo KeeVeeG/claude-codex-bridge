@@ -1,21 +1,20 @@
 // lib/ws-jsonrpc.mjs
-// Minimal WebSocket client framing (RFC 6455) for the Codex app-server control
-// socket, which is reached through `codex app-server proxy` on stdio. No I/O here.
+// Minimal WebSocket client framing (RFC 6455) for local and SSH Codex proxies. No I/O here.
 import { createHash, randomBytes } from 'node:crypto';
 
 export const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 const WEBSOCKET_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
-export function upgradeRequest() {
+export function upgradeRequest(path = '/') {
   const key = randomBytes(16).toString('base64');
   return {
-    text: 'GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+    text: `GET ${path} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
       `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`,
     accept: createHash('sha1').update(key + WEBSOCKET_GUID).digest('base64'),
   };
 }
 
-function clientFrame(opcode, payload) {
+export function encodeClientFrame(opcode, payload) {
   const length = payload.length;
   let header;
   if (length < 126) header = Buffer.from([0x80 | opcode, 0x80 | length]);
@@ -35,11 +34,22 @@ function clientFrame(opcode, payload) {
 export function encodeText(text) {
   const payload = Buffer.from(text, 'utf8');
   if (payload.length > MAX_MESSAGE_BYTES) throw new Error('Codex daemon request exceeds 8 MiB.');
-  return clientFrame(0x1, payload);
+  return encodeClientFrame(0x1, payload);
 }
 
-export const encodePong = payload => clientFrame(0xa, payload);
-export const encodeClose = () => clientFrame(0x8, Buffer.alloc(0));
+export const encodePong = payload => encodeClientFrame(0xa, payload);
+export const encodeClose = () => encodeClientFrame(0x8, Buffer.alloc(0));
+
+/** Read a bounded length after the caller checks the first two frame bytes. */
+export function readFrameLength(buffer, tooLarge) {
+  const short = buffer[1] & 0x7f;
+  if (short < 126) return { length: short, offset: 2 };
+  if (short === 126) return buffer.length < 4 ? null : { length: buffer.readUInt16BE(2), offset: 4 };
+  if (buffer.length < 10) return null;
+  const wide = buffer.readBigUInt64BE(2);
+  if (wide > BigInt(MAX_MESSAGE_BYTES)) throw new Error(tooLarge);
+  return { length: Number(wide), offset: 10 };
+}
 
 export class FrameDecoder {
   #buffer = Buffer.alloc(0);
@@ -115,18 +125,9 @@ export class FrameDecoder {
       if (first & 0x70) throw new Error('Codex daemon sent a frame with reserved bits set.');
       const masked = (second & 0x80) !== 0;
       if (masked !== this.#clientFrames) throw new Error('Invalid Codex daemon frame masking.');
-      let length = second & 0x7f;
-      let offset = 2;
-      if (length === 126) {
-        if (this.#buffer.length < 4) return;
-        length = this.#buffer.readUInt16BE(2); offset = 4;
-      } else if (length === 127) {
-        if (this.#buffer.length < 10) return;
-        const wide = this.#buffer.readBigUInt64BE(2);
-        if (wide > BigInt(MAX_MESSAGE_BYTES)) throw new Error('Codex daemon frame exceeds 8 MiB.');
-        length = Number(wide); offset = 10;
-      }
-      if (length > MAX_MESSAGE_BYTES) throw new Error('Codex daemon frame exceeds 8 MiB.');
+      const header = readFrameLength(this.#buffer, 'Codex daemon frame exceeds 8 MiB.');
+      if (!header) return;
+      const { length, offset } = header;
       const maskLength = masked ? 4 : 0;
       if (this.#buffer.length < offset + maskLength + length) return;
       const payload = Buffer.from(this.#buffer.subarray(offset + maskLength, offset + maskLength + length));

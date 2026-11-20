@@ -1,17 +1,39 @@
 # Releases
 
-## Build
+## Prepare the source
 
-Run these commands from a source checkout:
+These steps require a Git source checkout, not an extracted plugin. Edit release identity, version, and presentation in root `plugin.json`, and the portable stdio entry in root `mcp.json`. Run `npm run manifests:sync` to update `package.json`, the native adapters, and `compatibility/native/`. Commit the generated tree with the source changes: the Git marketplaces install it. Keep the release MCP environment empty; check, sync and package reject local overrides. For a private install, set the local configuration at install time instead.
+
+The plugin identity and skill namespace are `bridge-claude-codex`; the npm package and archive identity remain `claude-codex-bridge`. The native deployment stores its portable inputs in `config/plugin-source.json` and `config/mcp-source.json` so portable discovery does not change what Codex loads. It retains Codex's native `env_vars`; Claude uses a plugin-only inline server definition with supported nonsecret environment references, not a project `.mcp.json`. The installer stamps the staged version in all manifests and in the Claude launch arguments so an applied interactive reload sees a configuration change.
+
+Agent Plugins 1.0 cannot express native `env_vars`. The separate portable archive uses `${PLUGIN_ROOT}` and still requires a host that supplies the native application context. It does not replace the default native deployment.
+
+## Build and validate the tag
+
+Land the release commit (including its release notes and generated runtime) on the intended release branch. Create and push the annotated `v<version>` tag on that exact commit. Build in a fresh checkout of the tag so the working tree and the uploaded assets cannot come from different revisions. On Windows PowerShell, for example:
 
 ```powershell
-npm run manifests:sync
+$version = 'X.Y.Z' # Replace with the version being released.
+$tag = "v$version"
+$checkout = "../bridge-release-$version"
+git worktree add --detach $checkout $tag
+if ($LASTEXITCODE -ne 0) { throw 'Could not check out the release tag' }
+Set-Location $checkout
+if ((git status --porcelain) -or (git rev-parse HEAD) -ne (git rev-list -n 1 $tag)) {
+  throw 'Use a clean checkout of the intended release tag'
+}
+if ((node -p "require('./package.json').version") -ne $version) { throw 'Tag and package version differ' }
 npm run manifests:check
+if ($LASTEXITCODE -ne 0) { throw 'Manifest check failed' }
 npm test
+if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
 npm run package
+if ($LASTEXITCODE -ne 0) { throw 'Packaging failed' }
+claude plugin validate dist/marketplace
+if ($LASTEXITCODE -ne 0) { throw 'Claude marketplace validation failed' }
 ```
 
-Run `npm test` on Node.js 20 too: it is the oldest supported version, and Windows file-system behaviour differs between Node.js versions.
+Also run the tests on Node.js 20, the oldest supported version. CI runs tests and packaging on Windows and macOS across Node.js 20, 22, 24, and 26.
 
 The packager writes these artifacts under `dist/`:
 
@@ -23,45 +45,20 @@ The packager writes these artifacts under `dist/`:
 
 The archives include runtime code, documentation, and the MIT license. They exclude Git history, test fixtures, local state, credentials, and installer backups. ZIP entry timestamps are fixed for reproducible builds.
 
-## Validate
-
-```powershell
-claude plugin validate .claude-plugin/plugin.json
-claude plugin validate dist/marketplace
-```
-
-Edit release identity, version, and presentation in root `plugin.json`, and the portable stdio command in root `mcp.json`. Run `npm run manifests:sync` to update `package.json`, the legacy adapters, and the generated `compatibility/native/` tree. Commit that generated tree together with the root changes: the Git marketplaces install it. The packager refuses mismatched versions, modified adapters, unexpected native files, or stale runtime copies.
-
-The plugin identity and skill namespace are `bridge-claude-codex`; the npm package and release archives keep the product identity `claude-codex-bridge`. Manifest synchronization preserves that distinction while aligning versions. Repository URLs, transport client identity, and the default state directory also retain `claude-codex-bridge`.
-
-The installer adds cache-specific build suffixes to all staged manifests and `package.json` together. Canonical sources in the native package live in `config/plugin-source.json` and `config/mcp-source.json`; they are kept outside the root portable discovery paths deliberately.
-
-Agent Plugins 1.0 stdio configuration has no `env_vars` forwarding field. The default native deployment preserves the context required by Codex's current filtered MCP launcher; placing portable manifests in its root would change which server definition Codex loads. The separate portable archive uses `${PLUGIN_ROOT}` and requires a host that supplies the application's native context. It does not replace the default native deployment yet.
-
 ## GitHub release
 
-After the validation commands pass, commit the source and generated compatibility tree, push the branch, and create the matching tag and release. The release should attach the native plugin archive, marketplace archive, portable archive, and `SHA256SUMS` produced by the same `npm run package` run:
+From that verified tagged checkout, upload the three ZIPs and checksum file from the same build. Use the reviewed release notes, not an automatically generated account of the commit history.
 
 ```powershell
-$version = node -p "JSON.parse(require('fs').readFileSync('plugin.json', 'utf8')).version"
-$tag = "v$version"
-git diff --check
-git add -A
-git commit -m "Release $version"
-git push origin main
-git tag -a $tag -m "Release $tag"
-git push origin $tag
-npm run package
 gh release create $tag `
   "dist/claude-codex-bridge-$version.zip" `
   "dist/claude-codex-bridge-marketplace-$version.zip" `
   "dist/claude-codex-bridge-portable-$version.zip" `
   dist/SHA256SUMS `
-  --title $tag `
-  --generate-notes
+  --verify-tag --title $tag --notes-file "docs/releases/$tag.md"
 ```
 
-Do not commit `dist/`; it is ignored and is regenerated for each release. Keep the tag, package version, manifests, and checksums aligned. If a tag or release already exists, inspect it before replacing assets so an older package is not silently published under the same version. Windows and macOS CI also run `npm test` and `npm run package` on Node.js 20, 22, 24, and 26 for pushes and pull requests; the local `npm run package` above is needed to create the files uploaded to the release.
+Do not commit `dist/`. If the tag or release already exists, confirm it points to the intended commit and inspect its assets before replacing anything.
 
 ## Local marketplace
 
@@ -76,14 +73,7 @@ The generated catalogs use `./plugins/bridge-claude-codex`. Keep that directory 
 
 ## Git marketplace
 
-```powershell
-claude plugin marketplace add https://github.com/KeeVeeG/claude-codex-bridge.git
-claude plugin install bridge-claude-codex@keeveeg --scope user --json
-codex plugin marketplace add https://github.com/KeeVeeG/claude-codex-bridge.git
-codex plugin add bridge-claude-codex@keeveeg --json
-```
-
-The Git catalog is named `keeveeg`. Both source catalogs select the generated `compatibility/native/` directory; Codex uses a Git subdirectory source. The local installer's separate Claude catalog is named `claude-codex-local`.
+See [Installation](../README.md#installation) for the Git marketplace commands. The Git catalog is named `keeveeg`. Both source catalogs select the generated `compatibility/native/` directory; Codex uses a Git subdirectory source. The local installer's separate Claude catalog is named `claude-codex-local`.
 
 ## Directory submission references
 

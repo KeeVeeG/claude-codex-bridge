@@ -16,11 +16,5 @@
   "description": "Asynchronous two-way messaging between Claude Code and Codex conversations.",
   "engines": {
     "node": ">=20"
-  },
-  "scripts": {
-    "test": "node scripts/test.mjs",
-    "package": "node scripts/package.mjs",
-    "manifests:check": "node scripts/manifests.mjs --check",
-    "manifests:sync": "node scripts/manifests.mjs --sync"
   }
 }

@@ -430,18 +430,18 @@ test('history distinguishes unverifiable, invalid and unassignable history witho
   assert.doesNotMatch(invalid.warnings.join(), /secret|changed/);
 });
 
-test('native bounded discovery yields a cursor even when the first search window is empty', async t => {
+test('native bounded discovery yields a cursor even when the first catalog window is empty', async t => {
   const fixture = await nativeFixture(t);
   const projects = Array.from({ length: 257 }, (_, i) => `project-${String(i).padStart(3, '0')}`).sort((a, b) => hash(a).localeCompare(hash(b)));
   for (const project of projects) fs.mkdirSync(path.join(args(fixture).projectsDir, project), { recursive: true });
   writeTitle(fixture, projects.at(-1), sessionId, 'Hidden archived title');
-  const query = { ...args(fixture), search: 'archived title' };
-  const first = await listClaudeConversations(query);
+  const catalog = args(fixture);
+  const first = await listClaudeConversations(catalog);
   assert.deepEqual(first.conversations, []);
   assert.equal(typeof first.next_cursor, 'string');
   assert.match(first.warnings.join(), /catalog scan is incomplete/);
-  await assert.rejects(listClaudeConversations({ ...query, ownerThreadId: 'different', cursor: first.next_cursor }), /Invalid Claude catalog cursor/);
-  const next = await listClaudeConversations({ ...query, cursor: first.next_cursor });
+  await assert.rejects(listClaudeConversations({ ...catalog, ownerThreadId: 'different', cursor: first.next_cursor }), /Invalid Claude catalog cursor/);
+  const next = await listClaudeConversations({ ...catalog, cursor: first.next_cursor });
   assert.deepEqual(next.conversations.map(peer => peer.session_id), [sessionId]);
   assert.equal(next.next_cursor, null);
 });
@@ -452,14 +452,6 @@ test('a native UTF-8 title spanning adjacent windows is retained', async t => {
   const head = ' '.repeat(65536 - 19) + '\n';
   writeTitle(fixture, 'project', sessionId, title, head);
   const result = await listClaudeConversations(args(fixture));
-  assert.deepEqual(result.conversations.map(peer => peer.title), [title]);
-});
-
-test('native search matches canonically equivalent text without rewriting the title', async t => {
-  const fixture = await nativeFixture(t);
-  const title = 'Résumé — 東京';
-  writeTitle(fixture, 'project', sessionId, title);
-  const result = await listClaudeConversations({ ...args(fixture), search: title.normalize('NFD').toUpperCase() });
   assert.deepEqual(result.conversations.map(peer => peer.title), [title]);
 });
 

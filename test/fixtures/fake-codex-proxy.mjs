@@ -73,7 +73,12 @@ function answer(request) {
     send({ id, result: { data, nextCursor: null, backwardsCursor: null } });
     return;
   }
-  if (method === 'turn/start') { send({ id, result: { turn: { id: 'turn-started', status: 'inProgress' } } }); return; }
+  if (method === 'turn/start') {
+    const value = { id, result: { turn: { id: 'turn-started', status: 'inProgress' } } };
+    if (scenario.corruptTurnSuffix) process.stdout.write(Buffer.concat([serverFrame(JSON.stringify(value)), Buffer.from([0xc1, 0])]));
+    else send(value);
+    return;
+  }
   if (method === 'turn/steer') { send({ id, result: { turnId: params?.expectedTurnId } }); return; }
   send({ id, error: { code: -32601, message: `unsupported method ${method}` } });
 }

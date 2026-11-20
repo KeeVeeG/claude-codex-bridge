@@ -8,7 +8,7 @@ import { execFile, spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { FrameDecoder, encodeClose, encodePong, encodeText, upgradeRequest } from './ws-jsonrpc.mjs';
 import { resolveCodexExecutable } from './codex-binary.mjs';
-import { beforeWrite, monotonicNow } from './call-time.mjs';
+import { beforeWrite, cancelledError, monotonicNow, throwIfAborted } from './call-time.mjs';
 import { failure, tagged } from './outcome.mjs';
 
 const runtimeVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -38,14 +38,6 @@ export function unconfirmedReply(source, detail, error = new Error()) {
 
 export class DaemonUnavailableError extends Error {
   constructor(message) { super(message); this.name = 'DaemonUnavailableError'; }
-}
-
-function cancelled() {
-  return Object.assign(new Error('Bridge request was cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
-}
-
-function checkCancellation(signal) {
-  if (signal?.aborted) throw cancelled();
 }
 
 export const NOT_RUNNING_MESSAGE = 'No Codex daemon is running; `codex app-server daemon start` starts one. The bridge never starts it.';
@@ -80,7 +72,7 @@ function resolveExecutable({ effective, command }) {
 // Class (b) default: one proxy start and handshake for a send; routing and listing pass their inquiry
 // attempt's limit instead, and the call deadline bounds both.
 export function openDaemon({ env = process.env, command, args, signal, timeoutMs = 10000 } = {}) {
-  try { checkCancellation(signal); } catch (error) { return Promise.reject(error); }
+  try { throwIfAborted(signal); } catch (error) { return Promise.reject(error); }
   // The effective environment (for example CODEX_HOME) is the supplied one layered over the process's.
   const effective = { ...process.env, ...env };
   let executable;
@@ -123,7 +115,7 @@ export function openDaemon({ env = process.env, command, args, signal, timeoutMs
       if (!opened) rejectOpen(error);
     }
 
-    function onAbort() { fail(cancelled()); }
+    function onAbort() { fail(cancelledError()); }
     signal?.addEventListener('abort', onAbort, { once: true });
 
     function write(buffer) {
@@ -135,7 +127,7 @@ export function openDaemon({ env = process.env, command, args, signal, timeoutMs
     function request(method, params, { mutating = false, signal: requestSignal, timeoutMs: limit = 15000 } = {}) {
       if (closed) return Promise.reject(new DaemonUnavailableError('The Codex daemon connection is closed.'));
       try {
-        checkCancellation(requestSignal);
+        throwIfAborted(requestSignal);
         if (mutating) beforeWrite(requestSignal);
       } catch (error) { return Promise.reject(error); }
       const id = nextId++;
@@ -143,7 +135,7 @@ export function openDaemon({ env = process.env, command, args, signal, timeoutMs
         const entry = { mutating, written: false, resolve: undefined, reject: undefined };
         const timer = setTimeout(() => fail(Object.assign(new Error('Codex daemon did not answer before the local request timeout.'),
           { code: 'DAEMON_TIMEOUT' })), limit);
-        const onRequestAbort = () => fail(cancelled());
+        const onRequestAbort = () => fail(cancelledError());
         const done = () => { clearTimeout(timer); requestSignal?.removeEventListener('abort', onRequestAbort); };
         entry.resolve = value => { done(); resolve(value); };
         entry.reject = error => { done(); reject(error); };
@@ -421,7 +413,7 @@ export function queueRefusal(text) {
 /** Deliver through `codex queue`, for terminal sessions the daemon does not hold. Never retried.
  * Class (b): one queue run that may already have queued the message, so it is never repeated. */
 export function queueToTerminalThread({ threadId, text, env = process.env, signal, timeoutMs = 30000, command, args } = {}) {
-  try { checkCancellation(signal); } catch (error) { return Promise.reject(error); }
+  try { throwIfAborted(signal); } catch (error) { return Promise.reject(error); }
   const refusal = queueTargetRefusal(threadId) || queueRefusal(text);
   if (refusal) return Promise.reject(new Error(refusal));
   threadId = normalizeCodexThreadId(threadId);

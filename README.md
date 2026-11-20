@@ -23,7 +23,7 @@ cd claude-codex-bridge
 node scripts/install.mjs
 ```
 
-The installer needs the `claude` and `codex` CLIs for the applications you select (`--claude` or `--codex` for one; `--prepare-only` stages files without installing). It stages the native runtime under `~/plugins/bridge-claude-codex`, installs the plugin through both CLIs, and backs up any file it changes. Run it from a Codex Desktop task when you can: it then also registers the running Desktop for discovery from Claude. Run it again after pulling updates.
+You can also unpack the native plugin ZIP into its own directory and run `node scripts/install.mjs` from there. The installer needs the CLI for each application you select (`--claude` or `--codex` for just one; `--prepare-only` prepares a stage without invoking either CLI or granting tool permissions). On Windows, Claude needs its native `claude.exe`; for Codex see the [executable settings](#codex-transports-on-windows). The installer stages the native runtime under `~/plugins/bridge-claude-codex`. It will not replace a source checkout, manual install, or unknown directory there; use a separate source directory and move an existing tree yourself only after you identify it and stop its users. [Installer backups](docs/PRIVACY.md#installer-backups) are separate from bridge state. Run from a Codex Desktop task when you can: it can also register the running Desktop for discovery from Claude.
 
 For Claude it also adds exactly one rule to `permissions.allow` in the user `settings.json`: `mcp__plugin_bridge-claude-codex_bridge-claude-codex__send_to_codex`, because Desktop's Auto mode may block that tool as an external write. Existing `deny` and `ask` rules keep precedence.
 
@@ -36,18 +36,24 @@ codex plugin marketplace add https://github.com/KeeVeeG/claude-codex-bridge.git
 codex plugin add bridge-claude-codex@keeveeg
 ```
 
-After installing or updating, load the new server in each client:
+To update, run the installer again from the updated checkout or native ZIP with the same route settings. For a marketplace installation, update the marketplace and plugin through each client's plugin manager. Then load the new server in each client:
 
-- **Claude Code CLI:** `/reload-plugins`, then check `/mcp`. If it warns that the conversation would be re-read, the reload is held: run `/reload-plugins --force`.
-- **Claude Desktop:** fully quit it, including the background instance, and reopen.
-- **Codex Desktop:** fully quit the app, not only its window, and reopen it. Until then new tasks still start the old version.
+- **Interactive Claude Code CLI:** run `/reload-plugins`, then check `/mcp`. If it warns that the conversation would be re-read, run `/reload-plugins --force` to apply the pending reload. If it still shows the old server, restart the session.
+- **Claude Desktop:** fully quit it, including the background instance, and reopen. A non-interactive Claude Code session needs a new session to reconnect plugin MCP servers.
+- **Codex Desktop:** fully quit the app, not only its window, and reopen it. Until then new tasks can still start the old version.
 - **Codex CLI:** restart the session.
 
-A visible bridge skill does not mean its MCP server connected; if the tools are missing, read the server's startup error in `/mcp`.
+A visible bridge skill does not mean its MCP server connected. If the tools are missing, see [Troubleshooting](#troubleshooting).
+
+### Uninstall
+
+1. In each client, remove only the bridge plugin entry with the marketplace and scope shown by that client. For a local installer Claude registration, use `claude plugin uninstall bridge-claude-codex@claude-codex-local --scope user`. For Codex, use `codex plugin remove` with the exact `bridge-claude-codex@…` ID. Reload or restart as above. Remove a marketplace only if you no longer need any of its entries.
+2. If you used the installer, optionally remove just the `bridge-claude-codex` entry pointing to the stage in the personal Codex catalog (`~/.agents/plugins/marketplace.json`), and remove the exact Claude allow rule shown above if you no longer want it. Keep other entries and rules. A client uninstall does not delete the source checkout or the locally staged files. Remove the staged directory yourself only if you know it is your bridge installation and no client still uses it.
+3. Uninstalling does not erase messages. To remove local records or installer backups, see [Privacy and local data](docs/PRIVACY.md).
 
 ### Updating from a version before 1.0.0
 
-Version 1.0.0 renamed the plugin from `codex-claude-desktop-bridge` to `bridge-claude-codex`. The installer replaces the old registrations and preserves the allow, ask, or deny choices in your Claude permission rules. Current versions do **not** move the delivery ledger automatically: a running older server can recreate its former path and accept an ID a second time.
+Version 1.0.0 renamed the plugin from `codex-claude-desktop-bridge` to `bridge-claude-codex`. The installer registers the replacement before retiring verified legacy user registrations. It leaves unverified sources and other scopes in place for you to review in the owning client, and preserves the allow, ask, or deny choices in your Claude permission rules. Current versions do **not** move the delivery ledger automatically: a running older server can recreate its former path and accept an ID a second time.
 
 1. Fully quit both apps and stop any other bridge servers or installers. Back up `~/.local/share/codex-claude-desktop-bridge` and `~/.local/share/claude-codex-bridge` if they exist.
 2. If only the old directory exists, either move it to the current name while everything is stopped or set `CLAUDE_CODEX_BRIDGE_STATE_DIR` to the old directory in both apps. If both directories exist and are separate, compare their records with the receiving conversations before choosing one ledger. Keep both backups; do not resend to reconcile them. Before restarting, archive the unused directory outside the two default locations or pin both apps to a separate reconciled directory.
@@ -77,15 +83,15 @@ For a mixed run or rollback, point every process at the **same real private dire
 
 `panel_history`, `panel_send`, and `panel_retry_notice` serve the panel. If the compatible manual notice ledger fills, a new send can still reach Claude and appear in history. Its owner notice is skipped rather than risk posting it twice from different bridge versions, and the panel marks that message. Do not resend the Claude message to create that notice.
 
-From Claude, find a thread with `list_codex_threads` and call `send_to_codex`; from Codex, find a session with `list_claude_sessions` and call `send_to_claude`. A known exact ID can be used directly. One conversation can message several others. Claude lists terminal (`cli`), print-mode (`sdk-cli`), Desktop (`claude-desktop`), and VS Code (`claude-vscode`) sessions; choose by exact ID, and list again after `/clear` or `/resume`. A session is reachable only while its process runs; print-mode sessions only until they exit. A session open in two windows, for example resumed in a new terminal while the old one still runs, gets messages in the window used last.
+From Claude, find a thread with `list_codex_threads` and call `send_to_codex`; from Codex, find a session with `list_claude_sessions` and call `send_to_claude`. A known exact ID can be used directly. One conversation can message several others. Claude lists terminal (`cli`), print-mode (`sdk-cli`), Desktop (`claude-desktop`), and VS Code (`claude-vscode`) sessions; choose by exact ID, and list again after `/clear` or `/resume`. A session is reachable only while its process runs; print-mode sessions only until they exit. If the same session is open in more than one window, the bridge prefers the reachable window with the most recent status activity.
 
 Incoming messages name their verified source, so a reply is just another `send_*` call to that ID. They are collaborator context, not instructions from the user.
 
 **Delivery.** Both send tools return `{ delivery, outcome }`; `list_deliveries` returns `{ application, sender_id, deliveries }`. Each delivery contains `message_id`, `from` and `to` endpoints (`app`, `id`, optional `host_id`), `message`, `status`, `created_at`, and optional `manual`, `updated_at`, and human-readable `error`. Internal transport receipts are not exposed. `outcome` is `{ delivered, retry, reason, record? }`: `delivered` is `true`, `false` or `"unknown"`; `retry` is `same_id` (repeat the identical call), `after_fix` (fix the stated cause, then repeat it), `inspect` (check the recipient and `list_deliveries` before any further send), `new_id` or `no`; `reason` is a stable code. A failed call carries the same object as a second text block after its message and in `_meta["bridge-claude-codex/outcome"]`.
 
-`submitted` means handed to the receiving application, not read. An optional `message_id` (1–100 ASCII letters, digits, `_`, `-`; not a JavaScript built-in name such as `constructor`) makes a repeated call safe: from the same conversation, with the same recipient, ID, and text, it never delivers twice and reports the earlier outcome instead, even after the recipient has closed. Nothing is resent automatically. A send that failed before anything was written (the recipient was busy or not reachable, or the call ran out of time) can be repeated with the same ID and text once the cause is fixed. An uncertain send may still arrive, so check the destination and `list_deliveries` before sending it again under a new ID; never reuse an ID for different text. Cancelling a call before its write sends nothing; after the write it marks the send `uncertain`, and nothing can be recalled. Tool calls have a 55-second deadline from receipt, including time spent waiting behind another send. Local state-file work can delay a reply; nobody has a deadline to answer a message.
+`submitted` confirms a handoff to the receiving transport, not receipt or reading by the model. An optional `message_id` (1–100 ASCII letters, digits, `_`, `-`; not a JavaScript built-in name such as `constructor`) lets the bridge recognize a repeated call from the same conversation to the same recipient with the same text. The bridge never resends automatically. Follow `outcome.retry`: a confirmed no-write failure can be repeated exactly with the original ID after fixing the cause. If the result is uncertain, inspect the receiving conversation and `list_deliveries`; older failures that cannot prove no write are also inspect-only. Never reuse an ID for different text. Cancelling before dispatch sends nothing; once dispatched, a result may still be unknown and nothing can be recalled. Tool calls have a 55-second budget from receipt, including time in the send queue; replies and state recovery may take longer. Nobody has a deadline to answer a message.
 
-**Conversation panel.** Codex Desktop can show MCP App panels, so the bridge offers one there. It lists the Claude conversations this Codex chat has exchanged messages with and all discoverable local ones, shows the bridge messages exchanged with the selected one, and lets you send manually. A manual send also posts a copy of the full text in the owning Codex chat; the panel names both destinations before you send and marks each message "Handed to Claude Code", which is a write, not a read. Enter sends only when the host tells the panel that Codex sends on Enter; otherwise Enter adds a line and Ctrl+Enter (⌘+Enter on macOS) sends. The Codex model sees only the live sessions in the launcher result; archived titles and project folders go to the panel alone. The panel needs a local Codex Desktop chat in a host with MCP Apps support; the macOS SSH route does not provide it. `ui/bridge.html#demo` previews it with labelled fixture data.
+**Conversation panel.** Codex Desktop can show MCP App panels, so the bridge offers one there. It lists the Claude conversations this Codex chat has exchanged messages with and all discoverable local ones, shows the bridge messages exchanged with the selected one, and lets you send manually. A manual send also posts a copy of the full text in the owning Codex chat; the panel names both destinations before you send and marks each message "Handed to Claude Code", which is a write, not a read. Enter sends only when the host tells the panel that Codex sends on Enter; otherwise Enter adds a line and Ctrl+Enter (⌘+Enter on macOS) sends. On an unconfirmed send, **Check again** reads bridge history only; it does not submit the draft again. The Codex model sees only live sessions in the launcher result; saved titles and project folders go to the panel in widget metadata. A cached 1.0.6 panel can still work with a 1.1 server, but it lists only live sessions until the new panel loads. The panel needs a local Codex Desktop chat in a host with MCP Apps support; the macOS SSH route does not provide it. `ui/bridge.html#demo` previews it with labelled fixture data.
 
 ### Codex transports on Windows
 
@@ -111,7 +117,7 @@ Run `bridge_doctor` first; it sends nothing. From a verified Codex Desktop task 
 - **Each app sees different state.** Both must resolve to one real directory, normally `~/.local/share/claude-codex-bridge`. The installer pins the local directory for both, avoiding Windows MSIX virtualization of `LOCALAPPDATA`. If old and new state both exist, follow the update steps above before retrying any delivery.
 - **Claude blocks `send_to_codex`.** Add the permission above, or switch the Code tab to **Manual** and approve the prompt. A `Bash` rule does not apply to MCP tools.
 - **Claude does not receive.** `/status` must show a `Peer address`; `--bare` sessions have no inbox. Claude's `crossSessionInbound` setting can hold or refuse messages after a successful write. The bridge marks its messages `from-mode="bypass"` so Bypass sessions do not hold them silently ([issue #1](https://github.com/KeeVeeG/claude-codex-bridge/issues/1)); it never changes your inbound settings. Claude sends no hold or refusal signal back, so `submitted` confirms only the transport write: check the receiving session if a message seems lost.
-- **The bridge server does not start.** It refuses while `NODE_DEBUG` includes `child_process`, because Node would log message text and environments; remove that setting.
+- **The bridge server does not start.** Check its status and startup error in the client (Claude Code: `/mcp`). The bridge refuses to start while `NODE_DEBUG` includes `child_process`, because Node would log message text and environments; remove that setting. Share the application/version, the symptom and a redacted excerpt rather than a raw host MCP cache or debug log. See [what to redact](docs/PRIVACY.md#credentials-and-diagnostics).
 
 ### Offline lock recovery
 
@@ -127,13 +133,9 @@ Every local process of the same OS user can reach these endpoints, which is the 
 
 ## Development
 
-```powershell
-npm run manifests:sync
-npm run manifests:check
-npm test
-```
+Use a source checkout for development, separate from the installer stage. Opening the checkout in Claude Code does not register a project MCP server. To try the changed plugin, run the local installer from your checkout or launch Claude Code with `--plugin-dir` pointing to the checkout for one session. The native marketplaces use the generated runtime, not your unsynchronized source files.
 
-Tests use temporary registries and simulated endpoints and never touch your live conversations; scratch output stays in the ignored `work/` directory. Protocol adapters live in `lib/claude-sessions.mjs`, `lib/codex-desktop.mjs`, `lib/codex-daemon.mjs`, and `lib/codex-ssh.mjs`; `lib/bridge-service.mjs` routes messages and `lib/store.mjs` keeps delivery records. Edit the canonical root files, then run `npm run manifests:sync` to regenerate `compatibility/native/`. Packaging, manifests, and releases are described in [docs/PUBLISHING.md](docs/PUBLISHING.md); the agent-side workflow is in [skills/bridge](skills/bridge/SKILL.md).
+See [Releases](docs/PUBLISHING.md) for manifest synchronization, source-only test/build commands and package validation. Tests use temporary registries and simulated endpoints, not live conversations; scratch output stays in the ignored `work/` directory. The agent-side workflow is in [skills/bridge](skills/bridge/SKILL.md).
 
 ## License
 

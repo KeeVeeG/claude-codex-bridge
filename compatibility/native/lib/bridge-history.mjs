@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 import { defaultStateDir, interruptedSend } from './store.mjs';
 import { readHistoryLedger } from './history-ledger-reader.mjs';
 import { REASONS } from './outcome.mjs';
+import { readManualRecords } from './manual-service.mjs';
+import { throwIfAborted } from './call-time.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const MiB = 1024 * 1024;
@@ -64,9 +66,7 @@ export function validateClaudeHistoryId(sessionId) {
   return sessionId;
 }
 
-function checkCancellation(signal) {
-  if (signal?.aborted) throw Object.assign(new Error('Bridge history request was cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
-}
+const checkCancellation = signal => throwIfAborted(signal, 'Bridge history request was cancelled.');
 
 const samePath = (left, right) => process.platform === 'win32'
   ? path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase()
@@ -359,7 +359,6 @@ function visitPairs(view, ownerThreadId, sessionId, visit) {
 async function manualRecords(stateDir, threadId, scan, signal, selection) {
   if (!scan.root) return [];
   try {
-    const { readManualRecords } = await import('./manual-service.mjs');
     await assertDirectory(scan.root, true);
     checkCancellation(signal);
     return await readManualRecords({ stateDir, threadId, ...selection });

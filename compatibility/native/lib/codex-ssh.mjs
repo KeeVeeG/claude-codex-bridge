@@ -2,17 +2,15 @@
 // This never opens the protected Desktop app-tools socket or starts a server.
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { createHash, randomBytes } from 'node:crypto';
+import { encodeClientFrame, MAX_MESSAGE_BYTES as MAX_MESSAGE, readFrameLength, upgradeRequest } from './ws-jsonrpc.mjs';
 import { appServerError, appServerWriteError, markDeliveryUnknown, normalizeCodexThreadId, rpcReplyKind,
   startedTurnId, unconfirmedReply } from './codex-daemon.mjs';
-import { beforeWrite } from './call-time.mjs';
+import { beforeWrite, cancelledError, throwIfAborted } from './call-time.mjs';
 import { failure } from './outcome.mjs';
 
 const runtimeVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
-const MAX_MESSAGE = 8 * 1024 * 1024;
 const MAX_HEADER = 65536;
-const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 export function validateSshHostAlias(value) {
@@ -21,12 +19,6 @@ export function validateSshHostAlias(value) {
   }
   return value;
 }
-
-function cancellation() {
-  return Object.assign(new Error('Bridge request was cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
-}
-
-function check(signal) { if (signal?.aborted) throw cancellation(); }
 
 function text(value, name, limit = 65536) {
   if (typeof value !== 'string' || !value.trim() || Buffer.byteLength(value) > limit) {
@@ -43,20 +35,13 @@ function selectedThreadId(value) {
 
 function clientFrame(payload, opcode = 1) {
   if (payload.length > MAX_MESSAGE) throw new Error('Codex SSH request exceeds the transport limit.');
-  const header = Buffer.alloc(payload.length < 126 ? 2 : payload.length < 65536 ? 4 : 10);
-  header[0] = 128 | opcode;
-  header[1] = 128 | (payload.length < 126 ? payload.length : payload.length < 65536 ? 126 : 127);
-  if (header.length === 4) header.writeUInt16BE(payload.length, 2);
-  if (header.length === 10) header.writeBigUInt64BE(BigInt(payload.length), 2);
-  const mask = randomBytes(4), data = Buffer.from(payload);
-  for (let i = 0; i < data.length; i++) data[i] ^= mask[i % 4];
-  return Buffer.concat([header, mask, data]);
+  return encodeClientFrame(opcode, payload);
 }
 
 class SshRpc {
   // Class (b): one SSH session including its connection; a written turn is never repeated.
   constructor({ sshHostAlias, signal, spawnImpl = spawn, timeoutMs = 30000 }) {
-    check(signal);
+    throwIfAborted(signal);
     const alias = validateSshHostAlias(sshHostAlias);
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30000) throw new Error('Invalid Codex SSH timeout.');
     this.pending = Buffer.alloc(0); this.calls = new Map(); this.id = 0;
@@ -65,9 +50,9 @@ class SshRpc {
     this.ready = new Promise((resolve, reject) => { this.resolveReady = resolve; this.rejectReady = reject; });
     // Attach rejection handling immediately, including a synchronous spawn failure.
     this.ready.catch(() => {});
-    this.nonce = randomBytes(16).toString('base64');
-    this.accept = createHash('sha1').update(this.nonce + GUID).digest('base64');
-    this.abort = () => this.fail(cancellation());
+    const { text: upgrade, accept } = upgradeRequest('/rpc');
+    this.accept = accept;
+    this.abort = () => this.fail(cancelledError());
     signal?.addEventListener('abort', this.abort, { once: true });
     this.timer = setTimeout(() => this.fail(failure('Codex SSH request timeout; the route could not be verified in time.', 'route_unverified')), timeoutMs);
     try {
@@ -95,8 +80,8 @@ class SshRpc {
       this.child.stdout.on('data', chunk => { try { this.receive(chunk); } catch (error) { this.fail(error); } });
       // Drain stderr without exposing login banners, diagnostics, or credentials.
       this.child.stderr.resume();
-      check(signal);
-      this.child.stdin.write(`GET /rpc HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${this.nonce}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
+      throwIfAborted(signal);
+      this.child.stdin.write(upgrade);
     } catch (error) { this.fail(error); }
   }
 
@@ -131,15 +116,11 @@ class SshRpc {
     while (this.pending.length >= 2 && !this.closed) {
       const first = this.pending[0], second = this.pending[1], opcode = first & 15, fin = !!(first & 128);
       if ((first & 112) || (second & 128)) throw new Error('Invalid Codex SSH WebSocket frame.');
-      let size = second & 127, header = 2;
-      if (size === 126) { if (this.pending.length < 4) return; size = this.pending.readUInt16BE(2); header = 4; }
-      if (size === 127) {
-        if (this.pending.length < 10) return;
-        const length = this.pending.readBigUInt64BE(2);
-        if (length > BigInt(MAX_MESSAGE)) throw new Error('Codex SSH response exceeds the transport limit.');
-        size = Number(length); header = 10;
-      }
-      if (size > MAX_MESSAGE || (opcode >= 8 && (!fin || size > 125))) throw new Error('Invalid Codex SSH WebSocket frame length.');
+      const length = readFrameLength(this.pending, 'Codex SSH response exceeds the transport limit.');
+      if (!length) return;
+      const { length: size, offset: header } = length;
+      // SSH rejects a bad control header immediately, without waiting for its payload.
+      if (opcode >= 8 && (!fin || size > 125)) throw new Error('Invalid Codex SSH WebSocket frame length.');
       if (this.pending.length < header + size) return;
       const payload = this.pending.subarray(header, header + size);
       this.pending = this.pending.subarray(header + size);
@@ -178,19 +159,19 @@ class SshRpc {
   }
 
   request(method, params, mutating = false) {
-    check(this.signal);
+    throwIfAborted(this.signal);
     if (this.closed) return Promise.reject(new Error('Codex SSH connection is closed.'));
     const id = ++this.id;
     const bytes = clientFrame(Buffer.from(JSON.stringify({ id, method, params })));
     return new Promise((resolve, reject) => {
       const call = { resolve, reject, mutating, written: false };
       this.calls.set(id, call);
-      try { check(this.signal); if (mutating) beforeWrite(this.signal); call.written = true; this.child.stdin.write(bytes); }
+      try { throwIfAborted(this.signal); if (mutating) beforeWrite(this.signal); call.written = true; this.child.stdin.write(bytes); }
       catch (error) { this.fail(error); }
     });
   }
 
-  notify(method) { check(this.signal); this.child.stdin.write(clientFrame(Buffer.from(JSON.stringify({ method, params: {} })))); }
+  notify(method) { throwIfAborted(this.signal); this.child.stdin.write(clientFrame(Buffer.from(JSON.stringify({ method, params: {} })))); }
 
   fail(error) {
     if (this.closed) return;

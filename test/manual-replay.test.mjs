@@ -167,6 +167,41 @@ test('MU31: notice retry requires an explicit true marker', windowsOnly, async t
   }
 });
 
+test('only the released manual marker authorizes a replay or owner notice retry', windowsOnly, async t => {
+  for (const manual of [true, false]) {
+    await t.test(manual ? 'migrated v1.0.6 manual row' : 'automatic row with an unrecognized origin field', async sub => {
+      const fixture = await setup(sub);
+      const session = createSession({ ...ownerLedger(fixture), cwd: fixture.cwd });
+      const { message } = recordMessage(session, { id: fixture.ids.message_id, direction, message: fixture.args.message,
+        route: fixture.route, manual });
+      finishMessage(session, message.id, { route: fixture.route, status: 'submitted', attemptId: message.attemptId });
+      const state = JSON.parse(fs.readFileSync(session.stateFile, 'utf8'));
+      const [key] = Object.keys(state.messages);
+      const { id, route, createdAt, updatedAt, senderPid, fingerprint } = state.messages[key];
+      state.messages[key] = { id, route, direction, message: fixture.args.message, createdAt, updatedAt, senderPid,
+        status: 'submitted', fingerprint, ...(manual ? { manual: true } : { origin: 'manual' }) };
+      fs.writeFileSync(session.stateFile, JSON.stringify(state));
+      const before = fs.readFileSync(session.stateFile);
+      seedSupplementary(fixture, { send_status: 'submitted', notice_status: 'failed', notice_attempted: true,
+        notice_retryable: true, sender_pid: process.pid });
+
+      if (manual) {
+        const replay = await manualSend(fixture.args, fixture.context);
+        assert.equal(replay.delivery.status, 'submitted');
+        assert.deepEqual(transportCounts(fixture), noTransport);
+        assert.equal((await retryManualNotice(fixture.ids, fixture.context)).notice_status, 'submitted');
+        assert.equal(fixture.notices.length, 1);
+        assert.equal(fixture.claude.messages.length, 0);
+      } else {
+        await assert.rejects(manualSend(fixture.args, fixture.context), { reason: 'id_conflict', message: /automatic send/ });
+        await assert.rejects(retryManualNotice(fixture.ids, fixture.context), /Only a confirmed submitted manual message/);
+        assert.deepEqual(transportCounts(fixture), noTransport);
+      }
+      assert.deepEqual(fs.readFileSync(session.stateFile), before);
+    });
+  }
+});
+
 test('MU32: notice retry refuses a conflicting supplementary fingerprint', windowsOnly, async t => {
   const fixture = await retryFixture(t);
   const counts = transportCounts(fixture);

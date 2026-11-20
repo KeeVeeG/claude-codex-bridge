@@ -9,7 +9,7 @@ import { nativeFixture as fixture } from './native-helpers.mjs';
 const storeUrl = new URL('../lib/store.mjs', import.meta.url).href;
 const DEAD_PID = 2_147_483_647;
 
-function worker(t, script, args, { watchdogMs = 15_000 } = {}) {
+function worker(t, script, args, { watchdogMs = 15_000, observe } = {}) {
   const child = spawn(process.execPath, ['--input-type=module', '-e', script, ...args], {
     stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
   });
@@ -18,23 +18,27 @@ function worker(t, script, args, { watchdogMs = 15_000 } = {}) {
   let readyResolve;
   let readyReject;
   let isReady = false;
+  let watchdogFired = false;
   const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
   let spawnError;
   child.on('error', error => { spawnError = error; });
   const closed = new Promise(resolve => {
     child.once('close', (code, signal) => {
-      if (!isReady) readyReject(spawnError ?? new Error(`Worker closed before ready (${code ?? signal}): ${stderr}`));
-      resolve({ code, signal, stdout, stderr });
+      const category = watchdogFired ? 'watchdog' : spawnError ? 'spawn' : signal ? 'signal' : code === 0 ? 'ok' : 'exit';
+      observe?.(`close-${category}`);
+      if (!isReady) readyReject(new Error(`Worker closed before ready (${category})`));
+      resolve({ code, stderr });
     });
   });
   child.stdout.setEncoding('utf8');
   child.stderr.setEncoding('utf8');
   child.stdout.on('data', text => {
+    if (isReady) return;
     stdout += text;
-    if (!isReady && stdout.includes('ready\n')) { isReady = true; readyResolve(); }
+    if (stdout === 'ready\n') { isReady = true; observe?.('ready'); readyResolve(); }
   });
-  child.stderr.on('data', text => { stderr += text; });
-  const watchdog = setTimeout(() => child.kill(), watchdogMs);
+  child.stderr.on('data', text => { if (!observe) stderr += text; });
+  const watchdog = setTimeout(() => { watchdogFired = true; child.kill(); }, watchdogMs);
   closed.then(() => clearTimeout(watchdog));
   t.after(async () => {
     if (child.exitCode === null && child.signalCode === null) child.kill();
@@ -58,6 +62,11 @@ test('simultaneous crash recovery never unlinks a replacement lock or loses upda
     const [stateDir, sessionKey, gate, sentinel, lock] = process.argv.slice(1);
     const session = loadSession({ stateDir, sessionKey });
     const sleeper = new Int32Array(new SharedArrayBuffer(4));
+    // Keep live-PID and token comparison in the real lock protocol, without
+    // starting competing PowerShell processes for creation tokens. The reused-PID
+    // test below separately exercises the native Windows creation-time check.
+    const identity = process.platform === 'win32'
+      ? { probe: pid => String(133_700_000_000_000_000n + BigInt(pid) * 10_000n) } : {};
     const originalRead = fs.readFileSync;
     let firstStaleRead = true;
     fs.readFileSync = function(file, ...args) {
@@ -82,7 +91,7 @@ test('simultaneous crash recovery never unlinks a replacement lock or loses upda
               Atomics.wait(sleeper, 0, 0, 2);
               state.counter = (state.counter ?? 0) + 1;
             } finally { fs.unlinkSync(sentinel); }
-          });
+          }, identity);
           break;
         } catch (error) {
           // The documented busy-acquisition rejection occurs before callback.
@@ -94,14 +103,22 @@ test('simultaneous crash recovery never unlinks a replacement lock or loses upda
       }
     }
   `;
-  const workers = Array.from({ length: 8 }, () => worker(t, script, [setup.stateDir, session.key, gate, sentinel, lock], { watchdogMs: 25_000 }));
+  const started = performance.now();
+  const elapsed = () => Math.round(performance.now() - started);
+  const workers = Array.from({ length: 8 }, (_, index) => worker(t, script, [setup.stateDir, session.key, gate, sentinel, lock], {
+    watchdogMs: 25_000,
+    observe: event => t.diagnostic(`C5 lock w${index + 1} ${event} ${elapsed()}ms`),
+  }));
   await Promise.all(workers.map(item => item.ready));
   fs.writeFileSync(gate, 'go');
+  t.diagnostic(`C5 lock gate 8 ${elapsed()}ms`);
   const results = await Promise.all(workers.map(item => item.closed));
-  for (const result of results) assert.equal(result.code, 0, result.stderr);
-  assert.equal(readSession(session).counter, 200);
-  assert.equal(fs.existsSync(lock), false);
-  assert.equal(fs.existsSync(path.join(session.dir, 'state.lock.recovery')), false);
+  assert.equal(results.filter(result => result.code === 0).length, 8);
+  const count = readSession(session).counter;
+  const remaining = [sentinel, lock, `${lock}.recovery`].filter(file => fs.existsSync(file)).length;
+  t.diagnostic(`C5 lock updates ${Number.isSafeInteger(count) ? count : 'unknown'} remaining ${remaining}`);
+  assert.ok(count === 200, 'All 200 updates must be present');
+  assert.equal(remaining, 0, 'critical section sentinel and both lock files must be gone');
 });
 
 test('a crash around atomic lock publication leaves either no lock or a recoverable complete lock', async t => {
