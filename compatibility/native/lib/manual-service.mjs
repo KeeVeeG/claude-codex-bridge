@@ -5,8 +5,8 @@ import { sendToCodex } from './codex-desktop.mjs';
 import { publicDelivery } from './delivery.mjs';
 import { manualLedgerPaths, readManualEntries, readManualEntry, updateManualEntry } from './manual-ledger.mjs';
 import { REASONS, errorOutcome, failure, outcome } from './outcome.mjs';
-import { routedRecord } from './call-store.mjs';
-import { defaultStateDir, ownerId, processAlive } from './store.mjs';
+import { routedRecord, repairSettlement } from './call-store.mjs';
+import { defaultStateDir, ledgerAt, ownerId, processAlive } from './store.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -33,7 +33,7 @@ function ledgerPaths(stateDir, threadId) {
 const routeFor = (owner, recipient) => ({ from: { kind: 'codex', id: owner }, to: { kind: 'claude', id: recipient } });
 const fingerprintFor = (route, message) => hash(JSON.stringify({ direction: 'to_claude', message, route }));
 
-function checked(record, key, paths) {
+function checked(record, key, paths, includeMessage = true) {
   if (record === undefined) return undefined;
   if (!/^[a-f0-9]{64}$/.test(key) || !object(record) || !safeId(record.message_id) ||
       typeof record.session_id !== 'string' || !record.session_id.trim() || Buffer.byteLength(record.session_id) > 256 ||
@@ -45,13 +45,16 @@ function checked(record, key, paths) {
       !Number.isSafeInteger(record.createdAt) || !Number.isSafeInteger(record.updatedAt)) {
     throw new Error('Manual bridge records contain an invalid delivery entry.');
   }
-  if (record.message !== undefined) {
-    requiredText(record.message, 'Saved manual message', 65536);
-    if (fingerprintFor(routeFor(paths.threadId, record.session_id), record.message) !== record.fingerprint) {
-      throw new Error('Saved manual message does not match its delivery entry.');
-    }
-  }
+  if (includeMessage && record.message !== undefined) checkedMessage(paths, record, record.message);
   return record;
+}
+
+function checkedMessage(paths, record, message) {
+  requiredText(message, 'Saved manual message', 65536);
+  if (fingerprintFor(routeFor(paths.threadId, record.session_id), message) !== record.fingerprint) {
+    throw new Error('Saved manual message does not match its delivery entry.');
+  }
+  return message;
 }
 
 function beginAttempt(record, attempts) {
@@ -96,16 +99,28 @@ function project(paths, record, legacy) {
   return visible;
 }
 
-/** Only a verified runtime owner may select threadId. Reads create no directories;
- * legacy records without a body have no message property. */
-export function readManualRecords({ stateDir, threadId }) {
+/** Only a verified runtime owner may select threadId. Reads create no directories.
+ * Catalogs can omit bodies; a conversation can request just its peer, and load
+ * only bodies it cannot recover from primary history. Missing text stays absent. */
+export function readManualRecords({ stateDir, threadId, sessionId, includeMessage = true }) {
   const paths = ledgerPaths(stateDir, threadId);
-  return Array.from(readManualEntries(paths), ([key, record, legacy]) => project(paths,
-    checked(record, key, paths), checked(legacy, key, paths)));
+  return Array.from(readManualEntries(paths, sessionId), ([key, record, legacy, loadMessage]) => {
+    const visible = project(paths, checked(record, key, paths, false), checked(legacy, key, paths, false));
+    delete visible.message;
+    if (typeof includeMessage === 'function' ? includeMessage(visible) : includeMessage) {
+      const message = loadMessage();
+      if (message !== undefined) visible.message = checkedMessage(paths, record, message);
+    }
+    return structuredClone(visible);
+  });
 }
 
-function originalMessage(stateDir, route, id, signal) {
-  return routedRecord({ stateDir, threadId: route.from.id }, route, id, signal);
+async function originalMessage(stateDir, route, id, signal) {
+  const owner = { stateDir, threadId: route.from.id };
+  const original = await routedRecord(owner, route, id, signal);
+  // Reconcile the authoritative primary receipt under its exact attempt before interpreting the
+  // shadow. This operation cannot call either transport, including when both receipts were lost.
+  return repairSettlement(ledgerAt(owner), original);
 }
 
 function primaryOutcome(args, record, { fresh, error }) {
@@ -250,6 +265,9 @@ function reconcile(paths, record, message, attempts) {
   if (message?.status === 'submitted' && record.send_status !== 'submitted') {
     Object.assign(record, { send_status: 'submitted', send_reason: undefined, error: undefined });
   }
+  if (!record.notice_attempted && message?.status === 'failed' && REASONS[message.reason]?.delivered === false) {
+    Object.assign(record, { send_status: 'failed', send_reason: message.reason });
+  }
   const retry = REASONS[record.send_reason];
   const unwritten = !message || (message.status === 'failed' && REASONS[message.reason]?.delivered === false);
   // Only an exact known rejection can re-arm a failed attempt. A stopped new
@@ -311,7 +329,7 @@ async function doManualSend(args, context, attempts) {
     }, { signal, onOverflow: noOverflowNotice });
     if (recovered) receipts.delete(recovered);
   } catch (error) {
-    if (error.reason === 'id_conflict') throw error;
+    if (error.reason === 'id_conflict' || error.outcome) throw error;
     // A read-only replay can still answer a known result even if acquiring a
     // write lock or repairing the shadow was impossible. This branch never sends.
     try { message ??= await readPrimary(); } catch (readError) { if (readError.reason === 'id_conflict') throw readError; }

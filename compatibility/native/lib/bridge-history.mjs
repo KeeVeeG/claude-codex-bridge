@@ -2,12 +2,17 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { defaultStateDir, interruptedSend } from './store.mjs';
+import { readHistoryLedger } from './history-ledger-reader.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const MiB = 1024 * 1024;
-const MAX_LEDGER_BYTES = 96 * MiB;
+// The scan ceiling bounds cold I/O/CPU, not the size of a read buffer. The
+// decoded projection has its own independent admission and retention bounds.
+const MAX_LEDGER_SCAN_BYTES = 512 * MiB;
+const MAX_VIEW_WEIGHT = 144 * MiB;
+const MAX_CACHED_VIEW_WEIGHT = 2 * MAX_VIEW_WEIGHT;
 const MAX_CATALOG_READ_BYTES = 96 * MiB;
-const MAX_PAGE_READ_BYTES = 2 * MAX_LEDGER_BYTES + 32 * MiB;
+const MAX_PAGE_READ_BYTES = 2 * MAX_LEDGER_SCAN_BYTES + 32 * MiB;
 const MAX_LEDGERS = 1024;
 const MAX_PAGE_BYTES = MiB;
 const statuses = new Set(['sending', 'submitted', 'failed', 'uncertain']);
@@ -23,7 +28,7 @@ const omitted = {
   LEDGER_CHANGED: 'A delivery ledger changed during the read. Refresh to try again.',
   LEDGER_UNAVAILABLE: 'Some delivery ledgers could not be read. Check access to the shared bridge state, then retry.',
   STATE_INVALID: 'Some delivery ledgers are unsafe, damaged, or use an unsupported format. Run bridge doctor and check the shared state before retrying.',
-  LEDGER_TOO_LARGE: 'Some delivery ledgers exceed the safe read size. Their histories were not checked; keep the original data when asking for help.',
+  LEDGER_TOO_LARGE: 'Some delivery ledgers exceed safe history read limits. Their histories were not checked; keep the original data when asking for help.',
   SCAN_LIMIT: 'Some delivery ledgers were not checked within this scan limit. Refresh the catalog to continue discovery.',
   ROUTING_METADATA: 'Some delivery records lack exact routing metadata and cannot be assigned to this conversation.',
   RECORD_INVALID: 'Some invalid or duplicate bridge delivery records were skipped. Check the shared state if expected records are missing.',
@@ -39,7 +44,7 @@ function rememberView(key, entry) {
   views.delete(key);
   views.set(key, entry);
   viewWeight += entry.weight;
-  while (viewWeight > 2 * MAX_LEDGER_BYTES || views.size > MAX_LEDGERS) {
+  while (viewWeight > MAX_CACHED_VIEW_WEIGHT || views.size > MAX_LEDGERS) {
     const oldest = views.keys().next().value;
     viewWeight -= views.get(oldest).weight;
     views.delete(oldest);
@@ -108,60 +113,86 @@ const compareKeys = (left, right) => left.localeCompare(right) || (left < right 
 const order = r => Number.isSafeInteger(r.orderAt) ? r.orderAt : r.createdAt;
 const compare = (left, right) => order(left) - order(right) || compareKeys(sortKey(left), sortKey(right));
 
-function addRoute(pairs, peer, key, record, full, warnings) {
-  let pair = pairs.get(peer);
-  const prefix = pair?.prefix ?? 'route:' + hash(JSON.stringify({ from: { kind: record.route.from.kind, id: record.route.from.id }, to: { kind: record.route.to.kind, id: record.route.to.id } })) + ':';
-  if (key !== prefix + record.id) { warnings.add('RECORD_INVALID'); return; }
-  if (!pair) pairs.set(peer, pair = { prefix, latest: record.createdAt, order: order(record), ...(full ? { byId: new Map() } : {}) });
-  if (pair.byId) {
-    if (pair.byId.has(record.id)) { warnings.add('RECORD_INVALID'); return; }
-    const { id, direction, createdAt, orderAt, status, message, senderPid, startedTick, manual, fingerprint } = record;
-    pair.byId.set(id, { id, direction, createdAt, orderAt, status, message, senderPid, startedTick, manual, fingerprint });
-  }
-  if (order(record) >= pair.order) { pair.latest = record.createdAt; pair.order = order(record); }
-}
+// Detach retained metadata from its parsed row, whose other fields may be large.
+const detached = text => Buffer.from(text, 'utf16le').toString('utf16le');
+const claudeOf = thread => typeof thread === 'string' && thread.startsWith('claude:') ? thread.slice(7) : '';
+const integer = value => Number.isSafeInteger(value) ? value : undefined;
 
-function buildView(state, key, owner, full) {
-  // Earlier stores may have only requests, not a messages map.
-  if (!object(state) || state.schemaVersion !== 1 || state.key !== key || typeof state.threadId !== 'string' ||
-      hash(state.threadId) !== key || typeof state.cwd !== 'string' ||
-      (state.messages !== undefined && !object(state.messages))) throw stateError('STATE_INVALID');
+function buildView(ledgerKey, owner, full, ownerLedger) {
   const outgoing = new Map();
   const incoming = new Map();
   const warnings = new Set();
-  const claude = state.threadId.startsWith('claude:') ? state.threadId.slice(7) : '';
-  const incomingLedger = sessionPattern.test(claude);
-  const outgoingLedger = state.threadId === owner;
-  if (outgoingLedger || incomingLedger) {
-    const messages = state.messages ?? {};
-    for (const key in messages) {
-      const record = messages[key];
-      if (!object(record)) { warnings.add('RECORD_INVALID'); continue; }
-      if (!object(record.route) || !object(record.route.from) || !object(record.route.to)) {
-        warnings.add('ROUTING_METADATA'); continue;
-      }
-      const { from, to } = record.route;
-      // Same-UUID remote deliveries and apparent routes stamped by a different ledger owner are not local history.
-      if (Object.hasOwn(from, 'host_id') || Object.hasOwn(to, 'host_id')) continue;
-      const toClaude = outgoingLedger && record.direction === 'to_claude' &&
-        from.kind === 'codex' && from.id === owner && to.kind === 'claude';
-      const toCodex = incomingLedger && record.direction === 'to_codex' &&
-        from.kind === 'claude' && from.id === claude && to.kind === 'codex';
-      if (!toClaude && !toCodex) continue;
-      if ((toClaude && (typeof to.id !== 'string' || !sessionPattern.test(to.id))) ||
-          (toCodex && (typeof to.id !== 'string' || !to.id.trim() || Buffer.byteLength(to.id) > 512 || /[\r\n\0]/.test(to.id))) ||
-          typeof record.id !== 'string' || !idPattern.test(record.id) ||
-          typeof record.message !== 'string' || Buffer.byteLength(record.message) > 65536 ||
-          !Number.isSafeInteger(record.createdAt) || record.createdAt < 0 || !statuses.has(record.status)) {
-        warnings.add('RECORD_INVALID'); continue;
-      }
-      addRoute(toClaude ? outgoing : incoming, to.id, key, record, full, warnings);
+  let incomingOwner;
+  let weight = 1024;
+  const charge = bytes => {
+    weight += bytes;
+    if (weight > MAX_VIEW_WEIGHT) throw stateError('LEDGER_TOO_LARGE');
+  };
+
+  function visit(key, record, threadId) {
+    const claude = claudeOf(threadId);
+    if (threadId !== undefined && !ownerLedger && !sessionPattern.test(claude)) return;
+    if (!object(record)) { warnings.add('RECORD_INVALID'); return; }
+    if (!object(record.route) || !object(record.route.from) || !object(record.route.to)) {
+      warnings.add('ROUTING_METADATA'); return;
     }
+    const { from, to } = record.route;
+    // Same-UUID remote deliveries and apparent routes stamped by a different ledger owner are not local history.
+    if (Object.hasOwn(from, 'host_id') || Object.hasOwn(to, 'host_id')) return;
+    const toClaude = ownerLedger && record.direction === 'to_claude' &&
+      from.kind === 'codex' && from.id === owner && to.kind === 'claude';
+    const toCodex = record.direction === 'to_codex' && from.kind === 'claude' && to.kind === 'codex' &&
+      typeof from.id === 'string' && sessionPattern.test(from.id) && (threadId !== undefined ? from.id === claude :
+        // JSON member order is not significant. Check the ledger key provisionally
+        // when messages precede the header, then verify the exact owner at finish.
+        (incomingOwner === undefined ? hash(`claude:${from.id}`) === ledgerKey : from.id === incomingOwner));
+    if (!toClaude && !toCodex) return;
+    if ((toClaude && (typeof to.id !== 'string' || !sessionPattern.test(to.id))) ||
+        (toCodex && (typeof to.id !== 'string' || !to.id.trim() || Buffer.byteLength(to.id) > 512 || /[\r\n\0]/.test(to.id))) ||
+        typeof record.id !== 'string' || !idPattern.test(record.id) ||
+        typeof record.message !== 'string' || Buffer.byteLength(record.message) > 65536 ||
+        !Number.isSafeInteger(record.createdAt) || record.createdAt < 0 || !statuses.has(record.status)) {
+      warnings.add('RECORD_INVALID'); return;
+    }
+    if (toCodex && incomingOwner === undefined) incomingOwner = detached(from.id);
+    const pairs = toClaude ? outgoing : incoming;
+    let pair = pairs.get(to.id);
+    const prefix = pair?.prefix ?? 'route:' + hash(JSON.stringify({ from: { kind: from.kind, id: from.id }, to: { kind: to.kind, id: to.id } })) + ':';
+    if (key !== prefix + record.id) { warnings.add('RECORD_INVALID'); return; }
+    if (!pair) {
+      charge(640 + 2 * to.id.length);
+      pairs.set(detached(to.id), pair = { prefix, latest: record.createdAt, order: order(record), ...(full ? { byId: new Map() } : {}) });
+    }
+    if (pair.byId) {
+      const { id, status, message, createdAt, fingerprint } = record;
+      if (pair.byId.has(id)) { warnings.add('RECORD_INVALID'); return; }
+      // One compact retained copy of the body; decode only messages returned on a page.
+      const encoding = message.isWellFormed() ? 'utf8' : 'utf16le';
+      charge(512 + 2 * id.length + Buffer.byteLength(message, encoding));
+      const body = Buffer.from(message, encoding);
+      const rowId = detached(id);
+      pair.byId.set(rowId, { id: rowId, direction: toClaude ? 'to_claude' : 'to_codex', createdAt, status,
+        orderAt: integer(record.orderAt), senderPid: integer(record.senderPid), startedTick: integer(record.startedTick),
+        manual: record.manual === true, fingerprint: typeof fingerprint === 'string' && keyPattern.test(fingerprint) ? detached(fingerprint) : undefined,
+        get message() { return body.toString(encoding); } });
+    }
+    if (order(record) >= pair.order) { pair.latest = record.createdAt; pair.order = order(record); }
   }
-  if (full) for (const pairs of [outgoing, incoming]) {
-    for (const pair of pairs.values()) pair.records = [...pair.byId.values()].sort(compare);
+
+  function finish(state) {
+    if (state.schemaVersion !== 1 || state.key !== ledgerKey || typeof state.threadId !== 'string' ||
+        hash(state.threadId) !== ledgerKey || typeof state.cwd !== 'string' ||
+        (ownerLedger && state.threadId !== owner)) throw stateError('STATE_INVALID');
+    const claude = claudeOf(state.threadId);
+    if (incomingOwner !== claude) incoming.clear();
+    if (!ownerLedger && !sessionPattern.test(claude)) warnings.clear();
+    if (full) for (const pairs of [outgoing, incoming]) {
+      for (const pair of pairs.values()) pair.records = [...pair.byId.values()].sort(compare);
+    }
+    return { view: { claude, outgoing, incoming, warnings }, weight };
   }
-  return { claude, outgoing, incoming, warnings };
+
+  return { visit, finish };
 }
 
 async function safeLedger(root, key, budget, owner, full, signal) {
@@ -201,35 +232,33 @@ async function safeLedger(root, key, budget, owner, full, signal) {
         rememberView(cacheKey, cached);
         return cached.view;
       }
-      if (before.size > MAX_LEDGER_BYTES) throw stateError('LEDGER_TOO_LARGE');
+      if (before.size > MAX_LEDGER_SCAN_BYTES) throw stateError('LEDGER_TOO_LARGE');
       const size = Number(before.size);
-      if (size > budget.remaining) throw stateError('SCAN_LIMIT');
+      // A discovery window can admit one oversized cold ledger on a fresh
+      // budget, or defer it to the next refresh via the existing resume key.
+      if (size > budget.remaining && !(budget.allowLarge && budget.remaining === MAX_CATALOG_READ_BYTES)) throw stateError('SCAN_LIMIT');
       const handle = await fs.open(file, 'r');
-      let bytes;
+      const builder = buildView(key, owner, full, ownerLedger);
+      let state, readError;
       try {
         const opened = await handle.stat({ bigint: true });
         if (!opened.isFile() || !sameVersion(before, opened)) continue;
         await assertLedgerDirectories(root, directory);
         budget.remaining -= size;
-        bytes = Buffer.alloc(size + 1);
-        let offset = 0;
-        while (offset < bytes.length) {
-          checkCancellation(signal);
-          const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
-          if (!bytesRead) break;
-          offset += bytesRead;
+        try { state = await readHistoryLedger(handle, size, () => checkCancellation(signal), builder.visit); }
+        catch (error) {
+          if (error.code === 'LEDGER_CHANGED') continue;
+          if (error.code !== 'STATE_INVALID' && error.code !== 'LEDGER_TOO_LARGE') throw error;
+          readError = error;
         }
-        if (offset !== size || !sameVersion(opened, await handle.stat({ bigint: true }))) continue;
+        if (!sameVersion(opened, await handle.stat({ bigint: true }))) continue;
       } finally { await handle.close(); }
       await assertLedgerDirectories(root, directory);
       const after = await fs.lstat(file, { bigint: true });
       if (!after.isFile() || after.isSymbolicLink() || !sameVersion(before, after)) continue;
-      let state;
-      try { state = JSON.parse(bytes.subarray(0, size).toString('utf8')); }
-      catch { throw stateError('STATE_INVALID'); }
-      if (ownerLedger && state?.threadId !== owner) throw stateError('STATE_INVALID');
-      const view = buildView(state, key, owner, full);
-      const weight = full ? size + 1024 : 1024 + (view.outgoing.size + view.incoming.size) * 1024;
+      checkCancellation(signal);
+      if (readError) throw readError;
+      const { view, weight } = builder.finish(state);
       rememberView(cacheKey, { directory, version: after, full, view, weight });
       return view;
     } catch (error) {
@@ -264,8 +293,8 @@ async function collectViews({ stateDir, ownerThreadId, sessionId, signal, visit 
   }
   const ownerKey = hash(ownerThreadId);
   const positionKey = JSON.stringify([root.path, root.dev.toString(), root.ino.toString(), ownerKey]);
-  const budget = { remaining: sessionId === undefined ? MAX_CATALOG_READ_BYTES : MAX_PAGE_READ_BYTES };
-  const ownerBudget = sessionId === undefined ? { remaining: MAX_LEDGER_BYTES } : budget;
+  const budget = sessionId === undefined ? { remaining: MAX_CATALOG_READ_BYTES, allowLarge: true } : { remaining: MAX_PAGE_READ_BYTES };
+  const ownerBudget = sessionId === undefined ? { remaining: MAX_LEDGER_SCAN_BYTES } : budget;
   try {
     let keys;
     if (sessionId !== undefined) {
@@ -326,13 +355,13 @@ function visitPairs(view, ownerThreadId, sessionId, visit) {
   if (incoming && (sessionId === undefined || sessionId === view.claude)) visit(view.claude, incoming, 'to_codex');
 }
 
-async function manualRecords(stateDir, threadId, scan, signal) {
+async function manualRecords(stateDir, threadId, scan, signal, selection) {
   if (!scan.root) return [];
   try {
     const { readManualRecords } = await import('./manual-service.mjs');
     await assertDirectory(scan.root, true);
     checkCancellation(signal);
-    return await readManualRecords({ stateDir, threadId });
+    return await readManualRecords({ stateDir, threadId, ...selection });
   } catch (error) {
     checkCancellation(signal);
     if (isRootError(error.code)) {
@@ -340,6 +369,7 @@ async function manualRecords(stateDir, threadId, scan, signal) {
       scan.incomplete = true;
       scan.warnings.push(omitted[error.code]);
     } else {
+      scan.incomplete = true; // Missing shadow-only texts can fall on either side of the requested cursor.
       scan.warnings.push('Manual delivery notice metadata could not be read. Refresh to retry, or check access to the shared bridge state.');
     }
     return [];
@@ -367,7 +397,7 @@ export async function listBridgeContacts({ stateDir = defaultStateDir(), ownerTh
   const scan = await collectViews({ stateDir, ownerThreadId, signal, visit: view => {
     visitPairs(view, ownerThreadId, undefined, (peer, pair) => add(peer, pair.latest, pair.order));
   } });
-  for (const record of await manualRecords(stateDir, ownerThreadId, scan, signal)) {
+  for (const record of await manualRecords(stateDir, ownerThreadId, scan, signal, { includeMessage: false })) {
     if (record.manual === true && record.send_status === 'submitted' && sessionPattern.test(record.session_id) &&
         Number.isSafeInteger(record.createdAt) && record.createdAt >= 0) add(record.session_id, record.createdAt);
   }
@@ -381,7 +411,7 @@ function readCursor(cursor, ownerThreadId, sessionId) {
   try {
     const value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
     if (!object(value) || value.v !== 1 || value.owner !== hash(ownerThreadId) || value.session !== hash(sessionId) ||
-        !Number.isSafeInteger(value.at) || value.at < 0 || typeof value.key !== 'string' ||
+        !Number.isSafeInteger(value.at) || value.at < 0 || (value.order !== undefined && (!Number.isSafeInteger(value.order) || value.order < 0)) || typeof value.key !== 'string' ||
         !/^(to_claude|to_codex):[a-zA-Z0-9_-]{1,100}$/.test(value.key)) throw new Error('Invalid cursor');
     return value;
   } catch { throw new Error('Invalid conversation cursor.'); }
@@ -389,7 +419,7 @@ function readCursor(cursor, ownerThreadId, sessionId) {
 
 function makeCursor(record, ownerThreadId, sessionId) {
   return Buffer.from(JSON.stringify({ v: 1, owner: hash(ownerThreadId), session: hash(sessionId),
-    at: order(record), key: sortKey(record) })).toString('base64url');
+    at: record.createdAt, order: order(record), key: sortKey(record) })).toString('base64url');
 }
 
 function seekBefore(records, before) {
@@ -421,7 +451,8 @@ export async function getBridgeConversation({ stateDir = defaultStateDir(), owne
   const notices = new Map();
   const shadowRows = [];
   let orphans = 0;
-  for (const record of await manualRecords(stateDir, ownerThreadId, scan, signal)) {
+  for (const record of await manualRecords(stateDir, ownerThreadId, scan, signal, { sessionId,
+    includeMessage: row => row.send_status === 'submitted' && !outgoing?.byId.has(row.message_id) })) {
     if (record.manual !== true || record.session_id !== sessionId) continue;
     const primary = outgoing?.byId.get(record.message_id);
     if (primary?.fingerprint === record.fingerprint) notices.set(record.message_id, record);
@@ -443,7 +474,15 @@ export async function getBridgeConversation({ stateDir = defaultStateDir(), owne
     return { session_id: sessionId, messages: [], next_cursor: cursor ?? null, has_more: before !== null, warnings: scan.warnings };
   }
   const sources = [outgoing?.records ?? [], incoming?.records ?? [], shadowRows.sort(compare)];
-  const positions = sources.map(rows => seekBefore(rows, before));
+  // A 1.0 writer sorted by civil time. If its boundary row has since acquired an additive
+  // order stamp, seek by that exact row rather than interpreting civil time as commit order.
+  let boundary = before;
+  if (before) {
+    const [direction, id] = before.key.split(':');
+    const prior = (direction === 'to_claude' ? outgoing : incoming)?.byId.get(id);
+    boundary = { ...before, at: before.order ?? (prior?.createdAt === before.at ? order(prior) : before.at) };
+  }
+  const positions = sources.map(rows => seekBefore(rows, boundary));
   const page = [];
   let oldest;
   let bytes = 0;

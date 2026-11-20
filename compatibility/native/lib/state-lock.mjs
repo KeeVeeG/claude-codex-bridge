@@ -8,6 +8,7 @@ import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readProcessStart } from './claude-process.mjs';
 import { inquire, remainingMs, throwIfStopped } from './call-time.mjs';
+import { ensureStateDirectory } from './state-directory.mjs';
 import { failure } from './outcome.mjs';
 
 const sleep = new Int32Array(new SharedArrayBuffer(4));
@@ -67,6 +68,23 @@ function readOwner(file) {
   if (!Number.isSafeInteger(value?.pid) || value.pid <= 0) throw failure('The saved bridge records have an unverifiable lock owner. Stop all bridge sessions and run bridge_doctor before coordinated recovery.', 'state_unavailable', { code: 'LOCK_INCOMPLETE' });
   return value;
 }
+// Read-only doctor check. Never acquire, remove or refresh either lock while diagnosing it.
+export function inspectStateLocks(directory) {
+  const offline = 'Quit both apps, stop every bridge server and installer, and back up the complete state. Follow the offline lock recovery steps in the README; do not resend to reconstruct a receipt.';
+  try {
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return { status: 'fail', detail: 'The lock location cannot be verified. Check the configured state directory.' };
+    for (const [name, recovery] of [['state.lock.recovery', true], ['state.lock', false]]) {
+      let owner;
+      try { owner = readOwner(path.join(directory, name)); } catch (e) {
+        if (e.code === 'ENOENT') continue;
+        return { status: 'fail', detail: `The lock owner cannot be verified. If another bridge is just starting, check again after it finishes. If the condition persists: ${offline}` };
+      }
+      if (recovery && !processAlive(owner.pid)) return { status: 'fail', detail: `Recovery was interrupted and its owner no longer runs. ${offline}` };
+    }
+  } catch (e) { if (e.code !== 'ENOENT') return { status: 'fail', detail: 'The bridge could not inspect the lock location. Check access to the shared state.' }; }
+}
+
 function* alive(owner, io) {
   if (!processAlive(owner.pid)) return false;
   if (owner.pid === process.pid && !owner.procStartFt && !owner.procStartUtc && !Number.isSafeInteger(owner.procStartMs)) return true;
@@ -127,18 +145,24 @@ function* transaction(directory, callback, io) {
     throwIfStopped(io.signal); yield io.pause(15, true);
   };
   throwIfStopped(io.signal);
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  ensureStateDirectory(directory);
   const lock = path.join(directory, 'state.lock'), guard = path.join(directory, 'state.lock.recovery');
   for (const file of [lock, guard]) if (pendingRelease.has(file)) try { clean(file, pendingRelease.get(file)); } catch {}
   const token = randomUUID();
   const start = ownStart ?? (yield io.start(process.pid));
   if (start) ownStart = start; // Only this same process's own immutable creation token is cached.
   const owner = { pid: process.pid, token, createdAt: Date.now(), ...(process.platform === 'win32' && isFt(start) ? { procStartFt: start, procStartMs: winMs(start) } : {}), ...(process.platform === 'darwin' && validDate(start) ? { procStartUtc: start } : {}) };
+  let observedOwner;
   for (;;) {
     check();
     try { publish(lock, owner); break; } catch (e) { if (e.code !== 'EEXIST') { yield* retry(e); continue; } }
     let other;
     try { other = readOwner(lock); } catch (e) { if (e.code !== 'ENOENT') yield* retry(e); continue; }
+    // Most foreign writers finish inside one retry interval. Wait once before starting an OS
+    // creation-time query; this observation never licenses removal or caches a PID's identity.
+    if (typeof other.token === 'string' && other.token !== observedOwner && other.pid !== process.pid && processAlive(other.pid)) {
+      observedOwner = other.token; yield io.pause(15, true); continue;
+    }
     if (yield* alive(other, io)) { yield io.pause(15, true); continue; }
     check();
     try { publish(guard, owner); } catch (e) {

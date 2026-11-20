@@ -139,7 +139,9 @@ for (const pin of [false, true]) test(`legacy default blocks until offline cutov
   assert.equal(directory, f.oldState);
   assert.match(stateDirectoryWarning(directory, { homeDir: f.homeDir }), /unpinned 1\.0\.x/);
   assert.equal(getMessages(getSession({ stateDir: directory, threadId: 'record-owner' }))[0].id, 'preserved');
+  const selectedBeforeMove = getSession({ stateDir: directory, threadId: 'record-owner' });
   fs.renameSync(f.oldState, destination); // Operator cutover or a released 1.0.x online move.
+  assert.throws(() => recordMessage(selectedBeforeMove, { id: 'late', direction: 'to_claude', message: 'Not reserved.' }, { peek: false }), { reason: 'state_unavailable' });
   const legacyPin = { CLAUDE_CODEX_BRIDGE_STATE_DIR: f.oldState };
   assert.throws(() => defaultStateDir({ homeDir: f.homeDir, env: legacyPin }), { reason: 'state_unavailable', message: /Do not recreate/ });
   assert.equal(fs.existsSync(f.oldState), false);
