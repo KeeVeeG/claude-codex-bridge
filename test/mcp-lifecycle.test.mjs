@@ -82,7 +82,7 @@ test('MCP catalogs, resources, and tools progress while sends retain order', asy
   client.write(send('first'));
   await started.promise;
   client.write(send('second'), send('third'), request('ping', 'ping'), request('tools', 'tools/list'),
-    request('resources', 'resources/list'), request('read', 'resources/read', { uri: 'ui://bridge/panel-v6.html' }),
+    request('resources', 'resources/list'), request('read', 'resources/read', { uri: 'ui://bridge/panel-v7.html' }),
     tool('read-only', 'list_deliveries'));
   assert.deepEqual((await client.response('ping')).result, {});
   const [tools, resources, read, readOnly] = await Promise.all(['tools', 'resources', 'read', 'read-only'].map(client.response));

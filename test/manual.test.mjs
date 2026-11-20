@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { performance } from 'node:perf_hooks';
@@ -668,4 +668,81 @@ test('A04: a filled v1 shadow preserves old entries while new primary sends and 
   assert.equal(fs.readFileSync(fixture.ledgerFile, 'utf8'), before);
   assert.equal(userFrames(fixture.claude).length, 2);
   assert.equal(fixture.notices.length, 0);
+});
+
+test('C3 handoff: at ledger capacity the panel history shows the submitted primary and the omitted notice after reload', windowsOnly, async t => {
+  const fixture = await setup(t);
+  const { getBridgeConversation } = await import('../lib/bridge-history.mjs');
+  // A04's ledger shape: fill the compact v1 file so one more row cannot fit.
+  const legacy = { schemaVersion: 1, owner_thread_id: fixture.owner, records: {} };
+  const message_id = 'legacy-pad';
+  const pad = { message_id, session_id: fixture.args.session_id, fingerprint: 'f'.repeat(64), manual: true, send_status: 'submitted',
+    notice_status: 'submitted', notice_attempted: true, notice_retryable: false, sender_pid: process.pid, createdAt: 1, updatedAt: 1, notice_error: '' };
+  legacy.records[recordKey({ ...fixture.args, message_id })] = pad;
+  pad.notice_error = 'x'.repeat(4 * 1024 * 1024 - 64 - Buffer.byteLength(JSON.stringify(legacy, null, 2) + '\n'));
+  fs.mkdirSync(path.dirname(fixture.ledgerFile), { recursive: true });
+  fs.writeFileSync(fixture.ledgerFile, JSON.stringify(legacy, null, 2) + '\n');
+  const args = { ...fixture.args, message_id: 'capacity-send' };
+  const sent = await manualSend(args, fixture.context);
+  assert.deepEqual([sent.outcome.delivered, sent.notice_status, sent.notice_retryable, sent.notice_omitted, sent.notice_outcome.reason],
+    [true, 'failed', false, true, 'state_unavailable']);
+  assert.equal(fixture.notices.length, 0);
+  const page = await getBridgeConversation({ stateDir: fixture.stateDir, ownerThreadId: fixture.owner, sessionId: args.session_id });
+  const row = page.messages.find(message => message.id === args.message_id);
+  assert.deepEqual([row.status, row.manual, row.notice_status, row.notice_retryable, row.notice_reason, row.notice_omitted, row.message],
+    ['submitted', true, 'failed', false, 'state_unavailable', true, args.message]);
+});
+
+test('Q04: a notice the stopped sender never claimed is retryable once and never resends Claude', windowsOnly, async t => {
+  const fixture = await setup(t);
+  await manualSend(fixture.args, fixture.context);
+  assert.equal(fixture.notices.length, 1);
+  // Rewind the record to the moment after Claude's submission and before the notice claim,
+  // owned by a sender that has since exited.
+  const dead = spawnSync(process.execPath, ['-e', ''], { windowsHide: true }).pid;
+  const ledger = JSON.parse(fs.readFileSync(fixture.ledgerFile, 'utf8'));
+  const record = ledger.records[recordKey(fixture.args)];
+  Object.assign(record, { notice_status: 'pending', notice_attempted: false, notice_retryable: false, sender_pid: dead });
+  for (const field of ['notice_reason', 'notice_error', 'writer_id', 'attempt_id']) delete record[field];
+  fs.writeFileSync(fixture.ledgerFile, JSON.stringify(ledger, null, 2) + '\n');
+  const [visible] = history(fixture);
+  assert.deepEqual([visible.send_status, visible.notice_status, visible.notice_retryable], ['submitted', 'pending', true]);
+  const args = { session_id: fixture.args.session_id, message_id: fixture.args.message_id };
+  const results = await Promise.allSettled([retryManualNotice(args, fixture.context), retryManualNotice(args, fixture.context)]);
+  assert.equal(results.filter(result => result.status === 'fulfilled' && result.value.notice_status === 'submitted').length, 1);
+  assert.equal(fixture.notices.length, 2);
+  assert.ok(fixture.notices[1].arguments.prompt.endsWith(fixture.args.message));
+  assert.equal(userFrames(fixture.claude).length, 1);
+  await assert.rejects(retryManualNotice(args, fixture.context), /not safely retryable/);
+});
+
+test('U208: manual text with NUL or over the byte limit is refused before any state with a specific reason', windowsOnly, async t => {
+  const fixture = await setup(t);
+  await assert.rejects(manualSend({ ...fixture.args, message: 'left\0right' }, fixture.context),
+    error => error.reason === 'invalid_argument' && /NUL character/.test(error.message));
+  await assert.rejects(manualSend({ ...fixture.args, message: '漢'.repeat(21846) }, fixture.context),
+    error => error.reason === 'invalid_argument' && /65538 UTF-8 bytes; the limit is 65536/.test(error.message));
+  assert.equal(fs.existsSync(path.join(fixture.stateDir, 'manual')), false);
+  assert.equal(userFrames(fixture.claude).length, 0);
+});
+
+test('E01: an owner notice receipt that cannot be saved still reports both writes and the original ID', windowsOnly, async t => {
+  const breakLedger = fixture => { fs.renameSync(fixture.ledgerFile, `${fixture.ledgerFile}.moved`); fs.mkdirSync(fixture.ledgerFile); };
+  await t.test('send', async sub => {
+    let fixture;
+    fixture = await setup(sub, { onNotice: () => breakLedger(fixture) });
+    const result = await manualSend(fixture.args, fixture.context);
+    assert.equal(result.delivery.message_id, fixture.args.message_id);
+    assert.deepEqual([result.outcome.delivered, result.notice_outcome.reason, result.notice_outcome.delivered], [true, 'settlement_failed', true]);
+    assert.deepEqual([userFrames(fixture.claude).length, fixture.notices.length], [1, 1]);
+  });
+  await t.test('retry', async sub => {
+    let fixture, armed = false;
+    fixture = await setup(sub, { noticeFailure: 'schema', onNotice: () => { if (armed) breakLedger(fixture); } });
+    assert.equal((await manualSend(fixture.args, fixture.context)).notice_retryable, true);
+    fixture.failureMode.current = null; armed = true;
+    const result = await retryManualNotice({ session_id: fixture.args.session_id, message_id: fixture.args.message_id }, fixture.context);
+    assert.deepEqual([result.delivery.message_id, result.notice_outcome.reason], [fixture.args.message_id, 'settlement_failed']);
+    assert.deepEqual([userFrames(fixture.claude).length, fixture.notices.length], [1, 1]);
+  });
 });

@@ -19,9 +19,11 @@ const safeId = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,100}$/.te
 const recordKey = (sessionId, messageId) => hash(JSON.stringify([sessionId, messageId]));
 
 function requiredText(value, name, maximum) {
-  if (typeof value !== 'string' || !value.trim() || /\0/.test(value) || Buffer.byteLength(value) > maximum) {
-    throw new Error(`${name} must be nonempty text, at most ${maximum} UTF-8 bytes.`);
-  }
+  if (typeof value !== 'string' || !value.trim()) throw failure(`${name} must be nonempty text.`, 'invalid_argument');
+  // U208: name the exact obstacle; the panel shows it beside the draft it keeps.
+  if (value.includes('\0')) throw failure(`${name} contains a NUL character (U+0000). Remove it and send again.`, 'invalid_argument');
+  const bytes = Buffer.byteLength(value);
+  if (bytes > maximum) throw failure(`${name} is ${bytes} UTF-8 bytes; the limit is ${maximum}. Shorten it and send again.`, 'invalid_argument');
   return value;
 }
 
@@ -51,7 +53,9 @@ function checked(record, key, paths, includeMessage = true) {
 }
 
 function checkedMessage(paths, record, message) {
-  requiredText(message, 'Saved manual message', 65536);
+  if (typeof message !== 'string' || !message.trim() || message.includes('\0') || Buffer.byteLength(message) > 65536) {
+    throw new Error('Saved manual message is not valid text.');
+  }
   if (fingerprintFor(routeFor(paths.threadId, record.session_id), message) !== record.fingerprint) {
     throw new Error('Saved manual message does not match its delivery entry.');
   }
@@ -97,8 +101,14 @@ function project(paths, record, legacy) {
   if (visible.notice_status === 'pending' && visible.notice_attempted && interrupted(oldNotice ?? visible)) {
     visible.notice_status = 'uncertain'; visible.notice_retryable = false;
   }
+  if (unclaimedNotice(visible)) visible.notice_retryable = true;
   return visible;
 }
+
+/** Q04: the sender stopped after Claude took the message and before it claimed the owner notice.
+ * The durable, never-attempted claim makes one explicit notice attempt safe. */
+const unclaimedNotice = record => record.send_status === 'submitted' && record.notice_status === 'pending' &&
+  record.notice_attempted === false && !record.overflow && interrupted(record);
 
 /** Only a verified runtime owner may select threadId. Reads create no directories.
  * Catalogs can omit bodies; a conversation can request just its peer, and load
@@ -151,6 +161,7 @@ function resultFor(args, route, record, message, submittedDelivery, { fresh = fa
     ...(record.error ? { error: record.error } : {}), manual: true }, manual: true,
   notice_status: record.notice_status, notice_retryable: record.notice_retryable === true,
   ...(record.notice_error ? { notice_error: record.notice_error } : {}),
+  ...(record.overflow && record.notice_status === 'failed' && !record.notice_attempted ? { notice_omitted: true } : {}),
   outcome: primary ?? primaryOutcome(args, record, { fresh, error }), ...(posted ? { notice_outcome: posted } : {}) };
 }
 
@@ -446,7 +457,7 @@ async function doRetryManualNotice(args, context, attempts) {
           (message.manual !== true && message.origin !== 'manual')))) throw new Error(confirmed);
       const text = record.message ?? message?.message;
       if (text === undefined || fingerprintFor(route, text) !== record.fingerprint) throw new Error(confirmed);
-      if (record.overflow || record.notice_status !== 'failed' || record.notice_retryable !== true) {
+      if (!unclaimedNotice(record) && (record.overflow || record.notice_status !== 'failed' || record.notice_retryable !== true)) {
         throw new Error('This owner notice is not safely retryable. Inspect the current Codex chat before taking another action.');
       }
       originalArgs = { ...args, message: text };

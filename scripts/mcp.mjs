@@ -13,7 +13,7 @@ import { MAX_CODEX_CHAT_LIMIT } from '../lib/codex-desktop.mjs';
 // later would mix two versions in one running server. The lib modules' dynamic imports then
 // resolve to these already loaded copies.
 import { warmLedgerWorker } from '../lib/call-store.mjs';
-import { executeBridgeTool, hasCodexCallerMetadata } from '../lib/bridge-service.mjs';
+import { PANEL_CATALOG, executeBridgeTool, hasCodexCallerMetadata } from '../lib/bridge-service.mjs';
 import { publishCodexHost, getCodexHosts } from '../lib/codex-host.mjs';
 import '../lib/manual-service.mjs';
 import '../lib/claude-history.mjs';
@@ -49,8 +49,13 @@ const codexChat = schema({ thread_id: outputText, title: outputText, status: out
 const outcomeProperty = { ...OUTCOME_SCHEMA, description: 'retry: same_id = repeat the identical call; after_fix = fix the cause first; new_id = only a new message_id can send it; inspect = check the recipient and list_deliveries before any further send; no = done.' };
 const issues = (key, keyProperty) => ({ type: 'array', items: schema({ [key]: keyProperty, ...(key === 'check' ? { status: { type: 'string', enum: ['fail', 'warning'] } } : {}), reason: { type: 'string', enum: Object.keys(REASONS) } }, key === 'check' ? [key, 'status', 'reason'] : [key, 'reason']) });
 const sendOutput = schema({ delivery, outcome: outcomeProperty }, ['delivery']);
-// Version the resource URI so hosts do not reuse an older panel layout.
-const panelUri = 'ui://bridge/panel-v6.html';
+// Version the resource URI so hosts do not reuse an older panel layout. Results that older
+// releases returned still name v6; it resolves to this release's panel, which reads both.
+const panelUri = 'ui://bridge/panel-v7.html';
+const panelUris = [panelUri, 'ui://bridge/panel-v6.html'];
+// Serve the bytes this process started with: an in-place update must not hand a newer
+// panel to an older running server, or the reverse (versions.md, UI skew).
+const panelHtml = fs.readFileSync(new URL('../ui/bridge.html', import.meta.url), 'utf8');
 // Claude-style orange starburst icon for the conversation-panel entrypoint.
 // Keep it self-contained because tool icons are data-URI images.
 const bridgeIconSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none"><rect x="1" y="1" width="18" height="18" rx="4" fill="#D97757"/><g stroke="#FFF9F1" stroke-width=".85" stroke-linecap="round"><path d="M10 4v12M4 10h12M5.75 5.75l8.5 8.5M14.25 5.75l-8.5 8.5M7.2 4.8l5.6 10.4M12.8 4.8 7.2 15.2M4.8 7.2l10.4 5.6M4.8 12.8l10.4-5.6"/></g><circle cx="10" cy="10" r=".9" fill="#FFF9F1"/></svg>';
@@ -59,6 +64,7 @@ const bridgeIcon = {
   mimeType: 'image/svg+xml',
   sizes: ['20x20'],
 };
+const noticeOmitted = { type: 'boolean', description: 'True when no owner notice was attempted because the notice ledger shared with older releases is full.' };
 const conversation = schema({ session_id: outputText, title: outputText, cwd: outputText,
   entrypoint: { type: 'string', enum: [...CLAUDE_ENTRYPOINTS] },
   live: { type: 'boolean' }, last_activity_at: { type: ['integer', 'null'] },
@@ -66,7 +72,8 @@ const conversation = schema({ session_id: outputText, title: outputText, cwd: ou
 const uiMessage = schema({ id: outputText, direction: { type: 'string', enum: ['to_claude', 'to_codex'] },
   message: outputText, created_at: { type: 'integer' },
   status: { type: 'string', enum: ['sending', 'submitted', 'failed', 'uncertain'] },
-  manual: { type: 'boolean' }, notice_status: outputText, notice_retryable: { type: 'boolean' } }, ['id', 'direction', 'message', 'created_at', 'status']);
+  manual: { type: 'boolean' }, notice_status: outputText, notice_retryable: { type: 'boolean' },
+  notice_reason: { type: 'string', enum: Object.keys(REASONS) }, notice_omitted: noticeOmitted }, ['id', 'direction', 'message', 'created_at', 'status']);
 const registryOf = env => env.CLAUDE_CODEX_BRIDGE_REGISTRY_DIR ||
   path.join(env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'sessions');
 const appToolMeta = { ui: { visibility: ['app'] }, 'openai/widgetAccessible': true };
@@ -132,8 +139,8 @@ export const TOOLS = [
     name: 'bridge_panel',
     title: 'Claude',
     description: 'Open the conversation panel hosted by Codex Desktop to search local Claude Code sessions, inspect exchanged bridge messages, and manually send a message.',
-    inputSchema: schema({ cursor: textProperty('Catalog continuation from the previous page.', 512) }),
-    outputSchema: schema({ next_cursor: { type: ['string', 'null'] }, owner_thread_id: outputText, application: { type: 'string', const: 'codex' },
+    inputSchema: schema({ cursor: textProperty('Panel use only: continues the panel\'s archived-conversation scan.', 512) }),
+    outputSchema: schema({ owner_thread_id: outputText, application: { type: 'string', const: 'codex' },
       sessions: { type: 'array', items: conversation }, warnings: { type: 'array', items: outputText },
       composer_enter_behavior: { type: ['string', 'null'], enum: ['enter', 'cmdIfMultiline', 'cmdAlways', null] } },
     ['owner_thread_id', 'application', 'sessions', 'warnings']),
@@ -151,6 +158,7 @@ export const TOOLS = [
       cursor: textProperty('Opaque earlier-page cursor returned by this tool.', 2048) }, ['session_id']),
     outputSchema: schema({ session_id: outputText, messages: { type: 'array', items: uiMessage },
       next_cursor: { type: ['string', 'null'] }, has_more: { type: 'boolean' },
+      incomplete: { type: 'boolean', description: 'True when this page could not be read in full; retry the same cursor.' },
       warnings: { type: 'array', items: outputText } }, ['session_id', 'messages', 'next_cursor', 'has_more', 'warnings']),
     _meta: appToolMeta,
   },
@@ -160,7 +168,7 @@ export const TOOLS = [
     description: 'Send the user\'s manually entered message to the selected live Claude Code conversation and notify this same Codex chat with its full content. Does not resend uncertain deliveries.',
     inputSchema: schema({ session_id: textProperty('Exact selected live Claude Code conversation ID.'),
       message: messageText, message_id: messageId }, ['session_id', 'message', 'message_id']),
-    outputSchema: schema({ delivery, manual: { type: 'boolean', const: true }, notice_retryable: { type: 'boolean' }, notice_error: outputText,
+    outputSchema: schema({ delivery, manual: { type: 'boolean', const: true }, notice_retryable: { type: 'boolean' }, notice_error: outputText, notice_omitted: noticeOmitted,
       notice_status: { type: 'string', enum: ['submitted', 'failed', 'uncertain', 'pending'] },
       outcome: outcomeProperty, notice_outcome: outcomeProperty }, ['delivery', 'manual', 'notice_status']),
     _meta: appToolMeta,
@@ -170,7 +178,7 @@ export const TOOLS = [
     title: 'Retry the Codex manual-send notice',
     description: 'Retry only a definitively failed context notice for a message already submitted to Claude. Never sends the original message to Claude again and refuses uncertain notice outcomes.',
     inputSchema: schema({ session_id: textProperty('Exact original Claude recipient.'), message_id: messageId }, ['session_id', 'message_id']),
-    outputSchema: schema({ delivery, manual: { type: 'boolean', const: true }, notice_retryable: { type: 'boolean' }, notice_error: outputText,
+    outputSchema: schema({ delivery, manual: { type: 'boolean', const: true }, notice_retryable: { type: 'boolean' }, notice_error: outputText, notice_omitted: noticeOmitted,
       notice_status: { type: 'string', enum: ['submitted', 'failed', 'uncertain', 'pending'] },
       outcome: outcomeProperty, notice_outcome: outcomeProperty }, ['delivery', 'manual', 'notice_status']),
     _meta: appToolMeta,
@@ -216,13 +224,14 @@ function validateArguments(args, tool) {
 }
 
 function toolResult(value, name) {
-  const panelMeta = name === 'bridge_panel' ? {
+  if (name !== 'bridge_panel') return { content: [{ type: 'text', text: JSON.stringify(value ?? null) }], structuredContent: value };
+  const { [PANEL_CATALOG]: catalog, ...visible } = value;
+  return { content: [{ type: 'text', text: JSON.stringify(visible) }], structuredContent: visible, _meta: {
     ui: { resourceUri: panelUri },
     'ui/resourceUri': panelUri,
     'openai/outputTemplate': panelUri,
-  } : undefined;
-  return { content: [{ type: 'text', text: JSON.stringify(value ?? null) }], structuredContent: value,
-    ...(panelMeta ? { _meta: panelMeta } : {}) };
+    ...(catalog ? { [PANEL_CATALOG]: catalog } : {}),
+  } };
 }
 
 const OUTCOME_META = 'bridge-claude-codex/outcome';
@@ -408,12 +417,11 @@ export async function runMcpServer({ input = process.stdin, output = process.std
         mimeType: 'text/html;profile=mcp-app' }] });
     }
     if (method === 'resources/read') {
-      if (params?.uri !== panelUri) return rpcError(id, -32602, 'Unknown bridge UI resource.');
-      return fs.promises.readFile(new URL('../ui/bridge.html', import.meta.url), 'utf8').then(html =>
-        respond({ contents: [{ uri: panelUri, mimeType: 'text/html;profile=mcp-app', text: html,
+      if (!panelUris.includes(params?.uri)) return rpcError(id, -32602, 'Unknown bridge UI resource.');
+      return respond({ contents: [{ uri: params.uri, mimeType: 'text/html;profile=mcp-app', text: panelHtml,
           _meta: { ui: { prefersBorder: true, csp: { connectDomains: [], resourceDomains: [] } },
             'openai/ui': { preferredDisplayMode: 'fullscreen', availableDisplayModes: ['inline', 'fullscreen'] },
-            'openai/widgetDescription': 'Local Claude Code conversation picker, exchanged bridge messages, and manual sending from the current Codex chat.' } }] }));
+            'openai/widgetDescription': 'Local Claude Code conversation picker, exchanged bridge messages, and manual sending from the current Codex chat.' } }] });
     }
     if (method === 'tools/list') {
       return params?.cursor !== undefined ? rpcError(id, -32602, 'This tool catalog does not use pagination.')

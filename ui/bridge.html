@@ -79,6 +79,8 @@
     .chat-title { font-size: 13px; font-weight: var(--font-weight-normal, 400); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
     .chat-time { font-size: 10px; color: var(--quiet); white-space: nowrap; font-variant-numeric: tabular-nums }
     .chat-cwd { display: block; margin-top: 4px; font-size: 11px; color: var(--quiet); overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .list-foot { flex: none; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 9px 14px 12px; border-top: 1px solid var(--line); color: var(--quiet); font-size: 11px; line-height: 1.5 }
+    .list-foot button { padding: 0; border: 0; background: transparent; color: var(--muted); font-size: 11px; text-decoration: underline }
     .list-empty { padding: 27px 9px; color: var(--muted); font-size: 12px; line-height: 1.6 }
     .list-empty strong { display: block; color: var(--text); font-weight: var(--font-weight-normal, 400); margin-bottom: 4px }
     .conversation { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg) }
@@ -86,6 +88,7 @@
     .conversation-heading { flex: 1; min-width: 0 }
     .conversation-title { font-size: 13px; line-height: 1.4; font-weight: var(--font-weight-medium, 500); margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
     .conversation-subtitle { font-size: 11px; color: var(--quiet); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .conversation-id { font-size: 10px; color: var(--quiet); margin-top: 2px; font-family: var(--font-mono, ui-monospace, "Cascadia Mono", Consolas, monospace); user-select: all; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
     .mobile-back { display: none }
     .welcome { flex: 1; display: flex; flex-direction: column; justify-content: center; padding: 30px; color: var(--muted) }
     .welcome h2 { font-size: 15px; color: var(--text); font-weight: var(--font-weight-normal, 400); margin: 0 0 9px }
@@ -105,11 +108,14 @@
     .message-meta.warning { color: var(--warning) }
     .message-meta.failed { color: var(--danger) }
     .notice-detail { display: block; margin-top: 5px; color: var(--muted); font-size: 10px; text-align: right; max-width: 88% }
+    .notice-detail.warning { color: var(--warning) }
+    .notice-detail.failed { color: var(--danger) }
     .timeline-empty { margin: 44px 0; color: var(--muted); font-size: 13px; line-height: 1.7; max-width: 340px }
     .timeline-empty strong { display: block; margin-bottom: 5px; color: var(--text); font-weight: var(--font-weight-normal, 400) }
     .alert { display: flex; align-items: flex-start; gap: 10px; margin: 0 18px 12px; padding: 10px 11px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); font-size: 12px; flex: none }
     .alert.error { color: var(--danger) }
     .alert-text { flex: 1; min-width: 0 }
+    .alert-actions { display: flex; gap: 12px; flex: none }
     .alert button { border: 0; background: transparent; color: inherit; text-decoration: underline; padding: 0; font-size: 11px; white-space: nowrap }
     .composer-wrap { padding: 0 16px 12px; flex: none }
     .composer { padding: 13px 14px 10px; background: var(--composer); border: 1px solid var(--color-border-tertiary, var(--line)); border-radius: 21px; box-shadow: 0 1px 2px rgb(0 0 0 / 8%) }
@@ -118,6 +124,9 @@
     .composer textarea::placeholder { color: var(--quiet) }
     .composer textarea:focus-visible { outline: 0 }
     .composer-bottom { display: flex; justify-content: flex-end; align-items: center; min-height: 32px; margin-top: 2px }
+    .composer-note { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; margin-right: 12px; color: var(--quiet); font-size: 11px; line-height: 1.45 }
+    .composer-dest { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+    .composer-hint.problem { color: var(--danger) }
     .send-button { display: grid; place-items: center; flex: 0 0 32px; aspect-ratio: 1 / 1; width: 32px; min-width: 32px; max-width: 32px; height: 32px; min-height: 32px; max-height: 32px; align-self: flex-end; padding: 0; appearance: none; background: var(--text); color: var(--bg); border: 0; border-radius: 50% }
     .send-button:hover:not(:disabled) { background: var(--color-background-info, var(--text)); color: var(--color-text-inverse, var(--bg)) }
     .send-button svg { width: 16px; height: 16px }
@@ -130,27 +139,27 @@
     @media(min-width:1150px) { .main { grid-template-columns: 280px minmax(0,1fr) } .timeline { padding-left: 6%; padding-right: 6% } .composer-wrap { padding-left: 6%; padding-right: 6% } .alert { margin-left: 6%; margin-right: 6% } }
     @media(max-width:620px) { .topbar { padding: 0 13px; height: 45px } .main { grid-template-columns: 1fr } .sidebar { border-right: 0 } .conversation { display: none } .shell.has-selection .sidebar { display: none } .shell.has-selection .conversation { display: flex } .mobile-back { display: grid } .conversation-head { padding: 10px 13px } .timeline { padding: 16px 16px 21px } .outgoing .bubble { max-width: 91% } .composer-wrap { padding: 0 12px 12px } .alert { margin: 0 12px 10px } .welcome { display: none } .demo-banner { padding: 6px 13px; font-size: 10px } }
   </style>
-</head>
 <body>
   <div class="shell" id="shell">
     <header class="topbar">
       <div class="brand-name">Claude</div>
-      <div class="toolbar"><span class="sr-only" id="connection-label" role="status">Connecting…</span><button class="icon-button" id="focus-search" type="button" aria-label="Search chats" title="Search chats"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg></button><button class="icon-button" id="refresh" type="button" aria-label="Refresh chats and history" title="Refresh"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 8a8 8 0 1 0 .4 7M20 3v5h-5"/></svg></button></div>
+      <div class="toolbar"><span class="sr-only" id="connection-label" role="status">Connecting…</span><button class="icon-button" id="focus-search" type="button" aria-label="Search conversations" title="Search conversations"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg></button><button class="icon-button" id="refresh" type="button" aria-label="Refresh conversations and history" title="Refresh"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 8a8 8 0 1 0 .4 7M20 3v5h-5"/></svg></button></div>
     </header>
     <div class="demo-banner" id="demo-banner" hidden><strong>Demo</strong>Demo interface. No real messages are sent.</div>
     <div class="connection-error" id="connection-error" role="alert" hidden></div>
     <div class="main">
       <aside class="sidebar" aria-label="Conversation list">
-        <div class="sidebar-head"><div class="heading-row"><h1>Conversations</h1><span class="count" id="chat-count">—</span></div><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><label class="sr-only" for="search">Search by chat or project name</label><input class="search" id="search" type="search" placeholder="Search chats or projects" autocomplete="off"></div></div>
-        <div class="tabs" role="tablist" aria-label="Show chats"><button class="tab" id="tab-contacted" role="tab" aria-selected="true" aria-controls="chat-list" type="button">Conversations</button><button class="tab" id="tab-all" role="tab" aria-selected="false" aria-controls="chat-list" type="button" tabindex="-1">All chats</button></div>
-        <div class="chat-list" id="chat-list" role="tabpanel" aria-label="Claude chats"></div>
+        <div class="sidebar-head"><div class="heading-row"><h1>Conversations</h1><span class="count" id="chat-count">—</span></div><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><label class="sr-only" for="search">Search by title, project or conversation ID</label><input class="search" id="search" type="search" placeholder="Search titles, projects or IDs" autocomplete="off"></div></div>
+        <div class="tabs" role="tablist" aria-label="Show conversations"><button class="tab" id="tab-contacted" role="tab" aria-selected="true" aria-controls="chat-list" type="button">Messaged</button><button class="tab" id="tab-all" role="tab" aria-selected="false" aria-controls="chat-list" type="button" tabindex="-1">All</button></div>
+        <div class="chat-list" id="chat-list" role="tabpanel" aria-label="Claude Code conversations"></div>
+        <div class="list-foot" id="list-foot" hidden><span id="list-note"></span><button type="button" id="catalog-more" hidden>Search more archived conversations</button></div>
       </aside>
       <main class="conversation" aria-label="Conversation">
-        <div class="conversation-head" id="conversation-head" hidden><button class="icon-button mobile-back" id="back" type="button" aria-label="Back to chat list"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="m14 6-6 6 6 6"/></svg></button><div class="conversation-heading"><h2 class="conversation-title" id="conversation-title"></h2><div class="conversation-subtitle" id="conversation-subtitle"></div></div></div>
-        <div class="welcome" id="welcome"><h2>Select a Claude chat</h2><p>Messages and the reply box will appear here.</p></div>
+        <div class="conversation-head" id="conversation-head" hidden><button class="icon-button mobile-back" id="back" type="button" aria-label="Back to the conversation list"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="m14 6-6 6 6 6"/></svg></button><div class="conversation-heading"><h2 class="conversation-title" id="conversation-title"></h2><div class="conversation-subtitle" id="conversation-subtitle"></div><div class="conversation-id" id="conversation-id"></div></div></div>
+        <div class="welcome" id="welcome"><h2>Select a Claude Code conversation</h2><p>Its bridge messages and a reply box will appear here.</p></div>
         <div class="timeline" id="timeline" aria-label="Message history" hidden></div>
-        <div class="alert" id="conversation-alert" role="status" hidden><span class="alert-text" id="alert-text"></span><button type="button" id="alert-refresh">Refresh</button></div>
-        <div class="composer-wrap" id="composer-wrap" hidden><div class="composer-inactive" id="composer-inactive" hidden><strong id="inactive-title"></strong><span id="inactive-detail"></span></div><form class="composer" id="composer"><label class="sr-only" for="message">Message for the selected Claude chat</label><textarea id="message" aria-describedby="composer-hint" rows="1" placeholder="Write to Claude…" maxlength="65536"></textarea><span class="sr-only" id="composer-hint">Enter — send · Shift+Enter — new line</span><div class="composer-bottom"><button class="send-button" id="send" type="submit"><span class="sr-only" id="send-label">Send</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-5 5 5-5 5 5"/></svg></button></div></form></div>
+        <div class="alert" id="conversation-alert" role="status" hidden><span class="alert-text" id="alert-text"></span><span class="alert-actions" id="alert-actions"></span></div>
+        <div class="composer-wrap" id="composer-wrap" hidden><div class="composer-inactive" id="composer-inactive" hidden><strong id="inactive-title"></strong><span id="inactive-detail"></span></div><form class="composer" id="composer"><label class="sr-only" for="message">Message for the selected Claude Code conversation</label><textarea id="message" aria-describedby="composer-dest composer-hint" rows="1" placeholder="Message to Claude Code…"></textarea><div class="composer-bottom"><div class="composer-note"><span class="composer-dest" id="composer-dest"></span><span class="composer-hint" id="composer-hint" aria-live="polite"></span></div><button class="send-button" id="send" type="submit"><span class="sr-only" id="send-label">Send to Claude Code</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-5 5 5-5 5 5"/></svg></button></div></form></div>
       </main>
     </div>
     <div class="sr-only" id="announcement" aria-live="polite"></div>
@@ -158,28 +167,51 @@
   <script type="module">
   const $ = id => document.getElementById(id);
   const demo = location.hash === '#demo';
-  const state = { chats: [], selected: null, tab: 'contacted', query: '', owner: null, ready: false,
-    drafts: new Map(), histories: new Map(), sends: new Map(), refreshing: false };
-  const noticeRetries = new Set();
+  const CATALOG = 'bridge-claude-codex/catalog';
+  const OUTCOME = 'bridge-claude-codex/outcome';
+  const LIMIT = 65536;
+  const CATALOG_PAGES = 5;
+  const KEEP_HISTORIES = 6;
+  const state = { chats: new Map(), catalogCursor: null, catalogWarnings: [], catalogSignature: '', catalogLoading: false,
+    selected: null, tab: 'contacted', query: '', owner: null, ready: false, ownerChanged: false, stopped: false,
+    drafts: new Map(), revisions: new Map(), histories: new Map(), sends: new Map(), outbox: new Map(),
+    contacted: new Set(), noticeRetries: new Set(), refreshing: false };
   const rpcPending = new Map();
   let rpcId = 0;
   let hostOrigin = null;
   let initializeId = null;
   let initialLoad = false;
   let initialPanelResult = null;
-  // Codex's native composer sends on Enter and inserts a newline with
-  // Shift+Enter. Hosts may override this through hostContext when exposed.
-  let composerEnterBehavior = 'enter';
+  let poll = null;
+  // The Enter action Codex applies, taken only from the host (K03: config.toml can differ from it).
+  // Unknown means the safe mode: Enter adds a line and Ctrl/⌘+Enter sends.
+  let enterMode = null;
   const initialPanelWaiters = [];
+  const mac = typeof navigator === 'object' && /Mac|iPhone|iPad/.test(String(navigator?.platform || navigator?.userAgent || ''));
   const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   const string = value => typeof value === 'string' ? value : '';
+  const strings = value => Array.isArray(value) ? value.filter(item => typeof item === 'string' && item) : [];
   const timestamp = value => { const date = new Date(value); return Number.isFinite(date.getTime()) && date.getTime() > 0 ? date.getTime() : 0; };
   const targetOrigin = () => hostOrigin && hostOrigin !== 'null' ? hostOrigin : '*';
   const shortTime = value => timestamp(value) ? new Date(timestamp(value)).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : '';
   const shortDate = value => timestamp(value) ? new Date(timestamp(value)).toLocaleDateString('en-US', { day: '2-digit', month: '2-digit' }) : '';
   const workspace = cwd => string(cwd).split(/[\\/]/).filter(Boolean).slice(-2).join(' / ');
+  const count = value => value.toLocaleString('en-US');
+  const bytesOf = value => new TextEncoder().encode(value).length;
+  const keyOf = row => `${row.direction}:${row.id}`;
+  const signatureOf = row => [row.status, row.notice_status, row.notice_retryable, row.notice_reason, row.notice_omitted, row.notice_note, row.primary_note].join('|');
+  const modifier = mac ? '⌘' : 'Ctrl';
   function element(tag, className, text) { const node = document.createElement(tag); if (className) node.className = className; if (text !== undefined) node.textContent = text; return node; }
+  function button(className, text, control, run) {
+    const node = element('button', className, text); node.type = 'button'; node.dataset.control = control; node.addEventListener('click', run); return node;
+  }
   function announce(text) { $('announcement').textContent = text; }
+  function focusedControl() { return string(document.activeElement?.dataset?.control); }
+  function restoreFocus(control, nodes) {
+    if (!control) return;
+    const stack = [...nodes];
+    while (stack.length) { const node = stack.shift(); if (node?.dataset?.control === control) { if (document.activeElement !== node) node.focus({ preventScroll: true }); return; } stack.push(...(node?.children || [])); }
+  }
   function theme(context) {
     if (!object(context)) return;
     if (context.theme === 'dark' || context.theme === 'light') document.documentElement.dataset.theme = context.theme;
@@ -188,12 +220,11 @@
       if (/^--[a-zA-Z0-9_-]+$/.test(name) && typeof value === 'string') document.documentElement.style.setProperty(name, value);
     }
   }
-  function composerContext(context) {
+  function hostComposer(context) {
     if (!object(context)) return;
     const value = context.composer_enter_behavior ?? context.composer?.enterBehavior ?? context['codex/composer']?.enterBehavior ?? context['openai/composer']?.enterBehavior;
-    if (['enter', 'cmdIfMultiline', 'cmdAlways'].includes(value)) composerEnterBehavior = value;
-    else if (value === 'send') composerEnterBehavior = 'enter';
-    else if (value === 'newline') composerEnterBehavior = 'cmdAlways';
+    const mode = value === 'send' ? 'enter' : value === 'newline' ? 'cmdAlways' : value;
+    if (['enter', 'cmdIfMultiline', 'cmdAlways'].includes(mode)) enterMode = mode;
   }
   function resizeComposer() {
     const input = $('message'); if (!input) return;
@@ -207,7 +238,7 @@
     const id = ++rpcId;
     if (method === 'ui/initialize') initializeId = id;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { rpcPending.delete(id); reject(new Error('Desktop did not respond in time. Refresh the panel.')); }, 25000);
+      const timer = setTimeout(() => { rpcPending.delete(id); reject(new Error('Desktop did not respond in time.')); }, 25000);
       rpcPending.set(id, { resolve, reject, timer });
       window.parent.postMessage({ jsonrpc: '2.0', id, method, params }, targetOrigin());
     });
@@ -224,318 +255,654 @@
       initialPanelWaiters.push({ resolve, timer });
     });
   }
-  function receiveInitialPanel(data) {
-    if (!initialPanelResult) initialPanelResult = data;
+  function receiveInitialPanel(result) {
+    if (!initialPanelResult) initialPanelResult = result;
     while (initialPanelWaiters.length) {
       const waiter = initialPanelWaiters.shift(); clearTimeout(waiter.timer); waiter.resolve(initialPanelResult);
     }
   }
-  function mcpData(result) {
-    if (!object(result)) throw new Error('Desktop returned an invalid response format.');
+  // A tool error carries the bridge outcome (C1) in _meta or a second text block; a 1.0 server sends none.
+  const knownOutcome = value => object(value) && [true, false, 'unknown'].includes(value.delivered) && typeof value.reason === 'string' ? value : null;
+  function errorDetails(result) {
+    const meta = object(result._meta) ? result._meta[OUTCOME] : null;
+    if (object(meta) && knownOutcome(meta.outcome)) return meta;
+    for (const item of Array.isArray(result.content) ? result.content.slice(1) : []) {
+      try { const value = JSON.parse(item?.text); if (object(value) && knownOutcome(value.outcome)) return value; } catch {}
+    }
+    return null;
+  }
+  function failed(message, details = null) { return Object.assign(new Error(message), { outcome: details?.outcome ?? null, details }); }
+  function toolResult(result) {
+    if (!object(result)) throw failed('Desktop returned an invalid response format.');
     if (result.isError) {
-      const detail = Array.isArray(result.content) ? result.content.filter(item => item?.type === 'text').map(item => string(item.text)).join('\n') : '';
-      throw new Error(detail.slice(0, 1200) || 'Action could not be completed.');
+      const first = Array.isArray(result.content) ? result.content.find(item => item?.type === 'text') : null;
+      throw failed(string(first?.text).slice(0, 1200) || 'Action could not be completed.', errorDetails(result));
     }
-    if (object(result.structuredContent)) return result.structuredContent;
+    const meta = object(result._meta) ? result._meta : {};
+    if (object(result.structuredContent)) return { data: result.structuredContent, meta };
     if (Array.isArray(result.content)) for (const item of result.content) if (item?.type === 'text') {
-      try { const value = JSON.parse(item.text); if (object(value)) return value; } catch {}
+      try { const value = JSON.parse(item.text); if (object(value)) return { data: value, meta }; } catch {}
     }
-    throw new Error('Desktop returned an invalid response format.');
+    throw failed('Desktop returned an invalid response format.');
   }
-  async function call(name, args = {}) {
-    if (demo) return demoCall(name, args);
-    return mcpData(await rpc('tools/call', { name, arguments: args }));
+  async function callTool(name, args = {}) {
+    if (demo) return { data: await demoCall(name, args), meta: {} };
+    return toolResult(await rpc('tools/call', { name, arguments: args }));
   }
+  // Requests, notifications and responses are told apart before any pending ID is consulted (U04).
   window.addEventListener('message', event => {
     if (event.source !== window.parent || !object(event.data) || event.data.jsonrpc !== '2.0') return;
-    const message = event.data;
     if (hostOrigin !== null && event.origin !== hostOrigin) return;
-    if (Object.hasOwn(message, 'id') && rpcPending.has(message.id)) {
-      const pending = rpcPending.get(message.id);
-      if (hostOrigin === null) {
-        if (message.id !== initializeId || typeof event.origin !== 'string') return;
-        if (!object(message.error) && (!object(message.result) || message.result.protocolVersion !== '2026-01-26')) {
-          clearTimeout(pending.timer); rpcPending.delete(message.id);
-          pending.reject(new Error('Desktop did not negotiate a supported UI version. Update the app and reopen the panel.'));
-          return;
-        }
-        hostOrigin = event.origin;
-      }
-      clearTimeout(pending.timer); rpcPending.delete(message.id);
-      if (message.error) pending.reject(new Error(string(message.error.message).slice(0, 1200) || 'Desktop could not complete the request.'));
-      else pending.resolve(message.result);
+    const message = event.data; const hasId = Object.hasOwn(message, 'id');
+    if (typeof message.method === 'string') {
+      if (hostOrigin === null) return;
+      if (hasId) answerHost(message); else hostNotification(message);
       return;
     }
-    if (hostOrigin === null) return;
-    if (message.method === 'ui/notifications/host-context-changed') { theme(message.params); composerContext(message.params); renderComposer(); }
-    if (message.method === 'ui/notifications/tool-result') {
-      try {
-        const data = mcpData(message.params);
-        if (Array.isArray(data.sessions) && data.application === 'codex') {
-          if (!initialLoad && !state.ready) receiveInitialPanel(data);
-          applyPanel(data);
-        }
-        else if (typeof data.session_id === 'string' && Array.isArray(data.messages)) applyHistory(data.session_id, data, false);
-      } catch (error) { showConnectionError(error.message); }
+    if (!hasId || !(Object.hasOwn(message, 'result') || Object.hasOwn(message, 'error')) || !rpcPending.has(message.id)) return;
+    const pending = rpcPending.get(message.id);
+    if (hostOrigin === null) {
+      if (message.id !== initializeId || typeof event.origin !== 'string') return;
+      if (!object(message.error) && (!object(message.result) || message.result.protocolVersion !== '2026-01-26')) {
+        clearTimeout(pending.timer); rpcPending.delete(message.id);
+        pending.reject(new Error('Desktop did not negotiate a supported UI version. Update the app and reopen the panel.'));
+        return;
+      }
+      hostOrigin = event.origin;
     }
+    clearTimeout(pending.timer); rpcPending.delete(message.id);
+    if (message.error) {
+      const error = new Error(string(message.error?.message).slice(0, 1200) || 'Desktop could not complete the request.');
+      error.outcome = knownOutcome(message.error?.data?.outcome);
+      pending.reject(error);
+    } else pending.resolve(message.result);
   });
-  function showConnectionError(text) { $('connection-error').textContent = text; $('connection-error').hidden = !text; }
-  function history(sessionId) {
-    if (!state.histories.has(sessionId)) state.histories.set(sessionId, { messages: [], loaded: false, loading: false, nextCursor: null, hasMore: false, paged: false, error: '', warning: '' });
-    return state.histories.get(sessionId);
+  function answerHost(message) {
+    const respond = body => window.parent.postMessage({ jsonrpc: '2.0', id: message.id, ...body }, targetOrigin());
+    if (message.method === 'ui/resource-teardown') { stopPanel(); respond({ result: {} }); }
+    else if (message.method === 'ping') respond({ result: {} });
+    else respond({ error: { code: -32601, message: 'Method not found.' } });
   }
-  function applyPanel(data) {
-    if (data.application !== 'codex' || typeof data.owner_thread_id !== 'string') throw new Error('This panel is available in a local Codex chat with a verified sender.');
-    composerContext(data);
-    if (state.owner && state.owner !== data.owner_thread_id) {
-      state.ready = false; renderComposer();
+  function hostNotification(message) {
+    if (message.method === 'ui/notifications/host-context-changed') { theme(message.params); hostComposer(message.params); renderComposer(); return; }
+    if (message.method !== 'ui/notifications/tool-result') return;
+    try {
+      const result = toolResult(message.params);
+      if (!Array.isArray(result.data.sessions) || result.data.application !== 'codex') return;
+      if (!initialLoad && !initialPanelResult) receiveInitialPanel(result);
+      else if (initialLoad) { acceptLauncher(result.data); applyCatalog([catalogOf(result)], null, 'poll'); }
+    } catch (error) { showConnectionError(error.message); }
+  }
+  function stopPanel() {
+    state.stopped = true;
+    if (poll !== null && typeof clearInterval === 'function') clearInterval(poll);
+    poll = null;
+  }
+  function showConnectionError(text) { $('connection-error').textContent = text; $('connection-error').hidden = !text; }
+
+  // Catalog. Page one of the full catalog always holds every live session and contact; later
+  // pages continue the archived-conversation scan. The model sees only live sessions (PR02).
+  function catalogOf({ data, meta }) {
+    const full = object(meta?.[CATALOG]) && Array.isArray(meta[CATALOG].sessions) ? meta[CATALOG] : null;
+    return { sessions: (full ?? data).sessions, cursor: typeof full?.next_cursor === 'string' ? full.next_cursor : null,
+      warnings: strings(full ? full.warnings : data.warnings), full: Boolean(full) };
+  }
+  function normalizeChat(chat) {
+    if (!object(chat) || typeof chat.session_id !== 'string' || !chat.session_id) return null;
+    return { session_id: chat.session_id, title: string(chat.title) || 'Claude Code conversation', cwd: string(chat.cwd), live: chat.live === true,
+      entrypoint: string(chat.entrypoint), last_activity_at: chat.last_activity_at ?? null, last_contact_at: chat.last_contact_at ?? null };
+  }
+  function acceptLauncher(data) {
+    if (data.application !== 'codex' || typeof data.owner_thread_id !== 'string' || !Array.isArray(data.sessions)) {
+      throw new Error('This panel is available in a local Codex chat with a verified sender.');
+    }
+    if (state.ownerChanged || (state.owner && state.owner !== data.owner_thread_id)) {
+      state.ownerChanged = true; state.ready = false; renderComposer(); renderAlert(); if (state.selected) renderTimeline({ preserve: true });
       throw new Error('The Codex context changed. Reopen the panel in the intended chat.');
     }
     state.owner = data.owner_thread_id;
-    state.chats = data.sessions.filter(chat => object(chat) && typeof chat.session_id === 'string' && chat.session_id)
-      .map(chat => ({ ...chat, title: string(chat.title) || 'Claude chat', cwd: string(chat.cwd), live: chat.live === true }));
-    state.ready = true; showConnectionError('');
+  }
+  const keepChat = id => id === state.selected || Boolean(state.drafts.get(id)) || state.sends.has(id);
+  function applyCatalog(pages, cursor, mode) {
+    const seen = new Map(); const warnings = new Set();
+    for (const page of pages) {
+      for (const chat of page.sessions.map(normalizeChat)) if (chat) seen.set(chat.session_id, chat);
+      for (const warning of page.warnings) if (!/^The catalog scan is incomplete/.test(warning)) warnings.add(warning);
+    }
+    const next = new Map(seen);
+    const complete = mode === 'replace' ? !cursor : mode === 'poll' && (!pages[0].full || !pages[0].cursor);
+    for (const [id, chat] of state.chats) {
+      if (next.has(id)) continue;
+      if (mode === 'append') { next.set(id, chat); continue; }
+      // A row seen only on later pages is not live, or page one would hold it.
+      if (!complete || keepChat(id)) next.set(id, chat.live ? { ...chat, live: false } : chat);
+    }
+    state.chats = next;
+    if (mode !== 'poll') state.catalogCursor = cursor;
+    if (mode !== 'append') state.catalogWarnings = [...warnings];
+    state.ready = !state.ownerChanged; showConnectionError('');
     $('connection-label').textContent = demo ? 'Demo' : 'Desktop connected';
-    if (!state.selected && typeof data.selected_session_id === 'string' && state.chats.some(chat => chat.session_id === data.selected_session_id)) select(data.selected_session_id);
-    renderChats(); renderConversation({ preserveTimeline: true });
+    const signature = [...state.chats.values()].map(chat => [chat.session_id, chat.live, chat.title, chat.cwd, chat.entrypoint, chat.last_activity_at, chat.last_contact_at].join('\u0001')).join('\n')
+      + `\n${state.catalogCursor}\n${state.catalogWarnings.join('\n')}`;
+    if (signature === state.catalogSignature) return;
+    state.catalogSignature = signature;
+    renderChats(); renderConversation({ timeline: false });
+  }
+  async function catalogPages(cursor) {
+    const pages = [];
+    while (cursor && pages.length < CATALOG_PAGES) {
+      const result = await callTool('bridge_panel', { cursor }); acceptLauncher(result.data);
+      const page = catalogOf(result); pages.push(page); cursor = page.cursor;
+    }
+    return { pages, cursor };
+  }
+  async function loadCatalog({ quiet = false, initial = null } = {}) {
+    const first = initial ?? await callTool('bridge_panel', {});
+    acceptLauncher(first.data);
+    const page = catalogOf(first);
+    if (quiet) return applyCatalog([page], null, 'poll');
+    const more = await catalogPages(page.cursor);
+    applyCatalog([page, ...more.pages], more.cursor, 'replace');
+    if (!state.selected && typeof first.data.selected_session_id === 'string' && state.chats.has(first.data.selected_session_id)) select(first.data.selected_session_id);
+    // A 1.1 launch without its UI metadata lists only live sessions; ask once for the full list.
+    // A 1.0 server lists archived sessions in the result itself.
+    if (initial && !page.full && !demo && page.sessions.every(chat => chat?.live === true)) loadCatalog().catch(() => {});
+  }
+  async function searchMore() {
+    if (!state.catalogCursor || state.catalogLoading || !state.ready) return;
+    state.catalogLoading = true; renderChats();
+    try { const more = await catalogPages(state.catalogCursor); applyCatalog(more.pages, more.cursor, 'append'); }
+    catch (error) { state.catalogWarnings = [error.message]; }
+    finally { state.catalogLoading = false; renderChats(); }
   }
   function clientLabel(chat) {
     return chat.entrypoint === 'cli' ? 'Claude CLI' : chat.entrypoint === 'sdk-cli' ? 'Claude CLI (print)' : chat.entrypoint === 'claude-desktop' ? 'Claude Desktop' : chat.entrypoint === 'claude-vscode' ? 'Claude VS Code' : 'Claude Code';
   }
+  // V10: whether the session runs now, not a state the user chose.
+  const availability = chat => chat.live ? 'Open' : 'Not open';
+  const twinKey = chat => `${chat.title}\u0001${clientLabel(chat)}\u0001${workspace(chat.cwd)}`;
   function renderChats() {
     const active = document.activeElement;
     const activeId = active?.id || '';
     const activeSession = active?.dataset?.sessionId || '';
-    const query = state.query.toLocaleLowerCase('en-US');
-    const chats = state.chats.filter(chat => (state.tab === 'all' || timestamp(chat.last_contact_at) || history(chat.session_id).messages.length)
-      && (!query || `${chat.title}\n${chat.cwd}`.toLocaleLowerCase('en-US').includes(query)));
-    $('chat-count').textContent = chats.length === state.chats.length ? String(chats.length) : `${chats.length} / ${state.chats.length}`;
+    const query = state.query.trim().toLocaleLowerCase('en-US');
+    const all = [...state.chats.values()];
+    const chats = all.filter(chat => (state.tab === 'all' || timestamp(chat.last_contact_at) || state.contacted.has(chat.session_id))
+      && (!query || `${chat.title}\n${chat.cwd}\n${chat.session_id}`.toLocaleLowerCase('en-US').includes(query)));
+    $('chat-count').textContent = chats.length === all.length ? String(chats.length) : `${chats.length} / ${all.length}`;
     chats.sort((a, b) => timestamp(b.last_activity_at || b.last_contact_at) - timestamp(a.last_activity_at || a.last_contact_at));
+    // A10: rows that would look identical show the start of their exact ID.
+    const twins = new Map(); for (const chat of all) twins.set(twinKey(chat), (twins.get(twinKey(chat)) || 0) + 1);
     $('tab-contacted').setAttribute('aria-selected', String(state.tab === 'contacted'));
     $('tab-all').setAttribute('aria-selected', String(state.tab === 'all'));
     $('tab-contacted').tabIndex = state.tab === 'contacted' ? 0 : -1; $('tab-all').tabIndex = state.tab === 'all' ? 0 : -1;
+    const today = new Date(Date.now()).toDateString();
     const nodes = chats.map(chat => {
-      const button = element('button', 'chat'); button.type = 'button'; button.dataset.sessionId = chat.session_id;
-      button.setAttribute('aria-current', String(state.selected === chat.session_id)); button.setAttribute('aria-label', `${chat.title}, ${clientLabel(chat)}${chat.live ? '' : ', inactive chat'}`);
+      const row = element('button', 'chat'); row.type = 'button'; row.dataset.sessionId = chat.session_id;
+      const twin = twins.get(twinKey(chat)) > 1 ? ` · ${chat.session_id.slice(0, 8)}` : '';
+      row.setAttribute('aria-current', String(state.selected === chat.session_id));
+      row.setAttribute('aria-label', `${chat.title}, ${clientLabel(chat)}, ${availability(chat).toLowerCase()}${twin ? `, ID ${chat.session_id}` : ''}`);
       const info = element('span', 'chat-info'); const top = element('span', 'chat-top');
       top.append(element('span', 'chat-title', chat.title));
       const activity = timestamp(chat.last_activity_at || chat.last_contact_at);
-      if (activity) top.append(element('span', 'chat-time', new Date(activity).toDateString() === new Date().toDateString() ? shortTime(activity) : shortDate(activity)));
-      info.append(top, element('span', 'chat-cwd', `${clientLabel(chat)}${workspace(chat.cwd) ? ` · ${workspace(chat.cwd)}` : ''} · ${chat.live ? 'Open' : 'Archived'}`));
-      button.append(info); button.addEventListener('click', () => select(chat.session_id)); return button;
+      if (activity) top.append(element('span', 'chat-time', new Date(activity).toDateString() === today ? shortTime(activity) : shortDate(activity)));
+      info.append(top, element('span', 'chat-cwd', `${clientLabel(chat)} · ${availability(chat)}${twin}${workspace(chat.cwd) ? ` · ${workspace(chat.cwd)}` : ''}`));
+      row.append(info); row.addEventListener('click', () => select(chat.session_id)); return row;
     });
     if (!nodes.length) {
       const empty = element('div', 'list-empty');
-      empty.append(element('strong', '', state.ready ? (query ? 'No results' : state.tab === 'contacted' ? 'No conversations yet' : 'No chats available') : 'Loading chats…'),
-        element('span', '', query ? 'Try another name or project.' : state.tab === 'contacted' ? 'Open All chats to start a conversation.' : 'Open a Claude Code session and refresh the list.'));
+      empty.append(element('strong', '', state.ready ? (query ? 'No results' : state.tab === 'contacted' ? 'No messaged conversations yet' : 'No conversations found') : 'Loading conversations…'),
+        element('span', '', query ? (state.catalogCursor ? 'Try another search, or search more archived conversations.' : 'Try another title, project or ID.') : state.tab === 'contacted' ? 'Open All to message a Claude Code conversation.' : 'Open a Claude Code session, then refresh the list.'));
       nodes.push(empty);
     }
     $('chat-list').replaceChildren(...nodes);
-    // Rendering a refresh replaces chat buttons. Keep keyboard focus on the
-    // same row (or control) instead of sending it back to the document root.
-    if (activeSession) {
-      const restored = Array.from($('chat-list').children).find(node => node.dataset?.sessionId === activeSession);
-      restored?.focus();
-    } else if (activeId && $(activeId)) $(activeId).focus();
+    const more = Boolean(state.catalogCursor);
+    $('list-foot').hidden = !more && !state.catalogWarnings.length;
+    $('list-note').textContent = [...state.catalogWarnings, ...(more ? ['Older archived conversations are not listed yet.'] : [])].join(' ');
+    $('catalog-more').hidden = !more; $('catalog-more').disabled = state.catalogLoading;
+    $('catalog-more').textContent = state.catalogLoading ? 'Searching…' : 'Search more archived conversations';
+    // A refresh replaces the rows. Keep keyboard focus on the same row or control.
+    if (activeSession) Array.from($('chat-list').children).find(node => node.dataset?.sessionId === activeSession)?.focus();
+    else if (activeId && $(activeId) && active !== $(activeId)) $(activeId).focus();
   }
+
+  // History. Rows stay in server order, keyed by direction and ID (U05, A07). The newest page
+  // either overlaps the cached rows or replaces them, so no hole can open (U02).
+  function history(sessionId) {
+    let cache = state.histories.get(sessionId);
+    if (cache) { state.histories.delete(sessionId); state.histories.set(sessionId, cache); return cache; }
+    cache = { rows: [], index: new Map(), nodes: new Map(), cursor: null, hasMore: false, loaded: false, loading: false, again: false,
+      olderLoading: false, olderError: '', error: '', warnings: [], incomplete: false, generation: 0 };
+    state.histories.set(sessionId, cache);
+    // P05: an open panel keeps only a few conversations' pages.
+    for (const key of state.histories.keys()) {
+      if (state.histories.size <= KEEP_HISTORIES) break;
+      if (key !== state.selected && key !== sessionId) state.histories.delete(key);
+    }
+    return cache;
+  }
+  function normalizeRow(row) {
+    if (!object(row) || typeof row.id !== 'string' || typeof row.message !== 'string' || !['to_claude', 'to_codex'].includes(row.direction)) return null;
+    return { id: row.id, direction: row.direction, message: row.message, created_at: row.created_at, status: string(row.status) || 'submitted',
+      manual: row.manual === true, notice_status: string(row.notice_status) || undefined, notice_retryable: row.notice_retryable === true,
+      notice_reason: string(row.notice_reason) || undefined, notice_omitted: row.notice_omitted === true };
+  }
+  function rowsOf(data) {
+    const rows = []; const keys = new Set();
+    for (const raw of data.messages) { const row = normalizeRow(raw); if (row && !keys.has(keyOf(row))) { keys.add(keyOf(row)); rows.push(row); } }
+    return rows;
+  }
+  function setRows(cache, rows) {
+    const changed = rows.length !== cache.rows.length || rows.some((row, index) => keyOf(row) !== keyOf(cache.rows[index]) || row.message !== cache.rows[index].message || signatureOf(row) !== signatureOf(cache.rows[index]));
+    cache.rows = rows; cache.index = new Map(rows.map(row => [keyOf(row), row]));
+    return changed;
+  }
+  function checkPage(sessionId, data) {
+    if (data.session_id !== sessionId || !Array.isArray(data.messages)) throw new Error('History belongs to another conversation. Refresh the panel.');
+  }
+  function applyNewest(sessionId, cache, data) {
+    checkPage(sessionId, data);
+    const warnings = strings(data.warnings).concat(strings([data.warning]));
+    // An unread page is not an empty page: keep what is shown and retry (C3 handoff).
+    const incomplete = data.incomplete === true || (data.incomplete === undefined && !data.messages.length && warnings.length > 0 && cache.rows.length > 0);
+    const was = [cache.incomplete, cache.warnings.join('\n'), cache.error];
+    cache.loaded = true; cache.error = ''; cache.warnings = warnings; cache.incomplete = incomplete;
+    let changed = false;
+    if (!incomplete) {
+      const page = rowsOf(data);
+      const next = typeof data.next_cursor === 'string' ? data.next_cursor : null; const more = data.has_more === true && Boolean(next);
+      const keys = new Set(page.map(keyOf));
+      const first = cache.rows.findIndex(row => keys.has(keyOf(row)));
+      if (!more) { changed = setRows(cache, page); cache.cursor = null; cache.hasMore = false; }
+      else if (!cache.rows.length || first < 0) {
+        // Nothing shown, or a gap: start over from this page; earlier pages load again on request.
+        changed = setRows(cache, page) || cache.cursor !== next; cache.cursor = next; cache.hasMore = true; cache.generation++;
+      } else changed = setRows(cache, cache.rows.slice(0, first).filter(row => !keys.has(keyOf(row))).concat(page));
+      for (const key of [...(state.outbox.get(sessionId)?.keys() ?? [])]) if (cache.index.has(key)) state.outbox.get(sessionId).delete(key);
+      settleFromHistory(sessionId, cache);
+    }
+    return { rows: changed, alert: changed || was.join('|') !== [cache.incomplete, cache.warnings.join('\n'), cache.error].join('|') };
+  }
+  async function loadHistory(sessionId, { quiet = false } = {}) {
+    const cache = history(sessionId);
+    if (cache.loading) { cache.again = true; return; }
+    cache.loading = true; if (!cache.loaded && state.selected === sessionId) renderTimeline();
+    try {
+      const { data } = await callTool('panel_history', { session_id: sessionId, limit: 100 });
+      if (state.histories.get(sessionId) !== cache) return;
+      const changed = applyNewest(sessionId, cache, data);
+      if (state.selected === sessionId) {
+        if (changed.rows || !cache.rows.length) renderTimeline({ preserve: true });
+        renderComposer(); if (changed.alert) renderAlert();
+      }
+    } catch (error) {
+      cache.error = error.message; cache.loaded = true;
+      if (state.selected === sessionId) { renderTimeline({ preserve: true }); renderAlert(); }
+      if (!quiet) announce('Could not load history.');
+    } finally {
+      cache.loading = false;
+      if (cache.again) { cache.again = false; loadHistory(sessionId, { quiet: true }); }
+    }
+  }
+  async function loadOlder() {
+    const sessionId = state.selected; const cache = state.histories.get(sessionId);
+    if (!cache?.cursor || cache.olderLoading) return;
+    const cursor = cache.cursor; const generation = cache.generation; const height = $('timeline').scrollHeight;
+    cache.olderLoading = true; cache.olderError = ''; renderTimeline({ preserve: true });
+    let added = false;
+    try {
+      const { data } = await callTool('panel_history', { session_id: sessionId, limit: 100, cursor });
+      if (state.histories.get(sessionId) !== cache || cache.generation !== generation || cache.cursor !== cursor) return;
+      checkPage(sessionId, data);
+      if (data.incomplete === true || (data.incomplete === undefined && !data.messages.length && data.next_cursor === cursor)) {
+        cache.olderError = 'Earlier messages could not be read in full.';
+      } else {
+        const older = rowsOf(data).filter(row => !cache.index.has(keyOf(row)));
+        setRows(cache, older.concat(cache.rows)); added = older.length > 0;
+        cache.cursor = typeof data.next_cursor === 'string' ? data.next_cursor : null; cache.hasMore = data.has_more === true && Boolean(cache.cursor);
+      }
+    } catch (error) { cache.olderError = error.message; }
+    finally {
+      cache.olderLoading = false;
+      if (state.selected === sessionId && state.histories.get(sessionId) === cache) { renderTimeline(added ? { prependHeight: height } : { preserve: true }); renderAlert(); }
+    }
+  }
+
+  // Sends. Each conversation has at most one unresolved send; only its own request may resolve
+  // it, and a success clears only the draft revision it sent (U01).
+  function sendVerdict(data, error) {
+    if (error) {
+      const outcome = knownOutcome(error.outcome);
+      return outcome ? { delivered: outcome.delivered, reason: outcome.reason, retry: outcome.retry, detail: error.message.replace(/^Message not sent\.\s*/i, '') }
+        : { delivered: 'unknown', reason: 'no_answer', detail: error.message };
+    }
+    const outcome = knownOutcome(data.outcome); const status = data.delivery.status;
+    if (outcome) return { delivered: outcome.delivered, reason: outcome.reason, retry: outcome.retry, detail: string(data.delivery.error) };
+    // 1.0 servers report only the delivery status.
+    return status === 'submitted' ? { delivered: true, reason: 'submitted' }
+      : status === 'failed' ? { delivered: false, reason: 'prior_failed', retry: 'after_fix', detail: string(data.delivery.error) }
+      : { delivered: 'unknown', reason: 'delivery_unconfirmed', detail: string(data.delivery.error) };
+  }
+  function canSend(chat, value) {
+    const pending = chat && state.sends.get(chat.session_id);
+    return Boolean(state.ready && !state.ownerChanged && chat?.live && value.trim() && !draftProblem(value)
+      && !(pending && ['sending', 'unknown'].includes(pending.phase)));
+  }
+  async function sendMessage({ replay = false } = {}) {
+    const sessionId = state.selected; const chat = state.chats.get(sessionId); const prior = state.sends.get(sessionId);
+    if (!chat || !state.ready || state.ownerChanged) return;
+    let message, id, revision, createdAt;
+    if (replay) {
+      // The same ID and the original text: the bridge reports the earlier result or completes it once.
+      if (prior?.phase !== 'unknown') return;
+      ({ message, id, revision, createdAt } = prior);
+    } else {
+      message = state.drafts.get(sessionId) || '';
+      if (!canSend(chat, message)) return;
+      const reuse = prior?.phase === 'failed' && prior.message === message && ['same_id', 'after_fix'].includes(prior.retry);
+      id = reuse ? prior.id : crypto.randomUUID(); revision = state.revisions.get(sessionId) || 0; createdAt = reuse ? prior.createdAt : Date.now();
+    }
+    const pending = { id, message, revision, createdAt, phase: 'sending' };
+    state.sends.set(sessionId, pending); renderSelected(sessionId);
+    let data, error;
+    try { ({ data } = await callTool('panel_send', { session_id: sessionId, message, message_id: id })); }
+    catch (caught) { error = caught; }
+    if (state.sends.get(sessionId) !== pending) return;
+    if (data && (!object(data.delivery) || data.delivery.message_id !== id || data.delivery.message !== message)) { data = undefined; error = failed('The response did not match the sent message.'); }
+    const verdict = sendVerdict(data, error);
+    if (verdict.delivered === true) {
+      const notice = knownOutcome(data?.notice_outcome ?? error?.details?.notice_outcome);
+      handOff(sessionId, pending, {
+        id, direction: 'to_claude', message, created_at: data?.delivery?.created_at ?? createdAt, status: 'submitted', manual: true,
+        notice_status: string(data?.notice_status) || undefined, notice_retryable: data?.notice_retryable === true, notice_omitted: data?.notice_omitted === true,
+        notice_reason: notice?.reason, notice_note: notice?.reason === 'settlement_failed' ? 'settlement_failed' : undefined,
+        primary_note: verdict.reason === 'settlement_failed' ? 'settlement_failed' : undefined });
+    } else if (verdict.delivered === false) {
+      Object.assign(pending, { phase: 'failed', reason: verdict.reason, retry: verdict.retry, detail: verdict.detail });
+      announce(`Not sent. ${failureText(pending)[0]} The draft is kept.`);
+    } else {
+      Object.assign(pending, { phase: 'unknown', reason: verdict.reason, detail: verdict.detail });
+      announce('The handoff is not confirmed. Check again before sending this text again.');
+    }
+    renderSelected(sessionId);
+    if (verdict.delivered !== false) loadHistory(sessionId, { quiet: true });
+  }
+  function handOff(sessionId, pending, row) {
+    state.sends.delete(sessionId); state.contacted.add(sessionId);
+    if ((state.revisions.get(sessionId) || 0) === pending.revision && state.drafts.get(sessionId) === pending.message) {
+      state.drafts.set(sessionId, ''); if (state.selected === sessionId) { $('message').value = ''; resizeComposer(); }
+    }
+    if (row) {
+      if (!state.outbox.has(sessionId)) state.outbox.set(sessionId, new Map());
+      if (!state.histories.get(sessionId)?.index.has(keyOf(row))) state.outbox.get(sessionId).set(keyOf(row), row);
+      announce(`${demo ? 'Added to the demo.' : 'Handed to Claude Code.'} ${noticeLine(row)?.[0] ?? ''}`.trim());
+    }
+    if (state.selected === sessionId) renderChats();
+  }
+  function settleFromHistory(sessionId, cache) {
+    // History settles an unknown send, never one whose request is still running (U01).
+    const pending = state.sends.get(sessionId); const row = pending && cache.index.get(`to_claude:${pending.id}`);
+    if (!row || pending.phase !== 'unknown' || row.message !== pending.message) return;
+    if (row.status === 'submitted') handOff(sessionId, pending, null);
+    else if (row.status === 'failed') Object.assign(pending, { phase: 'failed', reason: 'prior_failed', retry: 'after_fix', detail: '' });
+  }
+  async function retryNotice(sessionId, messageId) {
+    const key = `${sessionId}:${messageId}`;
+    if (demo || !state.ready || state.ownerChanged || state.noticeRetries.has(key)) return;
+    const row = state.histories.get(sessionId)?.index.get(`to_claude:${messageId}`) ?? state.outbox.get(sessionId)?.get(`to_claude:${messageId}`);
+    if (!row || !noticeRetryable(row)) return;
+    state.noticeRetries.add(key); renderSelected(sessionId);
+    try {
+      const { data } = await callTool('panel_retry_notice', { session_id: sessionId, message_id: messageId });
+      if (!object(data.delivery) || data.delivery.message_id !== messageId) throw failed('The response did not match this message.');
+      const notice = knownOutcome(data.notice_outcome);
+      Object.assign(row, { notice_status: string(data.notice_status) || row.notice_status, notice_retryable: data.notice_retryable === true,
+        notice_omitted: data.notice_omitted === true, notice_reason: notice?.reason, notice_note: notice?.reason === 'settlement_failed' ? 'settlement_failed' : undefined });
+    } catch (error) {
+      if (knownOutcome(error.outcome)?.delivered === false) Object.assign(row, { notice_retryable: false, notice_note: 'retry_refused' });
+      else Object.assign(row, { notice_status: 'uncertain', notice_retryable: false, notice_note: 'retry_unknown' });
+    } finally { state.noticeRetries.delete(key); renderSelected(sessionId); }
+    loadHistory(sessionId, { quiet: true });
+  }
+
+  // Words. "Handed to Claude Code" is what the bridge proves: a write, not a read (V03).
+  const SEND_REASONS = {
+    target_unavailable: ['The Claude Code conversation is not open.', 'Open it in Claude Code, refresh the list, then send again.', 'refresh'],
+    target_changed: ['The Claude Code conversation restarted or changed.', 'Refresh the list, check the conversation, then send again.', 'refresh'],
+    target_busy: ['Claude Code was busy.', 'Send again.'],
+    target_unverified: ['The bridge could not verify the Claude Code conversation.', 'Send again.'],
+    route_unverified: ['The bridge could not verify the route to Claude Code.', 'Send again.'],
+    caller_unverified: ['The bridge could not verify this Codex chat.', 'Send again.'],
+    identity_check_unavailable: ['The bridge could not check the conversation identity.', 'Send again.'],
+    state_busy: ['The bridge state was busy.', 'Send again.'],
+    server_busy: ['The bridge was busy.', 'Send again.'],
+    deadline: ['The send ran out of time before anything was written.', 'Send again.'],
+    cancelled: ['The send was cancelled before anything was written.', 'Send again.'],
+    state_unavailable: ['The bridge could not write its local state.', 'Free disk space or check access to the bridge state folder, then send again.'],
+    setup_incomplete: ['The bridge is not fully set up.', 'Ask Codex to run bridge_doctor, fix what it reports, then send again.'],
+    version_mismatch: ['Bridge versions do not match.', 'Reload plugins or restart Codex, then send again.'],
+    protocol_incompatible: ['Claude Code does not accept this message format.', 'Update Claude Code, then send again.'],
+    route_unavailable: ['No route to this Claude Code conversation is available.', 'Ask Codex to run bridge_doctor, then send again.'],
+    request_rejected: ['Claude Code refused the message.', 'Check the conversation in Claude Code, then send again.'],
+    caller_invalid: ['This Codex chat could not be verified as the sender.', 'Reopen the panel from this chat.'],
+    caller_changed: ['The Codex chat changed while sending.', 'Reopen the panel from the intended chat.'],
+    wrong_tool: ['This panel sends only from a Codex Desktop chat.', 'Open the panel in Codex Desktop.'],
+    invalid_argument: ['The bridge refused the message.', 'Correct it, then send again.', 'detail'],
+    id_conflict: ['This message ID already belongs to another message.', 'Send it as a new message.'],
+    internal_error: ['The bridge failed before sending.', 'Send again; if it repeats, ask Codex to run bridge_doctor.'],
+    prior_failed: ['The send failed before Claude Code took it.', 'Send again.', 'detail'],
+  };
+  const NOTICE_REASONS = { state_unavailable: 'the bridge could not write its local state', target_busy: 'Codex was busy', request_rejected: 'Codex refused it',
+    route_unavailable: 'this Codex chat could not be reached', protocol_incompatible: 'this Codex version does not accept it', deadline: 'it ran out of time',
+    cancelled: 'it was cancelled', setup_incomplete: 'the bridge is not fully set up', target_unavailable: 'this Codex chat was not available' };
+  function failureText(pending) {
+    const [what, step, extra] = SEND_REASONS[pending.reason] ?? ['The bridge did not send it.', 'Send again.', 'detail'];
+    return [extra === 'detail' && pending.detail ? `${what} ${pending.detail.slice(0, 300)}` : what, step, extra];
+  }
+  function statusText(row) {
+    if (row.status === 'uncertain') return 'Handoff not confirmed';
+    if (row.status === 'failed') return 'Not sent';
+    if (row.status === 'sending') return 'Sending…';
+    return demo ? 'Added to demo' : row.direction === 'to_claude' ? 'Handed to Claude Code' : 'From Claude';
+  }
+  const noticeRetryable = row => row.manual === true && row.status === 'submitted' && row.notice_retryable === true && !row.notice_omitted
+    && ['failed', 'pending'].includes(row.notice_status);
+  // Where the copy for the owner Codex chat went, as its own line beside the Claude handoff.
+  function noticeLine(row) {
+    if (row.direction !== 'to_claude' || row.manual !== true || row.status !== 'submitted') return null;
+    if (row.notice_note === 'settlement_failed') return ['Copy posted in this Codex chat; the bridge could not record that. Do not post it again.', 'warning'];
+    if (row.notice_note === 'retry_unknown') return ['Posting the copy again has an unknown result. Check this Codex chat; Claude Code did not get the message again.', 'warning'];
+    if (row.notice_note === 'retry_refused') return ['The copy could not be posted again. Check this Codex chat; Claude Code did not get the message again.', 'failed'];
+    if (row.notice_status === 'submitted') return ['Copy posted in this Codex chat', ''];
+    if (row.notice_omitted) return ['No copy in this Codex chat: the notice ledger shared with older bridge versions is full. Claude Code has the message; do not send it again.', 'warning'];
+    if (row.notice_status === 'pending') return row.notice_retryable ? ['No copy in this Codex chat yet: the send stopped before posting it.', 'warning'] : ['Posting a copy in this Codex chat…', ''];
+    if (row.notice_status === 'uncertain') return ['The copy for this Codex chat may not have been posted. Check this chat; it is not posted again automatically.', 'warning'];
+    if (row.notice_status === 'failed') {
+      const reason = NOTICE_REASONS[row.notice_reason];
+      return row.notice_retryable ? [`Copy for this Codex chat not posted${reason ? `: ${reason}` : ''}.`, 'failed']
+        : ['Copy for this Codex chat not posted. Check this chat before acting; Claude Code has the message.', 'failed'];
+    }
+    return null;
+  }
+  function dayLabel(time, now) {
+    // LC09: yesterday by calendar arithmetic; a civil day is not always 24 hours.
+    const date = new Date(time); const today = new Date(now);
+    const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+    const day = date.toDateString();
+    return day === today.toDateString() ? 'Today' : day === yesterday.toDateString() ? 'Yesterday'
+      : date.toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric' });
+  }
+  function draftProblem(value) {
+    if (value.includes('\0')) return 'Remove the NUL character (U+0000) to send this text.';
+    if (!value.isWellFormed()) return 'Replace the incomplete Unicode character to send this text.';
+    const bytes = bytesOf(value);
+    return bytes > LIMIT ? `${count(bytes)} of ${count(LIMIT)} bytes. Shorten the message to send it.` : '';
+  }
+  function keyHint() {
+    if (enterMode === 'enter') return 'Enter sends · Shift+Enter adds a line';
+    if (enterMode === 'cmdIfMultiline') return `Enter sends one line; in longer text it adds a line · ${modifier}+Enter sends`;
+    if (enterMode === 'cmdAlways') return `Enter adds a line · ${modifier}+Enter sends`;
+    return `Enter adds a line · ${modifier}+Enter sends (Codex did not share its Enter setting)`;
+  }
+
+  // Rendering.
   function select(sessionId) {
-    if (!state.chats.some(chat => chat.session_id === sessionId)) return;
-    if (state.selected) state.drafts.set(state.selected, $('message').value);
+    if (!state.chats.has(sessionId)) return;
     state.selected = sessionId; $('message').value = state.drafts.get(sessionId) || '';
+    const cache = history(sessionId);
     renderChats();
-    const selected = Array.from($('chat-list').children).find(node => node.dataset?.sessionId === sessionId);
-    selected?.focus();
+    Array.from($('chat-list').children).find(node => node.dataset?.sessionId === sessionId)?.focus();
     renderConversation();
-    if (!history(sessionId).loaded && !history(sessionId).loading) loadHistory(sessionId);
+    if (!cache.loaded && !cache.loading) loadHistory(sessionId);
   }
-  function renderConversation({ preserveTimeline = false } = {}) {
-    const chat = state.chats.find(item => item.session_id === state.selected);
+  function renderSelected(sessionId) { if (state.selected === sessionId) { renderTimeline({ preserve: true }); renderComposer(); renderAlert(); } }
+  function renderConversation({ timeline = true } = {}) {
+    const chat = state.chats.get(state.selected);
     $('shell').classList.toggle('has-selection', Boolean(chat));
     $('welcome').hidden = Boolean(chat); $('conversation-head').hidden = !chat; $('timeline').hidden = !chat; $('composer-wrap').hidden = !chat;
     if (!chat) { $('conversation-alert').hidden = true; return; }
     $('conversation-title').textContent = chat.title;
-    $('conversation-subtitle').textContent = `${clientLabel(chat)} · ${chat.live ? 'Session active' : 'Session inactive'}${workspace(chat.cwd) ? ` · ${workspace(chat.cwd)}` : ''}`;
-    renderTimeline({ preserve: preserveTimeline }); renderComposer(); renderAlert();
+    $('conversation-subtitle').textContent = `${clientLabel(chat)} · ${availability(chat)}${workspace(chat.cwd) ? ` · ${workspace(chat.cwd)}` : ''}`;
+    $('conversation-id').textContent = `ID ${chat.session_id}`;
+    if (timeline) renderTimeline(); renderComposer(); renderAlert();
   }
-  function statusText(message) {
-    if (message.status === 'uncertain') return 'Delivery not confirmed';
-    if (message.status === 'failed') return 'Not sent';
-    if (message.status === 'sending') return 'Sending…';
-    return demo ? 'Added to demo' : message.direction === 'to_claude' ? 'Sent to Claude' : 'From Claude';
+  function timelineRows(sessionId, cache) {
+    const extra = [];
+    for (const [key, row] of state.outbox.get(sessionId) ?? []) if (!cache.index.has(key)) extra.push(row);
+    const pending = state.sends.get(sessionId); const key = pending && `to_claude:${pending.id}`;
+    if (pending && ['sending', 'unknown'].includes(pending.phase) && !cache.index.has(key) && !state.outbox.get(sessionId)?.has(key)) {
+      extra.push({ id: pending.id, direction: 'to_claude', message: pending.message, created_at: pending.createdAt,
+        status: pending.phase === 'sending' ? 'sending' : 'uncertain', manual: true });
+    }
+    return extra.length ? cache.rows.concat(extra) : cache.rows;
+  }
+  function rowNode(sessionId, cache, row, used) {
+    const key = keyOf(row); const retrying = state.noticeRetries.has(`${sessionId}:${row.id}`);
+    const signature = `${signatureOf(row)}|${retrying}|${state.ready}`;
+    used.add(key);
+    const saved = cache.nodes.get(key); if (saved?.signature === signature && saved.message === row.message) return saved.node;
+    const outgoing = row.direction === 'to_claude'; const node = element('article', `message-row${outgoing ? ' outgoing' : ''}`);
+    const label = element('div', 'message-label', outgoing ? row.manual === true ? 'You' : 'Codex' : 'Claude');
+    if (row.manual === true) label.append(element('span', 'manual-tag', 'Manual'));
+    const meta = element('div', `message-meta${row.status === 'uncertain' || row.primary_note ? ' warning' : row.status === 'failed' ? ' failed' : ''}`);
+    meta.append(element('time', '', shortTime(row.created_at)), element('span', '', statusText(row)));
+    if (row.primary_note === 'settlement_failed') meta.append(element('span', '', 'Not recorded by the bridge; do not send it again'));
+    if (outgoing && row.status === 'submitted' && !demo) meta.title = 'The bridge wrote this message to the Claude Code conversation. Claude Code may still hold or refuse it; this is not a read receipt.';
+    node.append(label, element('div', 'bubble', string(row.message)), meta);
+    const notice = noticeLine(row);
+    if (notice) node.append(element('span', `notice-detail${notice[1] ? ` ${notice[1]}` : ''}`, notice[0]));
+    if (noticeRetryable(row)) {
+      const action = button('small-button', retrying ? 'Posting the copy…' : row.notice_status === 'pending' ? 'Post the copy now' : 'Post the copy again',
+        `notice:${row.id}`, () => retryNotice(sessionId, row.id));
+      action.disabled = retrying || !state.ready || state.ownerChanged; action.style.marginTop = '7px'; node.append(action);
+    }
+    cache.nodes.set(key, { signature, message: row.message, node });
+    return node;
   }
   function renderTimeline({ preserve = false, prependHeight = null } = {}) {
-    if (!state.selected) return;
-    const cache = history(state.selected); const pane = $('timeline');
+    const sessionId = state.selected; if (!sessionId) return;
+    const cache = history(sessionId); const pane = $('timeline'); const control = focusedControl();
     const previousTop = pane.scrollTop; const nearBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 70;
     const nodes = [];
-    if (cache.hasMore && cache.nextCursor) {
-      const control = element('div', 'history-control'); const button = element('button', 'small-button', cache.olderLoading ? 'Loading…' : 'Load earlier messages');
-      button.type = 'button'; button.disabled = Boolean(cache.olderLoading); button.addEventListener('click', () => loadOlder()); control.append(button); nodes.push(control);
+    if (cache.hasMore && cache.cursor) {
+      const holder = element('div', 'history-control');
+      const older = button('small-button', cache.olderLoading ? 'Loading…' : cache.olderError ? 'Retry earlier messages' : 'Load earlier messages', 'older', () => loadOlder());
+      older.disabled = cache.olderLoading; holder.append(older); nodes.push(holder);
     }
-    const messages = [...cache.messages]; const pending = state.sends.get(state.selected);
-    if (pending && !messages.some(message => message.id === pending.id)) messages.push({ id: pending.id, direction: 'to_claude', message: pending.message, created_at: pending.createdAt,
-      status: pending.outcome === 'sending' ? 'sending' : 'uncertain', manual: true });
-    let lastDay = '';
-    for (const message of messages) {
-      const date = timestamp(message.created_at); const day = date ? new Date(date).toDateString() : '';
-      if (day && day !== lastDay) {
-        lastDay = day; const today = new Date().toDateString(); const yesterday = new Date(Date.now() - 86400000).toDateString();
-        nodes.push(element('div', 'day', day === today ? 'Today' : day === yesterday ? 'Yesterday' : new Date(date).toLocaleDateString('en-US', { day: 'numeric', month: 'long', year: 'numeric' })));
-      }
-      const outgoing = message.direction === 'to_claude'; const row = element('article', `message-row${outgoing ? ' outgoing' : ''}`);
-      const label = element('div', 'message-label', outgoing ? message.manual === true ? 'You' : 'Codex' : 'Claude');
-      if (message.manual === true) label.append(element('span', 'manual-tag', 'Manual'));
-      const bubble = element('div', 'bubble', string(message.message));
-      const meta = element('div', `message-meta${message.status === 'uncertain' ? ' warning' : message.status === 'failed' ? ' failed' : ''}`);
-      meta.append(element('time', '', shortTime(date)), element('span', '', statusText(message)));
-      if (message.status === 'submitted' && !demo) meta.title = 'Sent to the app. This does not confirm that it was read.';
-      row.append(label, bubble, meta);
-      if (message.notice_status && message.notice_status !== 'submitted') row.append(element('span', 'notice-detail', message.notice_status === 'failed'
-        ? 'Notification was not sent to the current Codex chat' : message.notice_status === 'uncertain' ? 'Codex notification delivery is unconfirmed' : 'Codex notification is pending'));
-      if (message.manual === true && message.status === 'submitted' && message.notice_status === 'failed' && message.notice_retryable === true) {
-        const button = element('button', 'small-button', noticeRetries.has(`${state.selected}:${message.id}`) ? 'Retrying notification…' : 'Retry Codex notification');
-        button.type = 'button'; button.disabled = noticeRetries.has(`${state.selected}:${message.id}`);
-        button.style.marginTop = '7px'; button.addEventListener('click', () => retryNotice(message.id)); row.append(button);
-      }
-      nodes.push(row);
+    const rows = timelineRows(sessionId, cache); const now = Date.now(); const used = new Set(); let lastDay = '';
+    for (const row of rows) {
+      const time = timestamp(row.created_at); const day = time ? new Date(time).toDateString() : '';
+      if (day && day !== lastDay) { lastDay = day; nodes.push(element('div', 'day', dayLabel(time, now))); }
+      nodes.push(rowNode(sessionId, cache, row, used));
     }
-    if (!messages.length) { const empty = element('div', 'timeline-empty'); empty.append(element('strong', '', cache.loading ? 'Loading history…' : cache.error ? 'History unavailable' : 'Start a conversation'),
-      element('span', '', cache.error ? 'Refresh history to try again.' : cache.loading ? 'Messages will appear here.' : 'Your message will appear in this Claude chat. The reply will arrive as a separate message.')); nodes.push(empty); }
+    for (const key of [...cache.nodes.keys()]) if (!used.has(key)) cache.nodes.delete(key);
+    if (!rows.length) {
+      const empty = element('div', 'timeline-empty');
+      empty.append(element('strong', '', cache.loading && !cache.loaded ? 'Loading history…' : cache.error ? 'History unavailable' : cache.incomplete ? 'History incomplete' : 'No bridge messages yet'),
+        element('span', '', cache.error || cache.incomplete ? 'Retry to load it again.' : cache.loading && !cache.loaded ? 'Messages will appear here.'
+          : 'Messages you write below go to this Claude Code conversation, with a copy in this Codex chat. Its bridge replies appear here too.'));
+      nodes.push(empty);
+    }
     pane.replaceChildren(...nodes);
     if (prependHeight !== null) pane.scrollTop = previousTop + pane.scrollHeight - prependHeight;
     else if (preserve && !nearBottom) pane.scrollTop = previousTop;
     else pane.scrollTop = pane.scrollHeight;
+    restoreFocus(control, nodes);
   }
   function renderComposer() {
-    const chat = state.chats.find(item => item.session_id === state.selected); if (!chat) return;
-    const pending = state.sends.get(chat.session_id); const uncertain = pending?.outcome === 'uncertain';
-    $('composer').hidden = !chat.live || uncertain; $('composer-inactive').hidden = chat.live && !uncertain;
-    $('inactive-title').textContent = uncertain ? 'Delivery not confirmed' : 'This Claude session is inactive';
-    $('inactive-detail').textContent = uncertain ? 'The text and message ID were saved. Check the selected Claude chat and refresh history. Resending is blocked.'
-      : 'History is available. To send a new message, open this Claude Code session and refresh the list.';
-    const value = state.drafts.get(chat.session_id) || ''; const bytes = new TextEncoder().encode(value).length;
-    const sending = pending?.outcome === 'sending';
-    $('message').disabled = !state.ready || sending;
+    const chat = state.chats.get(state.selected); if (!chat) return;
+    const pending = state.sends.get(chat.session_id);
+    $('composer').hidden = !chat.live; $('composer-inactive').hidden = chat.live;
+    $('inactive-title').textContent = 'Not available for sending';
+    $('inactive-detail').textContent = 'History is available. To send, open this conversation in Claude Code, then refresh the list.';
+    const value = state.drafts.get(chat.session_id) || ''; const problem = draftProblem(value); const bytes = problem ? 0 : bytesOf(value);
+    $('message').disabled = !state.ready;
     resizeComposer();
-    $('send').disabled = !state.ready || !chat.live || !value.trim() || bytes > 65536 || Boolean(pending);
-    $('send-label').textContent = sending ? 'Sending…' : demo ? 'Add to demo' : 'Send';
-    $('composer-hint').textContent = bytes > 65536 ? 'Message exceeds the 64 KiB limit'
-      : composerEnterBehavior === 'cmdAlways' ? 'Enter — new line · Ctrl / ⌘ + Shift + Enter — send'
-      : composerEnterBehavior === 'cmdIfMultiline' ? 'Enter — send · new line in multiline text'
-      : 'Enter — send · Shift+Enter — new line';
+    $('send').disabled = !canSend(chat, value);
+    $('send-label').textContent = pending?.phase === 'sending' ? 'Sending…' : demo ? 'Add to demo' : 'Send to Claude Code';
+    // A10: name both destinations before the send.
+    $('composer-dest').textContent = `To “${chat.title}” in Claude Code · a copy of the full text goes to this Codex chat`;
+    $('composer-hint').textContent = problem || (pending?.phase === 'sending' ? 'Sending… You can keep editing; the text being sent is fixed.'
+      : pending?.phase === 'unknown' ? 'Sending is paused until the last message is checked.'
+      : bytes > LIMIT * 0.9 ? `${count(bytes)} of ${count(LIMIT)} bytes · ${keyHint()}` : keyHint());
+    $('composer-hint').classList.toggle('problem', Boolean(problem));
+  }
+  function alertFor(sessionId) {
+    const cache = state.histories.get(sessionId); const pending = state.sends.get(sessionId);
+    if (pending?.phase === 'unknown') {
+      const confirmed = pending.reason !== 'no_answer' && pending.reason !== 'in_flight';
+      const text = pending.reason === 'in_flight' ? 'Another attempt with this message is still running.'
+        : confirmed ? 'The bridge wrote this message but cannot confirm Claude Code took it. Look in the Claude Code conversation before sending this text again.'
+        : `Codex did not report whether this message was handed to Claude Code.${pending.detail ? ` ${pending.detail.slice(0, 200)}` : ''}`;
+      return { text: `${text} Check again reuses the same message ID: the bridge reports the earlier result or finishes the send once, never twice.`, tone: 'warning',
+        actions: [['Check again', () => sendMessage({ replay: true })], ['Write a new message', () => { state.sends.delete(sessionId); renderSelected(sessionId); }]] };
+    }
+    if (pending?.phase === 'failed') {
+      const [what, step, extra] = failureText(pending);
+      return { text: `Not sent. ${what} ${step} The draft is kept.`, tone: 'error', actions: extra === 'refresh' ? [['Refresh list', () => refresh()]] : [] };
+    }
+    if (!cache) return null;
+    if (cache.error) return { text: `History could not be loaded. ${cache.error}`, tone: 'error', actions: [['Retry', () => loadHistory(sessionId)]] };
+    if (cache.incomplete) return { text: `Part of this history could not be read; showing what was loaded. ${cache.warnings.join(' ')}`.trim(), tone: 'warning', actions: [['Retry', () => loadHistory(sessionId)]] };
+    if (cache.olderError) return { text: `${cache.olderError} Earlier messages are still available.`, tone: 'warning', actions: [] };
+    if (cache.warnings.length) return { text: cache.warnings.join(' '), tone: 'warning', actions: [['Refresh', () => refresh()]] };
+    return null;
   }
   function renderAlert() {
     if (!state.selected) return;
-    const cache = history(state.selected); const pending = state.sends.get(state.selected);
-    const text = pending?.outcome === 'uncertain' ? 'Send result is unknown. Do not resend this text until you check the Claude chat.'
-      : cache.error || cache.warning;
-    $('conversation-alert').hidden = !text; $('alert-text').textContent = text || '';
-    $('conversation-alert').classList.toggle('error', Boolean(cache.error) && !pending);
+    const view = alertFor(state.selected); const control = focusedControl();
+    $('conversation-alert').hidden = !view; $('alert-text').textContent = view?.text || '';
+    $('conversation-alert').classList.toggle('error', view?.tone === 'error');
+    const actions = (view?.actions ?? []).map(([label, run]) => button('', label, `alert:${label}`, run));
+    $('alert-actions').replaceChildren(...actions); restoreFocus(control, actions);
   }
-  function applyHistory(sessionId, data, older) {
-    if (data.session_id !== sessionId || !Array.isArray(data.messages)) throw new Error('History belongs to another conversation. Refresh the panel.');
-    const cache = history(sessionId); const merged = new Map(cache.messages.map(message => [message.id, message]));
-    for (const message of data.messages) if (object(message) && typeof message.id === 'string' && typeof message.message === 'string'
-      && ['to_claude', 'to_codex'].includes(message.direction)) merged.set(message.id, message);
-    const previous = JSON.stringify(cache.messages); cache.messages = [...merged.values()].sort((a, b) => timestamp(a.created_at) - timestamp(b.created_at));
-    if (!cache.paged || older) { cache.nextCursor = typeof data.next_cursor === 'string' ? data.next_cursor : null; cache.hasMore = data.has_more === true && Boolean(cache.nextCursor); }
-    if (older) cache.paged = true;
-    cache.loaded = true; cache.loading = false; cache.error = ''; cache.warning = string(data.warning);
-    const pending = state.sends.get(sessionId); const recorded = pending && cache.messages.find(message => message.id === pending.id);
-    if (recorded?.status === 'submitted') {
-      state.sends.delete(sessionId); if (state.drafts.get(sessionId) === pending.message) { state.drafts.set(sessionId, ''); if (state.selected === sessionId) $('message').value = ''; }
-    } else if (recorded?.status === 'failed') { state.sends.delete(sessionId); cache.warning = 'Message was not sent. The text was saved; you can send it again manually.'; }
-    else if (pending && recorded?.status === 'uncertain') pending.outcome = 'uncertain';
-    if (!older && state.selected === sessionId && (previous !== JSON.stringify(cache.messages) || !cache.messages.length)) renderTimeline({ preserve: true });
-    if (state.selected === sessionId) { renderComposer(); renderAlert(); }
-    renderChats();
-  }
-  async function loadHistory(sessionId, quiet = false) {
-    const cache = history(sessionId); if (cache.loading) return;
-    cache.loading = true; if (!cache.loaded && state.selected === sessionId) renderTimeline();
-    try { applyHistory(sessionId, await call('panel_history', { session_id: sessionId, limit: 100 }), false); }
-    catch (error) { cache.error = error.message; cache.loading = false; if (state.selected === sessionId) { renderTimeline({ preserve: true }); renderAlert(); } if (!quiet) announce('Could not load history.'); }
-    finally { cache.loading = false; }
-  }
-  async function loadOlder() {
-    const sessionId = state.selected; if (!sessionId) return;
-    const cache = history(sessionId); if (!cache.nextCursor || cache.olderLoading) return;
-    const height = $('timeline').scrollHeight; cache.olderLoading = true; renderTimeline({ preserve: true });
-    try { applyHistory(sessionId, await call('panel_history', { session_id: sessionId, limit: 100, cursor: cache.nextCursor }), true);
-      if (state.selected === sessionId) renderTimeline({ prependHeight: height }); }
-    catch (error) { cache.error = error.message; if (state.selected === sessionId) renderAlert(); }
-    finally { cache.olderLoading = false; if (state.selected === sessionId) renderTimeline({ preserve: true }); }
-  }
-  async function refresh(quiet = false) {
-    if (state.refreshing || (!demo && !hostOrigin)) return;
+  async function refresh(quiet = false, initial = null) {
+    if (state.stopped || state.refreshing || (!demo && !hostOrigin)) return;
     state.refreshing = true; if (!quiet) $('refresh').classList.add('spin');
-    try { applyPanel(await call('bridge_panel')); if (state.selected) await loadHistory(state.selected, quiet); }
+    try { await loadCatalog({ quiet, initial }); if (state.selected) await loadHistory(state.selected, { quiet }); }
     catch (error) { if (!quiet || !state.ready) showConnectionError(error.message); }
     finally { state.refreshing = false; $('refresh').classList.remove('spin'); }
-  }
-  async function sendMessage() {
-    const sessionId = state.selected; const chat = state.chats.find(item => item.session_id === sessionId);
-    const message = state.drafts.get(sessionId) || '';
-    if (!chat?.live || !state.ready || !message.trim() || new TextEncoder().encode(message).length > 65536 || state.sends.has(sessionId)) return;
-    const pending = { id: crypto.randomUUID(), message, createdAt: Date.now(), outcome: 'sending' };
-    state.sends.set(sessionId, pending); renderTimeline(); renderComposer(); renderAlert();
-    try {
-      const data = await call('panel_send', { session_id: sessionId, message, message_id: pending.id });
-      if (!object(data.delivery) || data.delivery.message_id !== pending.id) throw new Error('Could not match the response to the sent message.');
-      const record = { ...data.delivery, id: data.delivery.message_id, created_at: data.delivery.created_at,
-        direction: 'to_claude', manual: data.manual === true, notice_status: data.notice_status, notice_retryable: data.notice_retryable === true };
-      const cache = history(sessionId); cache.messages = cache.messages.filter(item => item.id !== pending.id); cache.messages.push(record);
-      if (record.status === 'submitted') {
-        state.sends.delete(sessionId); state.drafts.set(sessionId, ''); if (state.selected === sessionId) $('message').value = '';
-        cache.warning = data.notice_status && data.notice_status !== 'submitted' ? 'Message sent to Claude. Notification in the current Codex chat is unconfirmed.' : '';
-        announce(demo ? 'Message added to demo.' : 'Message sent to the selected Claude chat.');
-      } else if (record.status === 'failed') { state.sends.delete(sessionId); cache.warning = 'Message was not sent. The text was saved.'; }
-      else pending.outcome = 'uncertain';
-      chat.last_contact_at = pending.createdAt; chat.last_activity_at = pending.createdAt; renderChats();
-      if (state.selected === sessionId) { renderTimeline(); renderComposer(); renderAlert(); }
-      await loadHistory(sessionId, true);
-    } catch (error) {
-      pending.outcome = 'uncertain'; history(sessionId).error = '';
-      if (state.selected === sessionId) { renderTimeline(); renderComposer(); renderAlert(); }
-      announce('Delivery is unconfirmed. Check Claude and refresh history.');
-    }
-  }
-  async function retryNotice(messageId) {
-    const sessionId = state.selected; if (!sessionId || demo) return;
-    const cache = history(sessionId); const message = cache.messages.find(item => item.id === messageId);
-    const key = `${sessionId}:${messageId}`;
-    if (!message || message.manual !== true || message.status !== 'submitted' || message.notice_status !== 'failed' || message.notice_retryable !== true || noticeRetries.has(key)) return;
-    noticeRetries.add(key); renderTimeline({ preserve: true });
-    try {
-      const data = await call('panel_retry_notice', { session_id: sessionId, message_id: messageId });
-      if (!object(data.delivery) || data.delivery.message_id !== messageId) throw new Error('Could not match the notification response.');
-      message.notice_status = data.notice_status;
-      message.notice_retryable = data.notice_retryable === true;
-      cache.warning = data.notice_status === 'submitted' ? '' : 'The message was already sent to Claude. The retry Codex notification is unconfirmed.';
-      await loadHistory(sessionId, true);
-    } catch { message.notice_status = 'uncertain'; message.notice_retryable = false; cache.warning = 'Retry notification result is unknown. Refresh history; the message was not resent to Claude.'; }
-    finally { noticeRetries.delete(key); if (state.selected === sessionId) { renderTimeline({ preserve: true }); renderAlert(); } }
   }
   $('search').addEventListener('input', () => { state.query = $('search').value; renderChats(); });
   for (const [id, tab] of [['tab-contacted', 'contacted'], ['tab-all', 'all']]) {
     $(id).addEventListener('click', () => { state.tab = tab; renderChats(); });
     $(id).addEventListener('keydown', event => { if (['ArrowLeft', 'ArrowRight'].includes(event.key)) { event.preventDefault(); state.tab = state.tab === 'all' ? 'contacted' : 'all'; renderChats(); $(state.tab === 'all' ? 'tab-all' : 'tab-contacted').focus(); } });
   }
-  $('message').addEventListener('input', () => { if (state.selected) state.drafts.set(state.selected, $('message').value); renderComposer(); });
+  $('message').addEventListener('input', () => {
+    const id = state.selected; if (!id) return;
+    state.drafts.set(id, $('message').value); state.revisions.set(id, (state.revisions.get(id) || 0) + 1); renderComposer();
+  });
   $('message').addEventListener('keydown', event => {
-    const shortcut = event.ctrlKey || event.metaKey;
-    if (event.key !== 'Enter' || event.isComposing || (event.shiftKey && !(composerEnterBehavior === 'cmdAlways' && shortcut))) return;
-    const multiline = $('message').value.includes('\n');
-    const shouldSend = composerEnterBehavior === 'enter'
-      || (composerEnterBehavior === 'cmdIfMultiline' && !multiline)
-      || (composerEnterBehavior === 'cmdAlways' && shortcut)
-      || (composerEnterBehavior === 'cmdIfMultiline' && shortcut);
-    if (shouldSend) { event.preventDefault(); sendMessage(); }
+    if (event.key !== 'Enter' || event.isComposing) return;
+    const shortcut = event.ctrlKey || event.metaKey; const mode = enterMode ?? 'cmdAlways';
+    if (event.shiftKey && !shortcut) return;
+    if (shortcut || mode === 'enter' || (mode === 'cmdIfMultiline' && !$('message').value.includes('\n'))) { event.preventDefault(); sendMessage(); }
   });
   $('composer').addEventListener('submit', event => { event.preventDefault(); sendMessage(); });
-  $('refresh').addEventListener('click', () => refresh()); $('alert-refresh').addEventListener('click', () => refresh());
-  $('focus-search').addEventListener('click', () => { if (state.selected) state.drafts.set(state.selected, $('message').value); state.selected = null; renderChats(); renderConversation(); $('search').focus(); });
-  $('back').addEventListener('click', () => { if (state.selected) state.drafts.set(state.selected, $('message').value); state.selected = null; renderChats(); renderConversation(); });
+  $('refresh').addEventListener('click', () => refresh());
+  $('catalog-more').addEventListener('click', () => searchMore());
+  $('focus-search').addEventListener('click', () => { state.selected = null; renderChats(); renderConversation(); $('search').focus(); });
+  $('back').addEventListener('click', () => { state.selected = null; renderChats(); renderConversation(); });
   const demoNow = Date.now();
   const demoChats = [
     { session_id: 'demo-interface', title: 'Desktop Bridge UI', cwd: 'C:/Projects/desktop-bridge', live: true, last_contact_at: demoNow - 300000, last_activity_at: demoNow - 180000 },
@@ -548,18 +915,19 @@
       { id: 'demo-a', direction: 'to_claude', message: 'Please review the latest plugin documentation updates. Which changes are useful for our bridge?', created_at: demoNow - 1200000, status: 'submitted' },
       { id: 'demo-b', direction: 'to_codex', message: 'I reviewed the documentation. Result schemas, diagnostics, and correct send cancellation are useful for the current bridge.\n\nThe UI can now be a native panel with conversation selection, history, and manual messages.', created_at: demoNow - 900000, status: 'submitted' },
       { id: 'demo-c', direction: 'to_claude', message: 'Good. We will preserve the exact recipient and show delivery status clearly.', created_at: demoNow - 300000, status: 'submitted', manual: true, notice_status: 'submitted' },
-      { id: 'demo-d', direction: 'to_codex', message: 'Yes. “Sent to Claude” means sent to the app. Reading and replying are separate events.', created_at: demoNow - 180000, status: 'submitted' },
+      { id: 'demo-d', direction: 'to_codex', message: 'Yes. “Handed to Claude Code” means the bridge wrote it to the inbox. Reading and replying are separate events.', created_at: demoNow - 180000, status: 'submitted' },
     ]],
     ['demo-review', [{ id: 'demo-review-a', direction: 'to_codex', message: 'Review complete. You can leave a draft reply in this conversation and return later.', created_at: demoNow - 3200000, status: 'submitted' }]],
     ['demo-archive', [{ id: 'demo-archive-a', direction: 'to_codex', message: 'Research complete. This session is closed, but the conversation history is saved.', created_at: demoNow - 86400000, status: 'submitted' }]],
     ['demo-new', []],
   ]);
   async function demoCall(name, args) {
-    if (name === 'bridge_panel') return { owner_thread_id: 'demo-owner', application: 'codex', sessions: demoChats, ...(initialLoad ? {} : { selected_session_id: 'demo-interface' }) };
-    if (name === 'panel_history') return { session_id: args.session_id, messages: args.cursor ? [{ id: 'demo-older', direction: 'to_claude', message: 'Starting the Desktop Bridge discussion.', created_at: demoNow - 86400000, status: 'submitted' }] : demoMessages.get(args.session_id) || [], has_more: args.session_id === 'demo-interface' && !args.cursor, next_cursor: args.session_id === 'demo-interface' && !args.cursor ? 'demo-older' : null };
+    if (name === 'bridge_panel') return { owner_thread_id: 'demo-owner', application: 'codex', sessions: demoChats, warnings: [], ...(initialLoad ? {} : { selected_session_id: 'demo-interface' }) };
+    if (name === 'panel_history') return { session_id: args.session_id, messages: args.cursor ? [{ id: 'demo-older', direction: 'to_claude', message: 'Starting the Desktop Bridge discussion.', created_at: demoNow - 86400000, status: 'submitted' }] : demoMessages.get(args.session_id) || [], has_more: args.session_id === 'demo-interface' && !args.cursor, next_cursor: args.session_id === 'demo-interface' && !args.cursor ? 'demo-older' : null, warnings: [] };
     if (name === 'panel_send') {
       const message = { id: args.message_id, direction: 'to_claude', message: args.message, created_at: Date.now(), status: 'submitted', manual: true, notice_status: 'submitted' };
-      demoMessages.get(args.session_id).push(message); return { delivery: { message_id: message.id, from: { app: 'codex', id: 'demo-owner' }, to: { app: 'claude', id: args.session_id }, message: message.message, status: message.status, manual: true, created_at: message.created_at }, manual: true, notice_status: 'submitted' };
+      demoMessages.get(args.session_id).push(message);
+      return { delivery: { message_id: message.id, from: { app: 'codex', id: 'demo-owner' }, to: { app: 'claude', id: args.session_id }, message: message.message, status: message.status, manual: true, created_at: message.created_at }, manual: true, notice_status: 'submitted' };
     }
     throw new Error('This action is unavailable in the demo.');
   }
@@ -569,13 +937,12 @@
     await refresh(); initialLoad = true;
   } else {
     try {
-      const result = await rpc('ui/initialize', { appInfo: { name: 'desktop-bridge-panel', version: '0.3.0' }, appCapabilities: {}, protocolVersion: '2026-01-26' });
-      theme(result.hostContext); composerContext(result.hostContext); notify('ui/notifications/initialized', {});
-      await waitForInitialPanel();
-      if (!initialPanelResult) await refresh();
+      const result = await rpc('ui/initialize', { appInfo: { name: 'desktop-bridge-panel', version: '1.1.0' }, appCapabilities: {}, protocolVersion: '2026-01-26' });
+      theme(result.hostContext); hostComposer(result.hostContext); notify('ui/notifications/initialized', {});
+      await refresh(false, await waitForInitialPanel());
       initialLoad = true;
     } catch (error) { $('connection-label').textContent = 'Not connected'; showConnectionError(error.message); }
-    setInterval(() => { if (document.visibilityState === 'visible' && state.ready) refresh(true); }, 12000);
+    if (!state.stopped) poll = setInterval(() => { if (!state.stopped && document.visibilityState === 'visible' && state.ready) refresh(true); }, 12000);
   }
   </script>
 </body>

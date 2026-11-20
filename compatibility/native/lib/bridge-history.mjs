@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { defaultStateDir, interruptedSend } from './store.mjs';
 import { readHistoryLedger } from './history-ledger-reader.mjs';
+import { REASONS } from './outcome.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const MiB = 1024 * 1024;
@@ -471,7 +472,8 @@ export async function getBridgeConversation({ stateDir = defaultStateDir(), owne
   }
   if (scan.incomplete) {
     // An incomplete direction cannot justify moving the boundary past unknown messages.
-    return { session_id: sessionId, messages: [], next_cursor: cursor ?? null, has_more: before !== null, warnings: scan.warnings };
+    // incomplete tells a reader to keep what it shows and retry this cursor: no page is not an empty page.
+    return { session_id: sessionId, messages: [], next_cursor: cursor ?? null, has_more: before !== null, incomplete: true, warnings: scan.warnings };
   }
   const sources = [outgoing?.records ?? [], incoming?.records ?? [], shadowRows.sort(compare)];
   // A 1.0 writer sorted by civil time. If its boundary row has since acquired an additive
@@ -498,6 +500,9 @@ export async function getBridgeConversation({ stateDir = defaultStateDir(), owne
       status: effectiveStatus(record), ...(record.manual === true || notice ? { manual: true } : {}) };
     if (noticeStatuses.has(notice?.notice_status)) visible.notice_status = notice.notice_status;
     if (typeof notice?.notice_retryable === 'boolean') visible.notice_retryable = notice.notice_retryable;
+    if (['failed', 'uncertain'].includes(notice?.notice_status) && Object.hasOwn(REASONS, notice.notice_reason ?? '')) visible.notice_reason = notice.notice_reason;
+    // The shared legacy ledger was full, so this release sent the message without an owner notice.
+    if (notice?.overflow === true && notice.notice_status === 'failed' && !notice.notice_attempted) visible.notice_omitted = true;
     const size = Buffer.byteLength(JSON.stringify(visible));
     if (page.length && bytes + size > MAX_PAGE_BYTES) break;
     bytes += size;

@@ -87,3 +87,23 @@ test('UI helper tools preserve trusted host metadata and reject widget-supplied 
     assert.equal(tool.annotations.readOnlyHint, false);
   }
 });
+
+test('PR02: the launcher gives the model only live sessions; archived titles and paths reach the panel as UI-only metadata', async t => {
+  const { PANEL_CATALOG } = await import('../lib/bridge-service.mjs');
+  const live = { session_id: 'live-1', title: 'Live work', cwd: 'C:/work/live', live: true, entrypoint: 'cli', last_activity_at: 2, last_contact_at: null };
+  const archived = { session_id: 'old-1', title: 'Private archived plan', cwd: 'C:/secret/archive', live: false, entrypoint: 'cli', last_activity_at: 1, last_contact_at: null };
+  const catalog = { sessions: [live, archived], warnings: [], next_cursor: 'scan-more' };
+  const client = peer(t, async name => name === 'bridge_panel' ? { owner_thread_id: 'owner', application: 'codex', sessions: [live], warnings: [],
+    composer_enter_behavior: 'cmdAlways', [PANEL_CATALOG]: catalog } : null);
+  await initialize(client);
+  const { result } = await client.rpc('tools/call', { name: 'bridge_panel', arguments: {} });
+  assert.doesNotMatch(JSON.stringify([result.content, result.structuredContent]), /Private archived plan|secret|old-1|scan-more/);
+  assert.deepEqual(result.structuredContent.sessions, [live]);
+  assert.deepEqual(result._meta[PANEL_CATALOG], catalog);
+  assert.equal(result._meta.ui.resourceUri, 'ui://bridge/panel-v7.html');
+  // The new URI makes hosts fetch the 1.1 panel; a host that cached the 1.0 URI still reads the current file.
+  for (const uri of ['ui://bridge/panel-v7.html', 'ui://bridge/panel-v6.html']) {
+    const read = await client.rpc('resources/read', { uri });
+    assert.equal(read.result.contents[0].uri, uri); assert.match(read.result.contents[0].text, /bridge-claude-codex\/catalog/);
+  }
+});
