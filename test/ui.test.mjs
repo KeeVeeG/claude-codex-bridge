@@ -705,6 +705,17 @@ test('R3P02: a later copy attempt replaces the previous refusal without offering
   assert.equal(timelineButton(h,'Post the copy again'), undefined); assert.equal(h.requests('panel_retry_notice').length, 0);
 });
 
+test('R4C08: an uncertain copy read straight after a refusal replaces it without offering another post', async () => {
+  const h = await live(); await h.choose('a'); type(h, 'Original'); h.node('composer').dispatch('submit'); await flush();
+  const send = h.requests('panel_send').at(-1), id = send.message.params.arguments.message_id;
+  h.reply(send, { delivery: delivery(id, 'Original'), manual: true, notice_status: 'failed', notice_retryable: true,
+    notice_outcome: { delivered: false, reason: 'request_rejected', retry: 'after_fix' } }); await flush();
+  assert.match(h.node('timeline').textContent, /Copy not posted/);
+  h.reply(h.requests('panel_history').at(-1), { session_id: 'a', messages: [record(id, 'Original', { manual: true, notice_status: 'uncertain', notice_retryable: false })] }); await flush();
+  assert.match(h.node('timeline').textContent, /may not have been posted.*Check this chat/); assert.doesNotMatch(h.node('timeline').textContent, /Copy not posted/);
+  assert.equal(timelineButton(h,'Post the copy again'), undefined); assert.equal(h.requests('panel_retry_notice').length, 0);
+});
+
 test('R3P02: a busy copy-only retry does not hide a newer durable claim on the pending slot', async () => {
   const h = await live(), row = record('copy', 'Original', { manual:true, notice_status:'pending', notice_retryable:true });
   await h.choose('a', [row]); timelineButton(h,'Post the copy now').dispatch('click'); await flush();

@@ -17,14 +17,19 @@ export function interruptedSend(record) {
   if (Number.isSafeInteger(record.startedTick)) return elapsed < 0 || elapsed > 60_000;
   // Released reservations carry no boot tick. A recycled live PID is not indefinite proof of a send.
   const age = Date.now() - record.createdAt;
-  // A future date beside a live PID is a wall-clock rollback, not abandonment (R3D03): age it here.
-  if (pid && age < 0) return /^[a-f0-9]{64}$/.test(record.fingerprint ?? '') && legacyAge(record) > 60_000;
+  // A future date beside a live PID is a wall-clock rollback, not abandonment (R3D03): age it here. Once that
+  // exact attempt has a monotonic first sight, civil time catching up to its date does not restart it (R4C05).
+  if (pid && Number.isFinite(age)) {
+    const key = legacyKey(record);
+    if (age < 0 || legacySeen.has(key)) return /^[a-f0-9]{64}$/.test(record.fingerprint ?? '') && legacyAge(key) > 60_000;
+  }
   return !Number.isFinite(age) || age < 0 || age > 60_000;
 }
 // First sight of each exact legacy reservation on this process's monotonic clock; bounded, oldest out.
 const legacySeen = new Map();
-function legacyAge({ senderPid, createdAt, id, direction, fingerprint }) {
-  const key = JSON.stringify([senderPid, createdAt, id, direction, fingerprint ?? null]), now = performance.now();
+const legacyKey = ({ senderPid, createdAt, id, direction, fingerprint }) => JSON.stringify([senderPid, createdAt, id, direction, fingerprint ?? null]);
+function legacyAge(key) {
+  const now = performance.now();
   if (!legacySeen.has(key)) {
     legacySeen.set(key, now);
     if (legacySeen.size > 4096) legacySeen.delete(legacySeen.keys().next().value);

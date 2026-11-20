@@ -359,6 +359,17 @@ test('every continuation honors the row and byte bounds without dropping the bou
   assert.deepEqual(seen, records.map(record => record.id));
 });
 
+test('R4C08: the history projection marks a pending copy claimed only when its attempt was recorded', async t => {
+  const fixture = await nativeFixture(t), fingerprints = { claimed: 'b'.repeat(64), unclaimed: 'c'.repeat(64) };
+  writeLedger(fixture, ownerThreadId, [outgoing('claimed', 7, { fingerprint: fingerprints.claimed }), outgoing('unclaimed', 8, { fingerprint: fingerprints.unclaimed })]);
+  const pending = (id, createdAt, attempted) => ({ manual: true, message_id: id, session_id: sessionId, fingerprint: fingerprints[id], send_status: 'submitted',
+    notice_status: 'pending', notice_attempted: attempted, notice_retryable: false, sender_pid: process.pid, createdAt, updatedAt: createdAt });
+  writeManual(fixture, [pending('claimed', 7, true), pending('unclaimed', 8, false)]);
+  const rows = Object.fromEntries((await getBridgeConversation(args(fixture))).messages.map(row => [row.id, row]));
+  assert.deepEqual([rows.claimed.notice_status, rows.claimed.notice_claimed], ['pending', true]);
+  assert.deepEqual([rows.unclaimed.notice_status, Object.hasOwn(rows.unclaimed, 'notice_claimed')], ['pending', false]);
+});
+
 test('missing manual primary is a body-free omission; exact text and fingerprint restore the row', async t => {
   const fixture = await nativeFixture(t);
   const fingerprint = 'a'.repeat(64);

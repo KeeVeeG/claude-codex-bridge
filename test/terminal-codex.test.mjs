@@ -625,10 +625,10 @@ claudeTest('explicit terminal delivery queues a Desktop-created conversation by 
   assert.deepEqual(desktop.sent(), []);
 });
 
-claudeTest('auto routing never switches to queue when a loaded session unloads between routing and sending', async t => {
+claudeTest('R4C07: auto routing never switches to queue when a loaded session unloads between routing and sending, nor reuses the ID after it reloads', async t => {
   const threadId = randomUUID();
   const setup = await claudeCallerSetup(t, { threads: [{ id: threadId, originator: 'Codex Desktop',
-    statusByRead: [{ type: 'idle' }, { type: 'notLoaded' }] }] });
+    statusByRead: [{ type: 'idle' }, { type: 'notLoaded' }, { type: 'idle' }] }] });
   const desktop = await desktopApp(t, setup, [{ id: threadId, title: 'Desktop candidate' }]);
   const queue = await fakeQueue(t);
   await assert.rejects(() => executeBridgeTool('send_to_codex', { thread_id: threadId, message: 'hello', message_id: 'unloaded-race' },
@@ -643,6 +643,11 @@ claudeTest('auto routing never switches to queue when a loaded session unloads b
   await assert.rejects(executeBridgeTool('send_to_codex', { ...explicit, message_id: 'unloaded-race', retry_failed: true }, setup.context),
     error => error.outcome.retry === 'new_id' && /confirm|ask/i.test(error.message));
   assert.equal(desktop.sent().length, 0);
+  // The daemon holds the session again (later reads are idle): the same auto transport with the flag still may not reuse the ID (R4C07).
+  await assert.rejects(executeBridgeTool('send_to_codex', { thread_id: threadId, message: 'hello', message_id: 'unloaded-race', retry_failed: true }, { ...setup.context, queue: queue.queue }),
+    error => error.outcome.retry === 'new_id' && error.outcome.reason === 'target_unavailable' && /confirm|ask/i.test(error.message));
+  assert.equal(setup.requests().some(entry => entry.method === 'turn/start' || entry.method === 'turn/steer'), false);
+  assert.deepEqual(queue.queueCalls(), []); assert.equal(desktop.sent().length, 0);
   const sent = await executeBridgeTool('send_to_codex', { ...explicit, message_id: 'confirmed-desktop' }, setup.context);
   assert.equal(sent.outcome.delivered, true); assert.equal(desktop.sent().length, 1);
 });
@@ -839,6 +844,82 @@ claudeTest('R3S04: a late final read followed by notLoaded never queues the mess
     e => e.outcome?.reason === 'route_unverified' && e.outcome.delivered === false);
   assert.equal(s.requests().filter(e => e.method === 'thread/read').length, 3);
   assert.ok(!s.requests().some(e => e.method === 'turn/start' || e.method === 'turn/steer')); assert.equal(queue.queueCalls().length, 0);
+});
+
+const writesOf = s => s.requests().filter(row => ['turn/start', 'turn/steer'].includes(row.method)).length;
+const countOf = (s, method) => s.requests().filter(row => row.method === method).length;
+
+for (const [label, crash] of [['a nonzero proxy exit', { exitCode: 3 }], ['an abnormal WebSocket close', { closeFrame: [0x88, 2, 0x03, 0xf3] }]]) {
+  claudeTest(`R4C03: a kept proxy lost to ${label} before the final read gets one fresh read and delivers once`, async t => {
+    const target = randomUUID(), queue = await fakeQueue(t);
+    const s = await claudeCallerSetup(t, { threads: [{ id: target, originator: 'codex-tui' }], crash: { method: 'thread/read', at: [2], ...crash } });
+    const result = await executeBridgeTool('send_to_codex', { thread_id: target, message: 'fixture', message_id: 'r4c03' }, { ...s.context, queue: queue.queue });
+    assert.equal(result.outcome.reason, 'submitted');
+    assert.equal(countOf(s, 'initialize'), 2, 'the routing proxy and one fresh proxy');
+    assert.equal(countOf(s, 'thread/read'), 3); assert.equal(writesOf(s), 1); assert.equal(queue.queueCalls().length, 0);
+  });
+}
+
+claudeTest('R4C03: the fresh read is one-time and typed: no second reconnect, no queue after an abnormal loss, none after denial', async t => {
+  const target = randomUUID(), queue = await fakeQueue(t), threads = [{ id: target, originator: 'codex-tui' }];
+  const send = (s, extra = {}) => executeBridgeTool('send_to_codex', { thread_id: target, message: 'fixture', ...extra }, { ...s.context, queue: queue.queue });
+  const twice = await claudeCallerSetup(t, { threads, crash: { method: 'thread/read', at: [2, 3], exitCode: 3 } });
+  await assert.rejects(send(twice), e => e.outcome?.reason === 'route_unavailable' && e.outcome.delivered === false);
+  assert.equal(countOf(twice, 'thread/read'), 3, 'the fresh proxy\'s own loss is final'); assert.equal(writesOf(twice), 0);
+  const stopped = await claudeCallerSetup(t, { threads, reachableConnections: 1, crash: { method: 'thread/read', at: [2], exitCode: 3 } });
+  await assert.rejects(send(stopped, { transport: 'terminal' }), e => e.outcome?.reason === 'route_unverified' && e.outcome.retry === 'same_id');
+  assert.equal(writesOf(stopped), 0);
+  const denied = await claudeCallerSetup(t, { threads, crash: { method: 'thread/read', at: [2], closeFrame: [0x88, 2, 0x03, 0xf0] } });
+  await assert.rejects(send(denied, { transport: 'terminal' }), e => e.outcome?.reason === 'access_denied');
+  assert.equal(countOf(denied, 'initialize'), 1); assert.equal(writesOf(denied), 0);
+  const partial = await claudeCallerSetup(t, { threads: [{ id: target, status: { type: 'active' } }], crash: { method: 'thread/turns/list', at: [1], exitCode: 3 } });
+  await assert.rejects(send(partial, { transport: 'terminal' }), { reason: 'route_unavailable' });
+  assert.equal(countOf(partial, 'initialize'), 1, 'a thread answer already arrived on the kept proxy'); assert.equal(writesOf(partial), 0);
+  assert.equal(queue.queueCalls().length, 0);
+});
+
+claudeTest('R4C03: one abnormal exit then an overdue fresh read is unverified, with no third connection', async t => {
+  const { FrameDecoder } = await import('../lib/ws-jsonrpc.mjs');
+  const target = randomUUID(), queue = await fakeQueue(t), s = await claudeCallerSetup(t, { threads: [{ id: target }], crash: { method: 'thread/read', at: [2], exitCode: 3 } });
+  let tick = performance.now(), answers = 0; t.mock.method(performance, 'now', () => tick);
+  const push = FrameDecoder.prototype.push;
+  t.mock.method(FrameDecoder.prototype, 'push', function (chunk) {
+    const events = push.call(this, chunk);
+    if (events.some(e => e.type === 'text' && JSON.parse(e.text).result?.thread?.id === target) && ++answers === 2) tick += 15_001;
+    return events;
+  });
+  await assert.rejects(executeBridgeTool('send_to_codex', { thread_id: target, transport: 'terminal', message: 'fixture' }, { ...s.context, queue: queue.queue }), { reason: 'route_unverified' });
+  assert.equal(countOf(s, 'initialize'), 2); assert.equal(writesOf(s), 0); assert.equal(queue.queueCalls().length, 0);
+});
+
+claudeTest('R4C03: malformed JSON on the kept proxy is an invalid reply, not a pre-answer exit', async t => {
+  const target = randomUUID(), queue = await fakeQueue(t), s = await claudeCallerSetup(t, { threads: [{ id: target }], crash: { method: 'thread/read', at: [2], exitCode: 3, invalidReply: true } });
+  await assert.rejects(executeBridgeTool('send_to_codex', { thread_id: target, transport: 'terminal', message: 'fixture' }, { ...s.context, queue: queue.queue }), { reason: 'protocol_incompatible' });
+  assert.equal(countOf(s, 'initialize'), 1); assert.equal(writesOf(s), 0); assert.equal(queue.queueCalls().length, 0);
+});
+
+claudeTest('R4C04: the call budget ending during the final daemon proof is unverified; cancellation stays cancellation', async t => {
+  const { FrameDecoder } = await import('../lib/ws-jsonrpc.mjs'), { startCall } = await import('../lib/call-time.mjs');
+  const target = randomUUID(), queue = await fakeQueue(t), s = await claudeCallerSetup(t, { threads: [{ id: target, originator: 'codex-tui' }] });
+  let tick = performance.now(), reads = 0, during = null; t.mock.method(performance, 'now', () => tick);
+  const push = FrameDecoder.prototype.push;
+  t.mock.method(FrameDecoder.prototype, 'push', function (chunk) {
+    const events = push.call(this, chunk);
+    // The routing read is the first answer of a call; the clock moves while the final proof's answer is decoded.
+    if (events.some(e => e.type === 'text' && JSON.parse(e.text).result?.thread?.id === target) && ++reads === 2) during?.();
+    return events;
+  });
+  const run = async (id, act) => {
+    const call = startCall(); t.after(() => call.dispose()); reads = 0; during = () => act(call);
+    try { await executeBridgeTool('send_to_codex', { thread_id: target, message: 'fixture', message_id: id }, { ...s.context, queue: queue.queue, signal: call.signal }); }
+    catch (error) { return [error.outcome?.reason, error.outcome?.retry, error.outcome?.delivered]; }
+    return ['submitted'];
+  };
+  assert.deepEqual(await run('late', () => { tick += 55_001; }), ['route_unverified', 'same_id', false]);
+  assert.deepEqual(await run('cancel', call => { call.cancel(); tick += 55_001; }), ['cancelled', 'same_id', false]);
+  assert.equal(writesOf(s), 0); assert.equal(queue.queueCalls().length, 0);
+  assert.deepEqual(await run('timely', () => { tick += 1000; }), ['submitted']);
+  assert.equal(writesOf(s), 1);
 });
 
 claudeTest('SP05: size refusal after reservation requires a new ID for shortened text', async t => {

@@ -105,7 +105,7 @@ test('F02: with only an earlier launch, or no registration at all, discovery and
     /No Codex Desktop registration is in this bridge’s state directory\. Open a Codex Desktop task with the bridge enabled, then retry\./.test(error.message));
   const earlier = await earlierLaunch(t, setup.stateDir);
   const started = performance.now();
-  const stale = /1 saved Codex Desktop endpoint belongs to earlier launches\. Open a Codex Desktop task with the bridge enabled; its bridge server registers the current endpoint when it starts\./;
+  const stale = /1 Codex Desktop endpoint is not present\. Open a Codex Desktop task with the bridge enabled; its bridge server registers the current endpoint when it starts\./;
   await assert.rejects(sendCodex(setup, 'f02-earlier'), error => error.outcome.reason === 'route_unavailable' &&
     stale.test(error.message) && !/ENOENT/.test(error.message) && !error.message.includes(earlier));
   await assert.rejects(executeBridgeTool('list_codex_threads', {}, setup.context), error => stale.test(error.message));

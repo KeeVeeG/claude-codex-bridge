@@ -699,7 +699,8 @@ export function prepareInstallation({ sourceRoot = projectRoot, homeDir = os.hom
   if (fs.existsSync(destination)) {
     if (!stageKind(destination)) throw new Error('The staging destination belongs to another directory or is not a verified installer stage. Preserve it elsewhere before installing.');
     // A rollback that stopped while it served an older retained build from the installed path leaves that build there.
-    if (predecessor) throw new Error(`An earlier update stopped during its rollback: the stage installed before it remains in ${predecessor}, and ${destination} may hold an older build that the rollback served only for a moment. Move ${destination} aside (keep it if a client still runs it), move ${predecessor} back to ${destination}, then retry.`);
+    // Name a backup folder this installer recognizes, so the cache fence still finds the build a client may run (R4C02).
+    if (predecessor) throw new Error(`An earlier update stopped during its rollback: the stage installed before it remains in ${predecessor}, and ${destination} may hold an older build that a client still runs. Move ${destination} to ${path.join(pluginsDir, `.${PLUGIN_NAME}.backup-${timestamp()}-${randomUUID()}`)}, where this installer recognizes it as a retained stage, then move ${predecessor} back to ${destination} and retry.`);
   } else if (predecessor) throw new Error(`The installed stage is missing, but its backup ${predecessor} remains. An earlier update may have been interrupted. Inspect the backups and move the intended predecessor back to ${destination} before retrying.`);
   const build = timestamp();
   const temporary = path.join(pluginsDir, `.${PLUGIN_NAME}.stage-${build}-${randomUUID()}`);
@@ -919,7 +920,8 @@ const ownClaudeEntry = entry => (entry.id === CLAUDE_SELECTOR || entry.name === 
 const claudeLoads = entry => typeof entry.readFromFolder === 'string' ? { version: entry.folderVersion, folder: entry.readFromFolder } : { version: entry.version, folder: entry.installPath };
 /** What a client loads, from the folder it loads: its version and the installer stage holding exactly those files. */
 function inUse(version, copy, stages) {
-  return { version: typeof version === 'string' ? version : null, ...(typeof copy === 'string' && path.isAbsolute(copy) && stageHolding(treeFiles(copy), stages)) };
+  const files = typeof copy === 'string' && path.isAbsolute(copy) ? treeFiles(copy) : null;
+  return { version: typeof version === 'string' ? version : null, files, holder: stageHolding(files, stages)?.holder };
 }
 
 /** Before any change: Codex state must be readable, its cache must be ours to replace, and no other source may keep serving the bridge.
@@ -983,12 +985,18 @@ export function installApplications(prepared, { execute = run, homeDir = os.home
     // destructive native call, including compensation after the newly staged directory was rolled back.
     const verifyCache = () => checkCodexCache({ homeDir, env, marketplaceName: prepared.marketplaceName, stagedCopy: prepared.unchangedStage, preflight: false });
     const remove = () => { verifyCache(); execute('codex', ['plugin', 'remove', selector, '--json']); };
-    const add = () => {
+    const add = (restoring = false) => {
       if (registered()?.enabled === false) throw disabledUpdate(selector);
       verifyCache();
+      if (restoring) {
+        const catalog = optionalJson(prepared.marketplacePath), rows = catalog?.plugins?.filter(row => row.name === PLUGIN_NAME);
+        if (catalog?.name !== prepared.marketplaceName || rows?.length !== 1 || rows[0].source?.source !== 'local' || rows[0].source?.path !== `./plugins/${PLUGIN_NAME}`) {
+          throw new Error('The current Codex marketplace does not select the verified stage. Codex was not refreshed.');
+        }
+      }
       execute('codex', ['plugin', 'add', selector, '--json']);
     };
-    if (before) restorePrior.push({ app: 'codex', refresh: add });
+    if (before) restorePrior.push({ app: 'codex', refresh: () => add(true) });
     try { add(); } catch (e) {
       if (!before) undoNew.push(() => { if (registered()) remove(); });
       throw e;
@@ -997,16 +1005,20 @@ export function installApplications(prepared, { execute = run, homeDir = os.home
     log('Codex plugin installed or updated.');
   }
   if (prepared.claude) {
-    const marketplaces = readList(execute('claude', ['plugin', 'marketplace', 'list', '--json']), 'marketplaces');
-    const registered = marketplaces.filter(entry => entry.name === CLAUDE_MARKETPLACE);
+    const sources = () => readList(execute('claude', ['plugin', 'marketplace', 'list', '--json']), 'marketplaces').filter(entry => entry.name === CLAUDE_MARKETPLACE);
+    const registered = sources();
     if (registered.length > 1) throw new Error('Claude reports duplicate local bridge marketplaces.');
-    if (registered.length) {
-      let location = registeredPath(registered[0]);
+    const selectsStage = entry => {
+      if (!entry || (object(entry.source) && !['directory', 'local', undefined].includes(entry.source.source))) return false;
+      let location = registeredPath(entry);
       if (!location) {
         const registry = optionalJson(path.join(env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude'), 'plugins', 'known_marketplaces.json'));
         location = registeredPath(registry?.[CLAUDE_MARKETPLACE]);
       }
-      if (!location || !samePath(location, prepared.destination)) {
+      return location && samePath(location, prepared.destination);
+    };
+    if (registered.length) {
+      if (!selectsStage(registered[0])) {
         throw new Error('Claude already has this marketplace name with a different or unverifiable source. Resolve the conflict before installing.');
       }
     } else {
@@ -1027,7 +1039,11 @@ export function installApplications(prepared, { execute = run, homeDir = os.home
     const selector = CLAUDE_SELECTOR;
     const installed = readList(execute('claude', ['plugin', 'list', '--json']), 'plugins').some(ownClaudeEntry);
     const apply = () => execute('claude', ['plugin', installed ? 'update' : 'install', selector, '--scope', 'user', '--json']);
-    if (installed) restorePrior.push({ app: 'claude', refresh: apply });
+    if (installed) restorePrior.push({ app: 'claude', refresh: () => {
+      const current = sources();
+      if (current.length !== 1 || !selectsStage(current[0])) throw new Error('The current Claude marketplace does not select the verified stage. Claude was not refreshed.');
+      apply();
+    } });
     const remove = () => execute('claude', ['plugin', 'uninstall', selector, '--scope', 'user', '--json']);
     try { apply(); } catch (error) {
       if (!installed) undoNew.push(() => { if (readList(execute('claude', ['plugin', 'list', '--json']), 'plugins').some(ownClaudeEntry)) remove(); });
@@ -1073,28 +1089,30 @@ function finishCleanup(prepared, homeDir, log) {
 }
 
 /** After a rollback, name each client whose version is not, or cannot be shown to be, the one it loaded before this run, and its recovery source. */
-function rollbackVersions({ prior, restorePrior, prepared, homeDir, env, execute }) {
-  const notes = restorePrior.map(({ app }) => {
-    const before = prior[app] ?? { version: null };
-    let now = null, off = false;
+function rollbackVersions({ prior, prepared, homeDir, env, execute }) {
+  // Claude can load the shared stage in place even if an early failure never reached its update command.
+  const notes = Object.entries(prior).map(([app, before]) => {
+    let now = null, loaded = null, off = false;
     try {
       if (app === 'codex') {
         const copies = directories(codexCacheDirectory({ homeDir, env, marketplaceName: prepared.marketplaceName }));
-        if (copies.length === 1) now = path.basename(copies[0]);
+        if (copies.length === 1) { loaded = copies[0]; now = path.basename(loaded); }
         off = codexConfig({ homeDir, env }).plugins.get(`${PLUGIN_NAME}@${prepared.marketplaceName}`)?.enabled === false;
       } else {
         const own = readList(execute('claude', ['plugin', 'list', '--json']), 'plugins').filter(ownClaudeEntry);
-        if (own.length === 1 && typeof claudeLoads(own[0]).version === 'string') now = claudeLoads(own[0]).version;
+        if (own.length === 1) { const { folder, version } = claudeLoads(own[0]); loaded = folder; now = typeof version === 'string' ? version : null; }
         off = own.length === 1 && own[0].enabled === false;
       }
     } catch { /* An unreadable state is reported as unverified. */ }
-    if (before.version && now === before.version) return null;
+    const sameStamp = before.version && now === before.version;
+    if (sameStamp && typeof loaded === 'string' && path.isAbsolute(loaded) && sameFiles(treeFiles(loaded), before.files)) return null;
     const name = app === 'codex' ? 'Codex' : 'Claude';
     // The previous files may sit in another verified stage after an incomplete rollback, not only where they were found.
     const kept = before.files && stageHolding(before.files, stageFiles(homeDir))?.holder;
     const recovery = kept ? ` Its previous files remain in ${kept}.`
       : before.version ? ` The installer kept no verified copy of ${before.version}; its recovery source is the ${before.version.split('+')[0]} release package.${/^1\.0\./.test(before.version) ? ' Before running that older installer, copy stage backups aside: it removes them by name, including newer or edited backups.' : ''}` : '';
     const state = off ? `it is turned off with ${now} installed` : `it now loads ${now} at its next start`;
+    if (sameStamp) return `${name}'s rollback is unverified: ${state}, but the files could not be verified against the copy it loaded before this run.${recovery}`;
     if (before.version && now) return `Version rollback did not complete for ${name}: before this run it loaded ${before.version}, and ${state}.${recovery}`;
     return `${name}'s version after rollback is unverified: ${before.version ? `before this run it loaded ${before.version}` : 'its version before this run could not be identified'}, and ${now ? state : 'its current version could not be read'}.${recovery}`;
   }).filter(Boolean);
@@ -1127,19 +1145,23 @@ function installSelected(args, { homeDir, env, execute, log, selection }) {
     for (const undo of undoNew.reverse()) { try { undo(); } catch (e) { failures.push(e); } }
     // Return each client to the files it ran before this run. A retained older stage holding them is served from
     // the installed path while that path is vacant; the other clients refresh from the restored previous stage.
+    const refreshFromStage = ({ app, refresh }) => {
+      if (!prior[app]?.files || !sameFiles(treeFiles(prepared.destination), prior[app].files)) return;
+      try { refresh(); } catch (e) { failures.push(e); }
+    };
     const serveRetained = () => {
       for (const holder of new Set(restorePrior.map(({ app }) => prior[app]?.holder))) {
         const group = restorePrior.filter(({ app }) => prior[app]?.holder === holder);
         if (!holder || holder === prepared.destination || !sameFiles(treeFiles(holder), prior[group[0].app].files)) continue;
         renameDirectoryWithRetry(holder, prepared.destination);
-        for (const restore of group) { pending.delete(restore); try { restore.refresh(); } catch (e) { failures.push(e); } }
+        for (const restore of group) { pending.delete(restore); refreshFromStage(restore); }
         try { renameDirectoryWithRetry(prepared.destination, holder); }
         catch (e) { throw new Error(`The retained stage ${holder} could not return from ${prepared.destination} (${e.message}).`); }
       }
     };
     try { prepared.undo(serveRetained); } catch (e) { failures.push(e); }
-    for (const { refresh } of pending) { try { refresh(); } catch (e) { failures.push(e); } }
-    const versions = rollbackVersions({ prior, restorePrior, prepared, homeDir, env, execute });
+    for (const restore of pending) refreshFromStage(restore);
+    const versions = rollbackVersions({ prior, prepared, homeDir, env, execute });
     if (failures.length) throw new Error(`${error.message} Rollback could not finish. Inspect ${prepared.destination}${prepared.backupDirectory ? ` and its preserved predecessor ${prepared.backupDirectory}` : ''} and the selected registrations before retrying. ${failures.map(e => e.message).join(' ')}${versions}`);
     if (versions) throw new Error(`${error.message}${versions}`);
     throw error;

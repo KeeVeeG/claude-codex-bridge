@@ -56,6 +56,24 @@ test('doctor reports missing configuration without registering a host or creatin
   assert.ok(result.checks.every(check => Object.keys(check).sort().join(',') === 'detail,name,status'));
 });
 
+test('R4O02: a pipe and startup task without per-call metadata or a verified Claude parent cannot identify the caller', windowsOnly, async t => {
+  const f = await claudeFixture(t), env = { CODEX_APP_TOOLS_PIPE_PATH: `\\\\.\\pipe\\fixture-${randomUUID()}`, CODEX_THREAD_ID: 'startup-only', CLAUDE_CODEX_BRIDGE_DAEMON: 'off' };
+  const context = { ...f, env, parentPid: 2147483647 };
+  const report = await executeBridgeTool('bridge_doctor', {}, context), caller = report.checks.find(c => c.name === 'caller');
+  assert.equal(caller.status, 'fail'); assert.match(caller.detail, /Codex task context/); assert.match(report.diagnosis.next_action, /conversation|task/);
+  await assert.rejects(executeBridgeTool('bridge_panel', {}, context), e => e.reason === 'caller_invalid' && /Codex task context/.test(e.message));
+  assert.deepEqual(getCodexHosts({ stateDir: f.stateDir }), []);
+  await assert.rejects(executeBridgeTool('bridge_panel', {}, { ...context, parentPid: process.pid }), { reason: 'wrong_tool' }); // The inherited pipe does not override a verified Claude parent.
+});
+
+test('R4O03: an unsaved missing current pipe is not described as a saved earlier launch', windowsOnly, async t => {
+  const f = await nativeFixture(t), env = { CODEX_APP_TOOLS_PIPE_PATH: `\\\\.\\pipe\\fixture-${randomUUID()}`, CLAUDE_CODEX_BRIDGE_DAEMON: 'off' };
+  const report = await executeBridgeTool('bridge_doctor', {}, { env, stateDir: f.stateDir, registryDir: path.join(f.root, 'absent'), parentPid: 2147483647 });
+  const detail = name => report.checks.find(c => c.name === name).detail;
+  assert.match(detail('codex_registry'), /No Codex Desktop registration/);
+  for (const name of ['codex_context','codex_tools']) { assert.match(detail(name), /1 endpoint is not present/); assert.doesNotMatch(detail(name), /saved|earlier launch/i); }
+});
+
 for (const entrypoint of ['claude-desktop', 'cli', 'sdk-cli']) test(`doctor validates ${entrypoint} endpoints without sending model messages and registers its verified Codex caller`, windowsOnly, async t => {
   const fixture = await claudeFixture(t, undefined, { entrypoint });
   const codex = await mockPipe(t, { framed: true, onMessage(message, socket) {
@@ -350,7 +368,7 @@ test('a stalled Desktop is reported as stalled, not hidden behind endpoints of e
   await earlier.close();
   const context = claudeCaller(fixture);
   await assert.rejects(executeBridgeTool('list_codex_threads', { limit: 5 }, context), error => {
-    assert.match(error.message, /running but did not answer in time\. Retry the same call\. Also observed: [^.]*1 saved endpoint belongs to earlier Codex Desktop launches\./);
+    assert.match(error.message, /running but did not answer in time\. Retry the same call\. Also observed: [^.]*1 endpoint is not present\./);
     assert.doesNotMatch(error.message, /ENOENT|Last error|Open a Codex Desktop task|restart/);
     return true;
   });
@@ -363,7 +381,7 @@ test('a stalled Desktop is reported as stalled, not hidden behind endpoints of e
   assert.match(check('codex_registry').detail, /2 present, 1 missing, 0 unverified/);
   assert.equal(check('codex_tools').status, 'pass');
   assert.equal(check('codex_context').status, 'warning');
-  assert.match(check('codex_context').detail, /did not answer in time; 1 saved endpoint belongs to earlier Codex Desktop launches/);
+  assert.match(check('codex_context').detail, /did not answer in time; 1 endpoint is not present/);
   assert.equal(Object.hasOwn(doctor, 'diagnosis'), false);
   assert.equal(calls(), 6);
 });
@@ -387,7 +405,7 @@ test('only endpoints of earlier launches point to opening Codex Desktop', window
   await earlier.close();
   const context = claudeCaller(fixture);
   await assert.rejects(executeBridgeTool('list_codex_threads', {}, context),
-    /1 saved Codex Desktop endpoint belongs to earlier launches\. Open a Codex Desktop task with the bridge enabled/);
+    /1 Codex Desktop endpoint is not present\. Open a Codex Desktop task with the bridge enabled/);
   const doctor = await executeBridgeTool('bridge_doctor', {}, context);
   assert.deepEqual(doctor.diagnosis, { reason: 'route_unavailable',
     next_action: 'Run bridge_doctor from an open Codex Desktop task with the bridge enabled to register its endpoint.' });

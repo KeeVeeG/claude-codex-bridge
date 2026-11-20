@@ -215,9 +215,28 @@ test('doctor reports dead sender and manual recovery owners without changing loc
   for (const dir of [session.dir, manual]) for (const lock of ['state.lock', 'state.lock.recovery']) assert.equal(fs.readFileSync(path.join(dir, lock), 'utf8'), contents);
 });
 
+test('R4O01: a recovery guard with no order lock does not block an acquisition or prescribe offline migration', async t => {
+  const { owner } = await setup(t), dir = path.join(owner.stateDir, 'order'); fs.mkdirSync(dir, { recursive: true });
+  const guard = path.join(dir, 'state.lock.recovery'), bytes = JSON.stringify({ pid: 2147483647, token: 'stopped-reaper' });
+  fs.writeFileSync(guard, bytes);
+  const doctor = () => executeBridgeTool('bridge_doctor', {}, { stateDir: owner.stateDir, env: { CLAUDE_CODEX_BRIDGE_DAEMON: 'off' },
+    metadata: { 'openai/threadId': owner.threadId }, registryDir: path.join(owner.root, 'absent') });
+  const check = report => { const lock = report.checks.find(c => c.name === 'order_lock');
+    assert.equal(lock?.status, 'pass'); assert.match(lock.detail, /no owner lock/i); assert.doesNotMatch(lock.detail, /quit both|offline recovery/i);
+    assert.notEqual(report.diagnosis?.reason, 'state_unavailable'); assert.equal(fs.readFileSync(guard, 'utf8'), bytes); };
+  check(await doctor());
+  assert.equal(await withStateLockAsync(dir, () => 'acquired'), 'acquired');
+  check(await doctor());
+  fs.writeFileSync(path.join(dir, 'state.lock'), bytes);
+  await assert.rejects(withStateLockAsync(dir, () => assert.fail('no takeover')), { code: 'LOCK_RECOVERY_INTERRUPTED' });
+  const blocked = await doctor(); assert.equal(blocked.checks.find(c => c.name === 'order_lock').status, 'fail');
+  assert.equal(blocked.diagnosis?.reason, 'state_unavailable'); assert.equal(fs.readFileSync(guard, 'utf8'), bytes);
+});
+
 test('TL04: a manual-only recovery lock is observed without diagnosing a primary sender failure', async t => {
   const { owner, session } = await setup(t), manual = path.join(owner.stateDir, 'manual', session.key);
-  fs.mkdirSync(manual, { recursive: true }); fs.writeFileSync(path.join(manual, 'state.lock.recovery'), '{"pid":2147483647}');
+  fs.mkdirSync(manual, { recursive: true });
+  for (const name of ['state.lock', 'state.lock.recovery']) fs.writeFileSync(path.join(manual, name), '{"pid":2147483647}');
   const report = await executeBridgeTool('bridge_doctor', {}, { stateDir: owner.stateDir, env: { CLAUDE_CODEX_BRIDGE_DAEMON: 'off' },
     metadata: { 'openai/threadId': owner.threadId }, registryDir: path.join(owner.root, 'absent') });
   assert.equal(report.checks.find(entry => entry.name === 'manual_lock')?.status, 'fail');

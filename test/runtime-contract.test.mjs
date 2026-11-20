@@ -97,8 +97,30 @@ test('R3D03: a live legacy reservation dated in the future stays in flight until
   assert.equal(saved().status, 'uncertain');
 });
 
+test('R4C05: a legacy reservation aged on the process clock does not resume sending once civil time passes its date', async t => {
+  const f = await nativeFixture(t), session = createSession({ stateDir: f.stateDir, threadId: 'sender', cwd: f.cwd });
+  recordMessage(session, { ...draft, id: 'crossover' });
+  const civil = Date.now(), base = performance.now(); let elapsed = 0;
+  updateSession(session, state => { const row = Object.values(state.messages).find(r => r.id === 'crossover');
+    delete row.startedTick; delete row.attemptId; delete row.orderAt; row.createdAt = civil + 120_000; return row; });
+  t.mock.method(performance, 'now', () => base + elapsed); t.mock.method(Date, 'now', () => civil + elapsed);
+  const saved = () => Object.values(readSession(session).messages).find(r => r.id === 'crossover');
+  const projected = () => getMessages(session, 5).find(r => r.id === 'crossover').status;
+  const prior = () => lookupMessage({ stateDir: f.stateDir, threadId: 'sender' }, { ...draft, id: 'crossover' }).prior.status;
+  assert.equal(projected(), 'sending', 'first sight, civil date 120 s ahead');
+  elapsed = 30_000; assert.equal(projected(), 'sending'); assert.equal(prior(), 'sending');
+  elapsed = 61_000; assert.equal(projected(), 'uncertain', 'aged on the process clock before the crossover'); assert.equal(prior(), 'uncertain');
+  elapsed = 121_000; assert.equal(Date.now() - saved().createdAt, 1000, 'civil time is now past the reservation date');
+  assert.equal(projected(), 'uncertain', 'the read-only projection does not step back to sending');
+  assert.equal(prior(), 'uncertain');
+  assert.equal(saved().status, 'sending', 'projection alone persists nothing');
+  assert.equal(recordMessage(session, { ...draft, id: 'crossover', reconcileOnly: true }).message.status, 'uncertain');
+  assert.equal(saved().status, 'uncertain', 'the durable reconcile settles it');
+});
+
 test('ST06: the lock inspector reports a reused guard PID, distinguishes an inconclusive check, and never unlinks', { skip: process.platform !== 'win32' }, async t => {
   const f = await nativeFixture(t), file = path.join(f.root, 'state.lock.recovery');
+  fs.writeFileSync(path.join(f.root, 'state.lock'), JSON.stringify({ pid: 2147483647 })); // This owner needs takeover.
   const bytes = JSON.stringify({ pid: process.pid, procStartFt: '133700000000000123' }); fs.writeFileSync(file, bytes);
   assert.equal((await inspectStateLocks(f.root, { probe: async () => '133700000000000456' })).status, 'fail');
   assert.equal((await inspectStateLocks(f.root, { probe: async () => null })).status, 'warning');

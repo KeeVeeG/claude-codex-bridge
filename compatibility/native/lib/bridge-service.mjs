@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { verifiedClaudeSessions, resolveClaudeSession, resolveClaudeCaller, sendToClaude } from './claude-sessions.mjs';
-import { beforeWrite, WRITE_RESERVE_MS, ensureCall, inquire, INQUIRY_ATTEMPT_MS, isCancelledError, monotonicNow, remainingMs, startCall, throwIfStopped, waitForSettlement } from './call-time.mjs';
+import { beforeWrite, WRITE_RESERVE_MS, ensureCall, inquire, INQUIRY_ATTEMPT_MS, isCancelledError, monotonicNow, remainingMs, startCall, stopError, throwIfStopped, waitForSettlement } from './call-time.mjs';
 import { manualSend, retryManualNotice } from './manual-service.mjs';
 import { listClaudeConversations } from './claude-history.mjs';
 import { getBridgeConversation, historyWarnings } from './bridge-history.mjs';
@@ -18,7 +18,7 @@ import { canonicalLocalSocket, localSocketPresence } from './local-socket.mjs';
 import { defaultStateDir, ledgerAt, ownerId } from './store.mjs';
 import { createSession, lookupMessage, recordMessage, finishMessage, listMessages, retainSettlement, checkSettlementCapacity, repairSettlement } from './call-store.mjs';
 import { openDaemon, listTerminalThreads, readDaemonVersions, readTerminalThread, readTerminalPlan, writeTerminalPlan, normalizeCodexThreadId,
-  queueToTerminalThread, queueRefusal, queueTargetRefusal, TerminalNotLoadedError, DaemonUnavailableError, NOT_RUNNING_MESSAGE } from './codex-daemon.mjs';
+  queueToTerminalThread, queueRefusal, queueTargetRefusal, TerminalNotLoadedError, DaemonUnavailableError, NOT_RUNNING_MESSAGE, ABNORMAL_CLOSE } from './codex-daemon.mjs';
 import { codexPeerContent, collaboratorNotice, quoted } from './codex-peer.mjs';
 import { validateSshHostAlias } from './codex-ssh.mjs';
 
@@ -158,6 +158,9 @@ export function hasCodexCallerMetadata(meta) {
     'codex/threadId', 'codexThreadId', 'codex_thread_id', 'threadId', 'thread_id', 'thread'].some(key => Object.hasOwn(meta, key));
 }
 
+// An inherited pipe or startup thread ID is a diagnostic hint only. Neither identifies the conversation.
+const missingCodexContext = 'No per-call Codex task context or verified Claude Code parent identifies this call. Open the bridge in the intended conversation and run the tool there.';
+const codexHint = env => !env.CLAUDE_CODE_MESSAGING_SOCKET && Boolean(env.CODEX_APP_TOOLS_PIPE_PATH || env.CODEX_THREAD_ID);
 async function identifyCaller(context, config) {
   const meta = context.metadata || {};
   const hasCodexMetadata = hasCodexCallerMetadata(meta);
@@ -172,7 +175,12 @@ async function identifyCaller(context, config) {
     return { kind: 'codex', transport: 'terminal', threadId };
   }
   const endpoint = await resolveClaudeCaller({ registryDir: config.registryDir, parentPid: context.parentPid ?? process.ppid,
-    socketPath: config.env.CLAUDE_CODE_MESSAGING_SOCKET, signal: context.signal, probe: context.processProbe });
+    socketPath: config.env.CLAUDE_CODE_MESSAGING_SOCKET, signal: context.signal, probe: context.processProbe }).catch(error => {
+    if (codexHint(config.env) && !hasCodexMetadata && ['caller_invalid', 'caller_unverified', 'identity_check_unavailable', 'state_unavailable'].includes(error.reason)) {
+      throw failure(missingCodexContext, error.reason, { missingTaskContext: true });
+    }
+    throw error;
+  });
   // A call admitted for one conversation never runs as another after the window switched (A201).
   if (context.callerSessionId === null) throw failure('Could not identify this Claude Code conversation when the request arrived. Retry the same call from the intended conversation.', 'caller_unverified');
   if (context.callerSessionId !== undefined && endpoint.sessionId !== context.callerSessionId) {
@@ -337,8 +345,8 @@ function desktopFailure(report, { factsOnly = false } = {}) {
     [report.errors?.includes('access_denied'), 'Access to a registered Desktop endpoint was denied. Check authorization before sending.', 'access to a registered endpoint was denied'],
     [failedRequests, 'Codex Desktop failed the discovery request. Restart Codex Desktop, then retry the same call.',
       `${plural(failedRequests, 'discovery request')} failed`],
-    [report.gone, `${plural(report.gone, 'saved Codex Desktop endpoint')} belong${report.gone === 1 ? 's' : ''} to earlier launches. Open a Codex Desktop task with the bridge enabled; its bridge server registers the current endpoint when it starts.`,
-      `${plural(report.gone, 'saved endpoint')} belong${report.gone === 1 ? 's' : ''} to earlier Codex Desktop launches`],
+    [report.gone, `${plural(report.gone, 'Codex Desktop endpoint')} ${report.gone === 1 ? 'is' : 'are'} not present. Open a Codex Desktop task with the bridge enabled; its bridge server registers the current endpoint when it starts.`,
+      `${plural(report.gone, 'endpoint')} ${report.gone === 1 ? 'is' : 'are'} not present`],
   ].filter(([count]) => count);
   if (factsOnly) return causes.length ? `Codex Desktop: ${causes.map(cause => cause[2]).join('; ')}.`
     : 'No saved Codex Desktop endpoint has a usable task context.';
@@ -608,21 +616,22 @@ async function bridgeDoctor(context, config) {
   } catch (error) {
     throwIfStopped(signal);
     if (error.reason === 'caller_unverified' || error.code === 'BRIDGE_DEADLINE') {
-      application = 'claude';
+      const ambiguous = codexHint(config.env) && !hasCodexCallerMetadata(context.metadata);
+      if (!ambiguous) application = 'claude';
       callerProbeError = error.reason === 'caller_unverified' ? error
-        : failure('Could not verify this Claude Code conversation within the diagnostic time budget. Retry the same call.', 'caller_unverified');
+        : failure(ambiguous ? missingCodexContext : 'Could not verify this Claude Code conversation within the diagnostic time budget. Retry the same call.', 'caller_unverified');
       add('caller', 'warning', callerProbeError.message, 'caller_unverified');
       callerDiagnosis = { reason: 'caller_unverified', next_action: 'Run bridge_doctor again from the same conversation when it responds.' };
     } else {
       if (error.application) application = error.application;
-      const specific = ['caller_invalid', 'caller_changed', 'identity_check_unavailable'].includes(error.reason);
+      const specific = error.missingTaskContext || ['caller_invalid', 'caller_changed', 'identity_check_unavailable'].includes(error.reason);
       add('caller', 'fail', specific ? error.message : application === 'unknown'
         ? 'No caller identity is available. Run this tool from the intended Claude Code or Codex conversation.'
         : application === 'codex'
         ? 'This call has no valid Codex task context. Run the tool from an open Codex task with the bridge enabled.'
         : 'The direct Claude parent session could not be verified. Open the bridge in the intended Claude Code session.',
       REASONS[error.reason] ? error.reason : 'caller_invalid');
-      const next_action = {
+      const next_action = error.missingTaskContext ? 'Run bridge_doctor from the intended open conversation with the bridge enabled.' : {
         caller_invalid: 'Run bridge_doctor from the intended open conversation with the bridge enabled.',
         caller_changed: 'Run bridge_doctor from the conversation you intended to use.',
         identity_check_unavailable: 'Check that the bridge can read the Claude Code process identity on this system.',
@@ -726,8 +735,10 @@ async function sendMessage(name, args, context, config, who) {
 /** Repeat only the final read-only routing proof. Keep its connection for a single dispatch outside
  * the inquiry, leaving the write reserve intact. A timeout never authorizes the queue. */
 async function terminalPlan(held, config, threadId, signal) {
-  beforeWrite(signal);
-  let timedOut = false;
+  beforeWrite(signal); // Pre-proof gate: too little time to prove and write is the call's deadline.
+  // A timed-out read or an abnormally lost proxy leaves the route unexplained: what follows it is never queued.
+  let fenced = false, reconnecting = false;
+  const unverified = () => failure('The Codex daemon could not verify the final route. Retry the same call.', 'route_unverified');
   try {
     return await inquire(async attempt => {
       const kept = attempt.attempt === 1 ? held.connection : null;
@@ -744,15 +755,23 @@ async function terminalPlan(held, config, threadId, signal) {
         const plan = await read(kept); held.connection = kept; return plan;
       } catch (error) {
         kept?.close();
-        if (error.code === 'DAEMON_TIMEOUT' || (kept && error instanceof DaemonUnavailableError)) error.transient = true;
+        // The kept proxy that went away before answering gets one fresh read (O02, R4C03). A denial or an
+        // invalid reply is never transient, and a fresh proxy's own loss is final.
+        if (error.code === 'DAEMON_TIMEOUT' || (kept && (error instanceof DaemonUnavailableError || error.lostBeforeAnswer))) error.transient = true;
         throw error;
       }
     }, { signal, attemptMs: Math.min(INQUIRY_ATTEMPT_MS, config.daemon?.timeoutMs ?? Infinity), until: monotonicNow() + remainingMs(signal) - WRITE_RESERVE_MS,
-      onTransient: error => { timedOut ||= ['ATTEMPT_TIMEOUT', 'DAEMON_TIMEOUT'].includes(error.code); } });
+      onTransient: error => {
+        if (reconnecting) throw unverified(); // A timeout on the one fresh proof must not open a third proxy.
+        reconnecting = error.code === ABNORMAL_CLOSE;
+        fenced ||= reconnecting || ['ATTEMPT_TIMEOUT', 'DAEMON_TIMEOUT'].includes(error.code);
+      } });
   } catch (error) {
-    throwIfStopped(signal);
-    if (error.inconclusive || (timedOut && (error instanceof DaemonUnavailableError || error instanceof TerminalNotLoadedError))) {
-      throw failure('The Codex daemon did not verify the final route in time. Retry the same call.', 'route_unverified');
+    // Explicit cancellation stays cancellation; the call's budget ending during the proof leaves it unverified (R4C04, as R3S01).
+    if (signal?.aborted && signal.reason?.code !== 'BRIDGE_DEADLINE') throw stopError(signal);
+    if (error.reason !== 'access_denied' && (remainingMs(signal) <= 0 || signal?.aborted || error.inconclusive ||
+        (fenced && (error instanceof DaemonUnavailableError || error instanceof TerminalNotLoadedError)))) {
+      throw unverified();
     }
     throw error;
   }

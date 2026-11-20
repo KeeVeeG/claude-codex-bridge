@@ -74,21 +74,32 @@ export async function inspectStateLocks(directory, { signal, probe = pid => asyn
   try {
     const stat = fs.lstatSync(directory);
     if (!stat.isDirectory() || stat.isSymbolicLink()) return { status: 'fail', detail: 'The lock location cannot be verified. Check the configured state directory.' };
-    for (const [name, recovery] of [['state.lock.recovery', true], ['state.lock', false]]) {
-      let owner;
-      try { owner = readOwner(path.join(directory, name)); } catch (e) {
-        if (e.code === 'ENOENT') continue;
-        return { status: 'fail', detail: `The lock owner cannot be verified. If another bridge is just starting, check again after it finishes. If the condition persists: ${offline}` };
-      }
-      if (!recovery) continue;
-      let unverified = false;
-      const step = alive(owner, { start: async pid => {
-        const actual = await probe(pid); unverified = !actual; return actual;
-      } });
-      let state = step.next(); while (!state.done) state = step.next(await state.value);
-      if (!state.value) return { status: 'fail', detail: `Recovery was interrupted and its owner no longer runs. ${offline}` };
-      if (unverified) return { status: 'warning', detail: 'Could not verify the recovery owner. Leave the locks alone and check again after the current operation finishes.' };
+    const ownerPath = path.join(directory, 'state.lock'), guardPath = path.join(directory, 'state.lock.recovery');
+    const unknown = { status: 'fail', detail: `The lock owner cannot be verified. If another bridge is just starting, check again after it finishes. If the condition persists: ${offline}` };
+    const vacant = { status: 'pass', detail: 'A recovery marker remains, but no owner lock is present. The marker does not block a new acquisition while the owner lock is absent. Leave it in place.' };
+    let owner;
+    try { owner = readOwner(ownerPath); } catch (e) {
+      if (e.code !== 'ENOENT') return unknown;
+      fs.lstatSync(guardPath); // ENOENT: neither file exists. A free lock is acquired without inspecting the marker.
+      return vacant;
     }
+    fs.lstatSync(guardPath); // A complete owner lock without a marker is normal.
+    const prove = async value => {
+      let inconclusive = false;
+      const step = alive(value, { start: async pid => { const actual = await probe(pid); inconclusive = !actual; return actual; } });
+      let state = step.next(); while (!state.done) state = step.next(await state.value);
+      return inconclusive ? null : state.value;
+    };
+    const running = await prove(owner);
+    if (running) return; // A live owner releases its own lock; the recovery marker matters only for takeover.
+    if (running === null) return { status: 'warning', detail: 'Could not verify the lock owner. Leave the locks alone and check again after the current operation finishes.' };
+    let guard;
+    try { guard = readOwner(guardPath); } catch (e) { if (e.code === 'ENOENT') return; return unknown; }
+    const recovering = await prove(guard);
+    // A process check can yield: do not prescribe offline recovery for a lock already released or replaced.
+    try { if (JSON.stringify(readOwner(ownerPath)) !== JSON.stringify(owner)) return; } catch (e) { if (e.code === 'ENOENT') return vacant; return unknown; }
+    if (recovering === false) return { status: 'fail', detail: `Recovery was interrupted and its owner no longer runs. ${offline}` };
+    if (recovering === null) return { status: 'warning', detail: 'Could not verify the recovery owner. Leave the locks alone and check again after the current operation finishes.' };
   } catch (e) { if (e.code !== 'ENOENT') return { status: 'fail', detail: 'The bridge could not inspect the lock location. Check access to the shared state.' }; }
 }
 

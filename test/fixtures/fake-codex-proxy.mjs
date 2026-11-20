@@ -116,6 +116,17 @@ process.stdin.on('data', chunk => {
       process.exit(0);
     }
     if (scenario.silent === request.method) { log({ method: request.method, params: request.params }); continue; }
+    if (scenario.crash?.method === request.method) {
+      // The proxy ends abnormally before answering the nth request of this method, counted across connections.
+      const previous = fs.readFileSync(scenario.logFile, 'utf8').trim().split('\n').filter(line => JSON.parse(line).method === request.method).length;
+      if (scenario.crash.at.includes(previous + 1)) {
+        log({ method: request.method, params: request.params });
+        leaving = true;
+        const output = scenario.crash.invalidReply ? serverFrame('{not JSON') : Buffer.from(scenario.crash.closeFrame ?? []);
+        process.stdout.write(output, () => process.exit(scenario.crash.exitCode ?? 0));
+        return;
+      }
+    }
     answer(request);
     if (scenario.exitAfterFirst === request.method) {
       // The proxy goes away right after its first answer to this method, for example after routing.

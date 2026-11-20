@@ -248,6 +248,10 @@ function clientFixture(t) {
   // Both clients run an older build: an installer stage whose files differ from this source, as a released version's do.
   const installOlder = async () => {
     await main(['--prepare-only'], options);
+    const original = staged(), older = '1.0.6+codex.20000101000000000';
+    for (const name of ['package.json', 'config/plugin-source.json', '.claude-plugin/plugin.json', '.codex-plugin/plugin.json']) {
+      const file = path.join(f.stage, name); write(file, read(file).replaceAll(original, older));
+    }
     fs.appendFileSync(path.join(f.stage, 'scripts', 'mcp.mjs'), '\n// older build\n');
     execute('codex', ['plugin', 'add', id, '--json']); execute('claude', ['plugin', 'install', selector, '--scope', 'user', '--json']);
     return staged();
@@ -289,19 +293,20 @@ for (const [label, args] of [['changed during the run', []], ['removed before a 
     const f = clientFixture(t), older = await f.installOlder();
     await main(['--prepare-only'], f.options);
     const prepared = f.staged(), backup = f.retained(older);
+    let updated;
     if (args.length) fs.rmSync(backup, { recursive: true });
-    else f.c.onRefuse = () => fs.appendFileSync(path.join(backup, 'scripts', 'mcp.mjs'), '// edited\n');
+    f.c.onRefuse = () => { updated = f.staged(); if (!args.length) fs.appendFileSync(path.join(backup, 'scripts', 'mcp.mjs'), '// edited\n'); };
     f.c.refuse = true;
     const error = await main(args, f.options).then(() => assert.fail('the run must fail'), e => e);
     assert.match(error.message, /already matches the outbound bridge tool/); assert.doesNotMatch(error.message, /Rollback could not finish/);
     const changed = args.length ? ['Claude'] : ['Codex', 'Claude'];
-    if (/^1\.0\./.test(older)) assert.match(error.message, /copy stage backups aside.*removes them by name.*newer or edited/i);
+    assert.match(error.message, /copy stage backups aside.*removes them by name.*newer or edited/i);
     for (const app of ['Codex', 'Claude']) {
-      const note = new RegExp(`Version rollback did not complete for ${app}: before this run it loaded ${literal(older)}, and it now loads ${literal(prepared)} at its next start\\. The installer kept no verified copy of ${literal(older)}; its recovery source is the \\d+\\.\\d+\\.\\d+ release package\\.`);
+      const note = new RegExp(`Version rollback did not complete for ${app}: before this run it loaded ${literal(older)}, and it now loads ${literal(updated)} at its next start\\. The installer kept no verified copy of ${literal(older)}; its recovery source is the \\d+\\.\\d+\\.\\d+ release package\\.`);
       if (changed.includes(app)) assert.match(error.message, note); else assert.doesNotMatch(error.message, new RegExp(`for ${app}:|${app}'s version`));
     }
-    assert.equal(f.c.claude.version, prepared); assert.equal(f.staged(), prepared);
-    assert.deepEqual(f.codexRuns(), [args.length ? older : prepared]);
+    assert.equal(f.c.claude.version, updated); assert.equal(f.staged(), prepared);
+    assert.deepEqual(f.codexRuns(), [args.length ? older : updated]);
   });
 }
 
@@ -316,18 +321,77 @@ test('R3I01: Claude loading the stage in place keeps the stage it loaded, and Co
   assert.equal(f.c.claude.version, prepared, 'Claude is refreshed from the stage it loads, not from its older cached copy');
 });
 
-test('R3I01: a rollback that cannot return a retained build to its folder names both paths, and the next run refuses until they are restored', async t => {
+test('R4C01/R4C02: failed return of a retained build never refreshes Claude from it; the printed moves unblock the next update', async t => {
   const f = clientFixture(t), older = await f.installOlder();
-  await main(['--prepare-only'], f.options);
+  await main(['--claude'], f.options);
   const prepared = f.staged(), backup = f.retained(older);
-  f.c.refuse = true;
+  f.c.refuse = true; let updated; f.c.onRefuse = () => { updated = f.staged(); };
   hook(t, 'renameSync', original => (from, to) => { if (from === f.stage && to === backup) throw new Error('rename denied'); return original(from, to); });
-  const error = await main([], f.options).then(() => assert.fail('the run must fail'), e => e);
-  assert.match(error.message, /Rollback could not finish.*could not return.*rename denied.*This run's stage remains in .* and the previous stage in /s);
-  assert.equal(f.staged(), older, 'the retained build still occupies the installed path');
-  const predecessor = fs.readdirSync(path.dirname(f.stage)).map(name => path.join(path.dirname(f.stage), name)).find(dir => dir !== f.stage && fs.existsSync(path.join(dir, 'package.json')) && JSON.parse(read(path.join(dir, 'package.json'))).version === prepared);
-  await assert.rejects(main(['--prepare-only'], f.options), new RegExp(`stopped during its rollback: the stage installed before it remains in ${literal(predecessor)}.*move ${literal(predecessor)} back to ${literal(f.stage)}`));
-  assert.equal(f.staged(), older);
+  const failure = () => main([], f.options).then(() => assert.fail('the run must fail'), e => e.message);
+  const error = await failure();
+  assert.match(error, /Rollback could not finish.*could not return.*rename denied.*This run's stage remains in .* and the previous stage in /s);
+  assert.equal(f.staged(), older); assert.deepEqual(f.codexRuns(), [older]);
+  assert.equal(f.c.claude.version, updated, 'do not refresh Claude from the wrong build left in place');
+  const predecessor = f.retained(prepared);
+  assert.match(error, new RegExp(`for Claude: before this run it loaded ${literal(prepared)}.*it now loads ${literal(updated)}.*previous files remain in ${literal(predecessor)}`));
+  assert.doesNotMatch(error, /for Codex:/);
+  fs.unlinkSync(path.join(f.homeDir, '.claude', 'settings.json')); // Resolve the original permission conflict.
+  const stopped = await failure(), moves = /Move (.*?) to (.*?), where this installer recognizes it as a retained stage, then move (.*?) back to (.*?) and retry\./.exec(stopped);
+  assert.ok(moves, stopped); assert.equal(moves[1], f.stage); assert.equal(moves[3], predecessor); assert.equal(moves[4], f.stage);
+  fs.renameSync(moves[1], moves[2]); fs.renameSync(moves[3], moves[4]);
+  await main([], f.options); assert.deepEqual(f.codexRuns(), [f.staged()]); assert.equal(f.c.claude.version, f.staged());
+});
+
+test('R4C01: an ordinary predecessor edited under the same stamp is preserved and is never fed to either client', async t => {
+  const f = clientFixture(t); f.c.inPlace = true;
+  const older = await f.installOlder(); let updated;
+  f.c.refuse = true; f.c.onRefuse = () => { updated = f.staged(); fs.appendFileSync(path.join(f.retained(older), 'scripts/mcp.mjs'), '// late edit\n'); };
+  const error = await main([], f.options).then(() => assert.fail('the run must fail'), e => e.message);
+  assert.equal(f.staged(), older); assert.match(read(path.join(f.stage, 'scripts/mcp.mjs')), /late edit/);
+  assert.match(error, new RegExp(`for Codex: before this run it loaded ${literal(older)}.*now loads ${literal(updated)}.*1\\.0\\.6 release package`));
+  assert.match(error, new RegExp(`Claude's rollback is unverified: it now loads ${literal(older)}.*files could not be verified.*1\\.0\\.6 release package`));
+  assert.deepEqual(f.codexRuns(), [updated]); assert.equal(f.c.claude.version, updated);
+});
+
+test('R4C01: an externally redirected Codex catalog is preserved but cannot refresh a client during rollback', async t => {
+  const f = clientFixture(t), older = await f.installOlder(); let updated, addsAfterRedirect = 0;
+  const source = './plugins/other-stage';
+  const options = { ...f.options, execute(app, args) {
+    if (app === 'codex' && args[1] === 'add' && JSON.parse(read(f.catalog)).plugins.find(row => row.name === PLUGIN_NAME)?.source.path === source) addsAfterRedirect++;
+    return f.options.execute(app, args);
+  } };
+  f.c.refuse = true; f.c.onRefuse = () => { updated = f.staged(); const value = JSON.parse(read(f.catalog));
+    value.plugins.find(row => row.name === PLUGIN_NAME).source.path = source; write(f.catalog, JSON.stringify(value)); };
+  const msg = await main([], options).then(() => assert.fail('the run must fail'), e => e.message);
+  assert.equal(addsAfterRedirect, 0); assert.equal(JSON.parse(read(f.catalog)).plugins.find(row => row.name === PLUGIN_NAME).source.path, source);
+  assert.deepEqual(f.codexRuns(), [updated]); assert.equal(f.c.claude.version, older);
+  assert.match(msg, new RegExp(`for Codex: before this run it loaded ${literal(older)}.*now loads ${literal(updated)}`));
+});
+
+test('R4C01: a redirected Claude marketplace cannot refresh from a different source during rollback', async t => {
+  const f = clientFixture(t), older = await f.installOlder(); let updated, refreshes = 0;
+  const options = { ...f.options, execute(app, args) {
+    if (updated && app === 'claude') {
+      if (args[1] === 'marketplace' && args[2] === 'list') return JSON.stringify([{ name: 'claude-codex-local', source: { source: 'directory', path: path.join(f.homeDir, 'other-source') } }]);
+      if (args[1] === 'update') refreshes++;
+    }
+    return f.options.execute(app, args);
+  } };
+  f.c.refuse = true; f.c.onRefuse = () => { updated = f.staged(); };
+  const msg = await main([], options).then(() => assert.fail('the run must fail'), e => e.message);
+  assert.equal(refreshes, 0); assert.deepEqual(f.codexRuns(), [older]); assert.equal(f.c.claude.version, updated);
+  assert.match(msg, /current Claude marketplace does not select the verified stage/);
+});
+
+test('R4C01: a failed early Codex add reports the in-place Claude build even before its CLI update starts', async t => {
+  const f = clientFixture(t); f.c.inPlace = true; const older = await f.installOlder();
+  const options = { ...f.options, execute(app, args) {
+    if (app === 'codex' && args[1] === 'add') { fs.appendFileSync(path.join(f.stage, 'scripts/mcp.mjs'), '// preserved edit\n'); throw new Error('codex add failed'); }
+    return f.options.execute(app, args);
+  } };
+  const msg = await main([], options).then(() => assert.fail('the run must fail'), e => e.message);
+  assert.deepEqual(f.codexRuns(), [older]); assert.notEqual(f.staged(), older); assert.match(read(path.join(f.stage, 'scripts/mcp.mjs')), /preserved edit/);
+  assert.match(msg, new RegExp(`for Claude: before this run it loaded ${literal(older)}.*now loads ${literal(f.staged())}.*previous files remain in ${literal(f.retained(older))}`));
 });
 
 test('R3I02: an installer lock on a volume without hard links names its folder and the volume requirement, not state recovery', async t => {

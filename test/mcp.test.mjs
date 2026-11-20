@@ -770,7 +770,7 @@ for (const entrypoint of ['cli', 'sdk-cli']) test(`Claude and Codex ${entrypoint
   assert.doesNotMatch(visible, new RegExp(setup.token));
 });
 
-test('R3C01: unchanged launcher exposes the fixed fallback-title warning but no archived identity in either public channel', windowsOnly, async t => {
+test('R3C01/R4C09: unchanged launcher exposes the fixed fallback-title warning but no archived identity or private warning in either public channel', windowsOnly, async t => {
   const s = await setupMcp(t), id = randomUUID(), project = path.join(s.env.CLAUDE_CONFIG_DIR, 'projects', 'fixture');
   fs.mkdirSync(path.join(project, id), { recursive: true });
   fs.writeFileSync(path.join(project, `${id}.jsonl`), JSON.stringify({ sessionId: id, type: 'custom-title', customTitle: 'Archived fixture', cwd: 'private-folder' }) + '\n');
@@ -784,9 +784,12 @@ test('R3C01: unchanged launcher exposes the fixed fallback-title warning but no 
   }
   for (let i = 0; i < 256; ++i) fs.mkdirSync(path.join(project, '..', `fixture-${i}`));
   const limited = await callTool(s.client, 'bridge_panel', {}, metadata('fixture-owner'));
+  const scan = 'The catalog scan is incomplete. Continue discovery to search more archived Claude conversations.';
   assert.ok(limited.result._meta['bridge-claude-codex/catalog'].next_cursor);
+  assert.ok(limited.result._meta['bridge-claude-codex/catalog'].warnings.includes(scan), 'the private continuation warning exists');
   for (const visible of [toolValue(limited), limited.result.structuredContent]) {
     assert.ok(visible.warnings.includes('Some Claude metadata was omitted because the scan limit was reached.'));
+    assert.ok(!visible.warnings.includes(scan), 'the allowlist withholds a private warning from both public channels');
     assert.equal(visible.next_cursor, undefined);
   }
 });

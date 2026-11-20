@@ -17,13 +17,18 @@ Run the gates in a fresh, clean checkout of the candidate so the tested tree and
 ```powershell
 $version = 'X.Y.Z' # Replace with the version being released.
 $tag = "v$version"
-git fetch origin
-$candidate = git rev-parse origin/dev
+git fetch --no-tags origin refs/heads/dev
+if ($LASTEXITCODE -ne 0) { throw 'Could not fetch dev from origin' }
+$candidate = git rev-parse --verify 'FETCH_HEAD^{commit}'
+if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the candidate' }
 $checkout = "../bridge-release-$version"
 git worktree add --detach $checkout $candidate
 if ($LASTEXITCODE -ne 0) { throw 'Could not check out the candidate commit' }
-Set-Location $checkout
-if ((git status --porcelain) -or (git rev-parse HEAD) -ne $candidate) { throw 'Use a clean checkout of the candidate commit' }
+Set-Location -LiteralPath $checkout -ErrorAction Stop
+$changes = git status --porcelain
+if ($LASTEXITCODE -ne 0 -or $changes) { throw 'Could not verify a clean checkout' }
+$head = git rev-parse --verify HEAD
+if ($LASTEXITCODE -ne 0 -or $head -ne $candidate) { throw 'Could not verify the candidate checkout' }
 if ((node -p "require('./package.json').version") -ne $version) { throw 'Candidate and release version differ' }
 npm run manifests:check
 if ($LASTEXITCODE -ne 0) { throw 'Manifest check failed' }
@@ -55,14 +60,24 @@ The archives include runtime code, documentation, and the MIT license. They excl
 Only after every gate passes, move `main` to the candidate, then tag it. If `main` cannot fast-forward to the candidate, stop: a merge commit is a commit the gates did not test. An existing tag is never reused: if `$tag` exists locally or on `origin`, stop and inspect it.
 
 ```powershell
-if ((git tag --list $tag) -or (git ls-remote --tags origin "refs/tags/$tag")) { throw "Tag $tag already exists: inspect it before publishing" }
+$localTag = git tag --list $tag
+if ($LASTEXITCODE -ne 0) { throw 'Could not inspect local tags' }
+if ($localTag) { throw "Tag $tag exists locally: inspect it before publishing" }
+git ls-remote --exit-code --refs --tags origin "refs/tags/$tag"
+switch ($LASTEXITCODE) {
+  0 { throw "Tag $tag exists on origin: inspect it before publishing" }
+  2 { } # Successful query, no matching ref.
+  default { throw 'Could not inspect tags on origin' }
+}
 git push origin "$($candidate):refs/heads/main"
 if ($LASTEXITCODE -ne 0) { throw 'main did not fast-forward to the candidate' }
 git tag -a $tag $candidate -m $tag
 if ($LASTEXITCODE -ne 0) { throw 'Could not create the tag' }
 git push origin "refs/tags/$tag"
 if ($LASTEXITCODE -ne 0) { throw 'Could not push the tag' }
-if (((git ls-remote origin "refs/tags/$tag^{}") -split "`t")[0] -ne $candidate) { throw 'The remote tag does not point to the candidate' }
+$remoteTag = git ls-remote --exit-code origin "refs/tags/$tag^{}"
+if ($LASTEXITCODE -ne 0) { throw 'Could not verify the published tag on origin' }
+if (($remoteTag -split "`t")[0] -ne $candidate) { throw 'The remote tag does not point to the candidate' }
 ```
 
 From the same verified checkout, upload the three ZIPs and checksum file from the build the gates checked. Use the reviewed release notes, not an automatically generated account of the commit history.

@@ -43,6 +43,8 @@ export class DaemonUnavailableError extends Error {
 }
 
 export const NOT_RUNNING_MESSAGE = 'No Codex daemon is running; `codex app-server daemon start` starts one. The bridge never starts it.';
+/** An open proxy exited abnormally, or the server indicated an internal error, restart or temporary outage. */
+export const ABNORMAL_CLOSE = 'DAEMON_ABNORMAL_CLOSE';
 const CMD_SHIM_MESSAGE ='CLAUDE_CODEX_BRIDGE_CODEX_BIN must point to a native Codex .exe, not a script or another file.';
 // Node cannot spawn a .cmd/.bat shim without a shell, and this module never uses one.
 const isDirectExecutable = executable => /\.exe$/i.test(executable);
@@ -162,9 +164,14 @@ export function openDaemon({ env = process.env, command, args, signal, timeoutMs
 
     function handle(text) {
       let message;
-      try { message = JSON.parse(text); } catch { return; }
+      try { message = JSON.parse(text); } catch {
+        fail(failure('Codex daemon returned invalid JSON.', 'protocol_incompatible')); return;
+      }
       // A peer request can reuse a pending ID but can never acknowledge it.
-      if (!object(message) || Object.hasOwn(message, 'method')) return;
+      if (!object(message) || (!Object.hasOwn(message, 'method') && !Object.hasOwn(message, 'id'))) {
+        fail(failure('Codex daemon returned a malformed response.', 'protocol_incompatible')); return;
+      }
+      if (Object.hasOwn(message, 'method')) return;
       const entry = waiting.get(message.id);
       if (!entry) return;
       const kind = rpcReplyKind(message);
@@ -207,7 +214,7 @@ export function openDaemon({ env = process.env, command, args, signal, timeoutMs
     child.stderr.on('error', () => fail(new Error('The Codex daemon connection failed.')));
     child.on('close', code => {
       if (/permission denied|access is denied|os error (?:5|13)\b/i.test(stderr)) { fail(denied()); return; }
-      if (opened) { fail(code === 0 ? new DaemonUnavailableError('The Codex daemon proxy disconnected.') : failure('The Codex daemon connection closed unexpectedly.', 'route_unavailable')); return; }
+      if (opened) { fail(code === 0 ? new DaemonUnavailableError('The Codex daemon proxy disconnected.') : failure('The Codex daemon connection closed unexpectedly.', 'route_unavailable', { code: ABNORMAL_CLOSE })); return; }
       // Only a missing or refusing socket proves that no daemon listens; other causes need other repairs.
       // The diagnostic itself never leaves this process: it can name private paths.
       const detail = /SUN_LEN|socket path (?:is )?too long/i.test(stderr)
@@ -226,7 +233,7 @@ export function openDaemon({ env = process.env, command, args, signal, timeoutMs
         if (event.type === 'open') afterUpgrade();
         else if (event.type === 'text') handle(event.text);
         else if (event.type === 'ping') { try { write(encodePong(event.payload)); } catch { /* closing */ } }
-        else if (event.type === 'close') fail(event.code === 1008 ? denied() : [undefined, 1000, 1001].includes(event.code) ? new DaemonUnavailableError('The Codex daemon closed the connection.') : failure('The Codex daemon connection closed without confirming a normal disconnect.', 'route_unavailable'));
+        else if (event.type === 'close') fail(event.code === 1008 ? denied() : [undefined, 1000, 1001].includes(event.code) ? new DaemonUnavailableError('The Codex daemon closed the connection.') : failure('The Codex daemon connection closed without confirming a normal disconnect.', 'route_unavailable', [1011, 1012, 1013].includes(event.code) ? { code: ABNORMAL_CLOSE } : undefined));
       }
       if (invalid) fail(invalid);
     });
@@ -356,7 +363,10 @@ export class TerminalNotLoadedError extends Error {
 
 export async function readTerminalPlan(connection, { threadId, signal, timeoutMs }) {
   threadId = normalizeCodexThreadId(threadId);
-  const thread = await readTerminalThread(connection, threadId, { signal, timeoutMs });
+  const thread = await readTerminalThread(connection, threadId, { signal, timeoutMs }).catch(error => {
+    if (error.code === ABNORMAL_CLOSE) error.lostBeforeAnswer = true;
+    throw error;
+  });
   if (!thread) throw failure('The selected Codex task was not found in the Codex daemon.', 'target_unavailable');
   const status = thread.status.type;
   if (status === 'notLoaded') {
