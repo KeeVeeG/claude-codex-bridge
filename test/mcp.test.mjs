@@ -922,8 +922,15 @@ test('a recorded failure cannot look successful when retried with the same messa
   recordMessage(ledger, { id: args.message_id, direction: 'to_codex', message: args.message, route });
   finishMessage(ledger, args.message_id, { status: 'failed', error: 'The native tool rejected the request.', route });
   const repeated = await callTool(peer, 'send_to_codex', args);
-  assert.ok(isToolFailure(repeated));
-  assert.match(JSON.stringify(repeated), /new message_id/);
+  assert.equal(repeated.result.isError, true);
+  const advice = repeated.result.content[0].text;
+  assert.match(advice, /may have arrived/i);
+  assert.match(advice, /check the receiving conversation and list_deliveries/i);
+  assert.doesNotMatch(advice, /send it again|new message_id|retry_failed/i);
+  const expected = { delivered: 'unknown', retry: 'inspect', reason: 'prior_failed',
+    record: { message_id: args.message_id, status: 'failed' } };
+  assert.deepEqual(JSON.parse(repeated.result.content[1].text).outcome, expected);
+  assert.deepEqual(repeated.result._meta['bridge-claude-codex/outcome'].outcome, expected);
   assert.equal(setup.notifications.length, 0);
   const status = toolValue(await callTool(peer, 'list_deliveries'));
   assert.equal(status.deliveries.length, 1);
